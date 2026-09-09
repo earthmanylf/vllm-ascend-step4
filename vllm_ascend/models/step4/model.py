@@ -95,7 +95,10 @@ from vllm_ascend.models.step4.dsa_attention import (
 )
 
 from vllm_ascend.models.step4.fused_add_rms_norm import fused_add_rms_norm_cast
-from vllm_ascend.models.step4.fused_qknorm_rope import fused_qknorm_rope
+from vllm_ascend.models.step4.fused_qknorm_rope import (
+    fused_qknorm_rope,
+    fused_indexer_qkz_kv_norm_rope,
+)
 
 logger = init_logger(__name__)
 
@@ -308,6 +311,27 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             eps=rms_norm_eps,
         )
 
+        # --- indexer fused norm+rope switch --------------------------------
+        indexer_rope_dim = int(sparse_config.sparse_indexer_rope_dim)
+        self.use_fused_indexer_norm_rope = (
+            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1"
+            and indexer_rope_dim > 0
+            and indexer_rope_dim < proxy_dim
+        )
+        if self.use_fused_indexer_norm_rope:
+            self._indexer_rotary_dim = indexer_rope_dim
+            self._indexer_num_q_heads = int(
+                sparse_config.sparse_indexer_num_heads
+            ) // int(sparse_config.index_tp_size)
+            self._indexer_num_k_heads = int(
+                sparse_config.sparse_indexer_num_k_heads
+            )
+            self._indexer_zero_centered = zero_centered
+            indexer_rotary_cache = self.sparse_indexer_rotary_emb.cos_sin_cache
+            self._indexer_rope_cos, self._indexer_rope_sin = (
+                indexer_rotary_cache.chunk(2, dim=-1)
+            )
+
         # --- vLLM attention-layer plumbing (minimax_m3 pattern) ---------------
         self.layer_name = f"{prefix}.attn"
         self.kv_cache_dtype = (
@@ -384,7 +408,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         index_k: torch.Tensor,
         index_z: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Indexer norm+rope (eager path) and head scores, all local shapes.
+        """Indexer norm+rope and head scores, all local shapes.
 
         Returns index_q [t, groups, heads_per_group, proxy], index_k [t, 1, proxy],
         index_z [t, 1, proxy], weights [t, groups, heads_per_group] fp32.
@@ -397,21 +421,56 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         num_index_k_heads = int(index_k.shape[-1]) // proxy_dim
         heads_per_group = num_index_q_heads // self.num_kv_heads
 
-        index_k = self.sparse_indexer_k_norm(index_k.contiguous())
-        index_q = index_q.view(
-            num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
-        ).contiguous()
-        index_q = self.sparse_indexer_q_norm(index_q)
-        index_k = index_k.view(num_tokens, num_index_k_heads, proxy_dim).contiguous()
-        index_q, index_k = self._apply_sparse_indexer_rope(
-            positions,
-            index_q.reshape(num_tokens, -1, proxy_dim),
-            index_k,
-        )
-        index_q = index_q.reshape(
-            num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
-        )
-        index_z = index_z.view(num_tokens, num_index_k_heads, proxy_dim).contiguous()
+        if self.use_fused_indexer_norm_rope:
+            x_cat = torch.cat([index_q, index_k, index_z], dim=-1)
+            index_q, index_k, index_z = fused_indexer_qkz_kv_norm_rope(
+                x_cat,
+                self.sparse_indexer_q_norm.weight,
+                self.sparse_indexer_k_norm.weight,
+                self._indexer_rope_cos,
+                self._indexer_rope_sin,
+                positions,
+                q_norm_bias=None,
+                k_norm_bias=self.sparse_indexer_k_norm.bias,
+                head_dim=proxy_dim,
+                num_q_heads=num_index_q_heads,
+                num_k_heads=num_index_k_heads,
+                rotary_dim=self._indexer_rotary_dim,
+                eps=self.sparse_indexer_q_norm.variance_epsilon,
+                q_norm_weight_bias=1.0 if self._indexer_zero_centered else 0.0,
+                k_norm_weight_bias=0.0,
+                subtract_mean_q=False,
+                subtract_mean_k=True,
+            )
+            index_q = index_q.reshape(
+                num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
+            )
+            index_k = index_k.reshape(
+                num_tokens, num_index_k_heads, proxy_dim
+            )
+            index_z = index_z.reshape(
+                num_tokens, num_index_k_heads, proxy_dim
+            )
+        else:
+            index_k = self.sparse_indexer_k_norm(index_k.contiguous())
+            index_q = index_q.view(
+                num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
+            ).contiguous()
+            index_q = self.sparse_indexer_q_norm(index_q)
+            index_k = index_k.view(
+                num_tokens, num_index_k_heads, proxy_dim
+            ).contiguous()
+            index_q, index_k = self._apply_sparse_indexer_rope(
+                positions,
+                index_q.reshape(num_tokens, -1, proxy_dim),
+                index_k,
+            )
+            index_q = index_q.reshape(
+                num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
+            )
+            index_z = index_z.view(
+                num_tokens, num_index_k_heads, proxy_dim
+            ).contiguous()
 
         weights = weights.to(dtype=torch.float32)
         weights = weights.view(num_tokens, self.num_kv_heads, heads_per_group)
