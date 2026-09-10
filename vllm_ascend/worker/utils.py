@@ -5,8 +5,9 @@ from typing import Any
 import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import largest_power_of_2_divisor
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
+from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer, KVCacheSideStorageLayer
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
@@ -65,6 +66,57 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
+        # group_id -> side-storage zero hooks, mirroring the upstream
+        # KVBlockZeroer collection (e.g. Step4 DSA summary sidecar reset).
+        self._side_storage_zero_hooks: dict[int, list[Any]] = {}
+
+    def _collect_side_storage_zero_hooks(
+        self,
+        attn_groups: list["AttentionGroup"],
+        static_forward_context: dict[str, Any],
+    ) -> None:
+        """Register each side-storage layer's zero hook under its owner group."""
+        layer_name_to_group_id: dict[str, int] = {}
+        for group in attn_groups:
+            for layer_name in group.layer_names:
+                previous_group_id = layer_name_to_group_id.setdefault(
+                    layer_name, group.kv_cache_group_id
+                )
+                if previous_group_id != group.kv_cache_group_id:
+                    raise ValueError(
+                        "KV cache layer belongs to multiple groups: "
+                        f"layer={layer_name!r}, groups="
+                        f"{previous_group_id},{group.kv_cache_group_id}"
+                    )
+        seen_side_storage_layers: set[int] = set()
+        for layer_name, layer in static_forward_context.items():
+            if not isinstance(layer, KVCacheSideStorageLayer):
+                continue
+            layer_id = id(layer)
+            if layer_id in seen_side_storage_layers:
+                continue
+            seen_side_storage_layers.add(layer_id)
+            owner_name = layer.main_layer_name
+            group_id = layer_name_to_group_id.get(owner_name)
+            if group_id is None:
+                raise ValueError(
+                    "KV side-storage layer has no owner KV cache group: "
+                    f"layer={layer_name!r}, owner={owner_name!r}"
+                )
+            self._side_storage_zero_hooks.setdefault(group_id, []).append(
+                layer.zero_kv_cache_side_storage
+            )
+        for group in attn_groups:
+            if (
+                group.kv_cache_spec.requires_zeroing
+                and group.kv_cache_group_id not in self._side_storage_zero_hooks
+            ):
+                raise ValueError(
+                    "KV cache group declares side-storage zeroing but no "
+                    "KVCacheSideStorageLayer owns the group: "
+                    f"group={group.kv_cache_group_id}, "
+                    f"layers={group.layer_names!r}"
+                )
 
     def init_meta(
         self,
@@ -87,11 +139,13 @@ class AscendKVBlockZeroer(KVBlockZeroer):
 
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
+        attn_groups = list(attn_groups_iter)
+        self._collect_side_storage_zero_hooks(attn_groups, static_forward_context)
         seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
         page_size_el: int | None = None
 
-        for group in attn_groups_iter:
+        for group in attn_groups:
             spec = group.kv_cache_spec
             if not isinstance(spec, FullAttentionSpec):
                 continue
@@ -150,10 +204,22 @@ class AscendKVBlockZeroer(KVBlockZeroer):
             len(seg_addrs),
         )
 
-    def zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
-            return
+    def zero_block_ids(
+        self,
+        block_ids: list[int],
+        block_ids_by_group: list[list[int]] | None = None,
+    ) -> None:
+        """Zero the KV cache memory for the given block IDs.
+
+        ``block_ids_by_group`` carries the scheduler's per-KV-group split;
+        side-storage layers (e.g. the Step4 DSA summary sidecar) are reset
+        through their registered hooks with their owner group's share.
+        """
+        if block_ids and self._meta is not None:
+            self._zero_base_kv_blocks(block_ids)
+        self._zero_side_storage_blocks(block_ids, block_ids_by_group)
+
+    def _zero_base_kv_blocks(self, block_ids: list[int]) -> None:
         seg_addrs, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
@@ -182,3 +248,46 @@ class AscendKVBlockZeroer(KVBlockZeroer):
             BLOCK_SIZE=blk_size,
             GRID_SIZE=grid,
         )
+
+    def _zero_side_storage_blocks(
+        self,
+        block_ids: list[int],
+        block_ids_by_group: list[list[int]] | None,
+    ) -> None:
+        """Dispatch per-group side-storage resets (mirrors upstream)."""
+        side_storage_zero_hooks = self._side_storage_zero_hooks
+        if not side_storage_zero_hooks:
+            return
+        if block_ids_by_group is None:
+            if block_ids:
+                raise RuntimeError(
+                    "KV side-storage reset requires block IDs grouped by KV "
+                    "cache group."
+                )
+            return
+        required_group_count = max(side_storage_zero_hooks) + 1
+        if len(block_ids_by_group) < required_group_count:
+            raise RuntimeError(
+                "KV side-storage reset is missing owner group IDs: "
+                f"required_groups={required_group_count}, "
+                f"actual_groups={len(block_ids_by_group)}"
+            )
+        flat_group_ids = [
+            block_id for group_ids in block_ids_by_group for block_id in group_ids
+        ]
+        if not flat_group_ids:
+            return
+        group_ids_dev = async_tensor_h2d(
+            flat_group_ids,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        offset = 0
+        for group_id, group_ids in enumerate(block_ids_by_group):
+            next_offset = offset + len(group_ids)
+            hooks = side_storage_zero_hooks.get(group_id, ())
+            if hooks and next_offset > offset:
+                ids = group_ids_dev[offset:next_offset]
+                for hook in hooks:
+                    hook(ids)
+            offset = next_offset

@@ -96,9 +96,10 @@ from vllm_ascend.models.step4.dsa_attention import (
 
 from vllm_ascend.models.step4.fused_add_rms_norm import fused_add_rms_norm_cast
 from vllm_ascend.models.step4.fused_qknorm_rope import (
-    fused_qknorm_rope,
     fused_indexer_qkz_kv_norm_rope,
+    fused_qknorm_rope,
 )
+from vllm_ascend.models.step4.summary_cache import AscendStep4SparseSummaryCacheLayer
 
 logger = init_logger(__name__)
 
@@ -339,6 +340,16 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         )
         self.kv_cache_torch_dtype = _kv_cache_torch_dtype(cache_config, vllm_config)
         self.attn_backend = AscendStep4DSABackend
+        spec_config = vllm_config.speculative_config
+        if (
+            spec_config is not None
+            and int(getattr(spec_config, "num_speculative_tokens", 0) or 0) > 0
+        ):
+            raise NotImplementedError(
+                "Ascend Step4 DSA with the paged summary sidecar does not "
+                "support speculative decoding yet (the upstream MTP "
+                "transaction machinery is not ported)."
+            )
         self.impl = AscendStep4DSAImpl(
             self.num_heads,
             self.head_dim,
@@ -351,6 +362,10 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             max_num_seqs=int(vllm_config.scheduler_config.max_num_seqs),
             max_model_len=int(vllm_config.model_config.max_model_len),
             block_size=int(vllm_config.cache_config.block_size),
+            max_num_batched_tokens=int(
+                vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            decode_out_dtype=vllm_config.model_config.dtype,
         )
         compilation_config = vllm_config.compilation_config
         if self.layer_name in compilation_config.static_forward_context:
@@ -373,16 +388,57 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             self.rope_cos = None
             self.rope_sin = None
 
+        # Page-backed sparse summary sidecar, aligned with the upstream
+        # KV-cache extra-budget contract: the sidecar's per-page bytes shrink
+        # the KV block count, and its lifetime/zeroing/COW follow the owner
+        # KV blocks through the generic side-storage hooks.
+        self.kv_cache_requires_zeroing = True
+        self.sparse_summary_cache = AscendStep4SparseSummaryCacheLayer(
+            prefix=f"{prefix}.attn.sparse_summary_cache",
+            target_impl=self.impl,
+            sparse_config=sparse_config,
+            main_layer_name=self.layer_name,
+            static_forward_context=compilation_config.static_forward_context,
+        )
+        self.kv_cache_extra_budget_page_size_bytes = (
+            self.sparse_summary_cache._set_summary_cache_budget
+        )
+        self.kv_cache_extra_budget_fixed_size_bytes = (
+            self.sparse_summary_cache._fixed_runtime_state_budget
+        )
+        if cache_config is not None:
+            # A prefix-cache hit replays at least one page of the prompt so
+            # the recomputed tail rebuilds the summary state that the hit
+            # pages alone cannot carry (the in-flight region's active slot).
+            self.kv_cache_prefix_recompute_tokens = int(cache_config.block_size)
+        else:
+            self.kv_cache_prefix_recompute_tokens = 0
+
+
     def get_attn_backend(self) -> type[AscendStep4DSABackend]:
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        block_size = vllm_config.cache_config.block_size
+        page_budget = self.kv_cache_extra_budget_page_size_bytes
+        if callable(page_budget):
+            page_budget = page_budget(block_size)
+        fixed_budget = self.kv_cache_extra_budget_fixed_size_bytes
+        if callable(fixed_budget):
+            fixed_budget = fixed_budget(block_size)
         return FullAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
+        ).with_side_storage(
+            requires_zeroing=self.kv_cache_requires_zeroing,
+            extra_budget_page_size_bytes=int(page_budget or 0),
+            extra_budget_fixed_size_bytes=int(fixed_budget or 0),
+            prefix_cache_recompute_tokens=int(
+                self.kv_cache_prefix_recompute_tokens or 0
+            ),
         )
 
     def _apply_sparse_indexer_rope(

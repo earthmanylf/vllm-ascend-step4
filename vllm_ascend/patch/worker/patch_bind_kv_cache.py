@@ -1,7 +1,11 @@
 import torch
 import vllm.v1.worker.utils as utils
 from vllm.model_executor.layers.attention import Attention
-from vllm.v1.worker.utils import defaultdict, extract_layer_index
+from vllm.v1.worker.utils import (
+    KVCacheSideStorageLayer,
+    defaultdict,
+    extract_layer_index,
+)
 
 
 # Without this patch, it will raise an exception when initialize kv_cache.
@@ -45,6 +49,19 @@ def bind_kv_cache(
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
+
+    # Some model-specific state is physically aligned with an owner KV cache
+    # but intentionally omitted from the generic KV specs (e.g. the Step4 DSA
+    # sparse summary sidecar). Bind it only after every regular KV cache is
+    # available. Mirrors the tail of the upstream bind_kv_cache.
+    seen_layers: set[int] = set()
+    for layer in forward_context.values():
+        layer_id = id(layer)
+        if layer_id in seen_layers:
+            continue
+        seen_layers.add(layer_id)
+        if isinstance(layer, KVCacheSideStorageLayer):
+            layer.bind_kv_cache_side_storage(forward_context)
 
 
 utils.bind_kv_cache = bind_kv_cache

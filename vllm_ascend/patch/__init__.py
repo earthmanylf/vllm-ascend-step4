@@ -872,6 +872,8 @@
 #    How：
 #       Replace with a new bind_kv_cache.
 #       Skip the raise.
+#       Keep the upstream tail that binds KVCacheSideStorageLayer side
+#       storage (e.g. the Step4 DSA sparse summary sidecar).
 #    Related PR (if no, explain why):
 #       It need discuss.
 #    Future Plan:

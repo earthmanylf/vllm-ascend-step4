@@ -53,6 +53,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
+from vllm.v1.worker.utils import (
+    KVCacheSideStorageLayer,
+    prepare_kv_cache_side_storage_for_memory_profiling,
+    reset_kv_cache_side_storage_runtime_state,
+)
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -547,6 +552,10 @@ class NPUWorker(WorkerBase):
         # --kv-cache-memory. Still run profile_run() to compile the model,
         # but skip the memory profiling calculation entirely.
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            prepare_kv_cache_side_storage_for_memory_profiling(
+                self.vllm_config.compilation_config.static_forward_context,
+                self.device,
+            )
             self.model_runner.profile_run()
             logger.info(
                 "Initial free memory %.2f GiB, reserved %.2f GiB for KV Cache "
@@ -567,6 +576,13 @@ class NPUWorker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            # Pre-allocate the fixed-size KV side-storage scratch (e.g. the
+            # Step4 DSA summary workspace) at max capacity so it is counted
+            # in the non-KV baseline before KV blocks are sized.
+            prepare_kv_cache_side_storage_for_memory_profiling(
+                self.vllm_config.compilation_config.static_forward_context,
+                self.device,
+            )
             self.model_runner.profile_run()
 
             # Record torch peak INSIDE the context and BEFORE graph capture,
@@ -823,6 +839,25 @@ class NPUWorker(WorkerBase):
         # may cause performance degradation at runtime.
         if get_current_hardware_profile().supports(HardwareCapability.ATB_WARMUP):
             self._warm_up_atb()
+
+        # Startup dummy runs and graph capture leave stale state in KV side
+        # storage (e.g. the Step4 DSA summary sidecar); restore the empty
+        # state in place without changing captured addresses (upstream
+        # gpu_worker does the same after warmup).
+        num_side_storages, num_scratch_buffers = (
+            reset_kv_cache_side_storage_runtime_state(
+                self.vllm_config.compilation_config.static_forward_context
+            )
+        )
+        if num_side_storages:
+            torch.npu.synchronize()
+            logger.info(
+                "Reset KV side-storage state after startup warmup: "
+                "storages=%d scratch_buffers=%d",
+                num_side_storages,
+                num_scratch_buffers,
+            )
+
         # Bind after warmup so hot allocations are already materialized on the
         # worker process before migratepages/taskset run.
         if get_ascend_config().enable_cpu_binding:
@@ -1021,7 +1056,13 @@ class NPUWorker(WorkerBase):
         # MRV2's scheduler emits new_block_ids_to_zero whenever this flag is
         # set, so its worker-side consumer must use the same condition. Keep the
         # narrower Eagle3 condition for MRV1, where zeroing was introduced only
-        # for the multi-step speculative-decode reuse issue.
+        # for the multi-step speculative-decode reuse issue, and add the
+        # side-storage condition: layers like the Step4 DSA summary sidecar
+        # require freshly allocated blocks to be reset through their hooks.
+        has_side_storage = any(
+            isinstance(layer, KVCacheSideStorageLayer)
+            for layer in self.vllm_config.compilation_config.static_forward_context.values()
+        )
         speculative_config = self.vllm_config.speculative_config
         needs_mrv1_eagle_zeroing = (
             speculative_config is not None
@@ -1029,7 +1070,7 @@ class NPUWorker(WorkerBase):
             and speculative_config.num_speculative_tokens > 1
         )
         should_init_kv_zeroer = kv_cache_config.needs_kv_cache_zeroing and (
-            self.use_v2_model_runner or needs_mrv1_eagle_zeroing
+            self.use_v2_model_runner or needs_mrv1_eagle_zeroing or has_side_storage
         )
         # Keep bookkeeping buffers outside the sleep-mode KV-cache pool so they
         # survive sleep/wake cycles.
