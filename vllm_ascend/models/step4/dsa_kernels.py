@@ -679,11 +679,12 @@ def _indexer_logits_kernel(
     out_row_base,
     heads_per_group: tl.constexpr,
     proxy_dim: tl.constexpr,
+    GROUPS: tl.constexpr,
     K_FP8: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ) -> None:
-    """Weighted-ReLU indexer scores for one (query tile, key tile, provider group).
+    """Weighted-ReLU indexer scores for one (query tile, key tile), all groups.
 
         score[q, r] = sum_h relu(dot(q_qh, k_r)) * w_qh
 
@@ -703,13 +704,19 @@ def _indexer_logits_kernel(
     directly -- widening e4m3 to bf16 is lossless, so only the host's
     fp8->bf16 staging casts are gone.
 
+    The group dimension is a loop inside the kernel rather than a grid axis: the
+    key tile is loaded once per (q_block, k_block) program and every group reuses
+    that UB-resident copy instead of re-reading it from global memory. The group
+    loop is pipelined so group g+1's query loads overlap group g's Cube dots;
+    loads are independent per group, so the pipeliner can hoist them without
+    cross-iteration aliasing concerns.
+
     ``out_q_stride``/``out_row_base`` let the kernel write its block directly into
     a group-major ``[groups * total_q, width]`` buffer at any row offset, so the
     caller does not have to copy per-request blocks into place afterwards.
     """
     q_block = tl.program_id(0)
     k_block = tl.program_id(1)
-    group = tl.program_id(2)
 
     queries = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
     keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -727,31 +734,34 @@ def _indexer_logits_kernel(
         # the fp8 summary cache directly with no host-side staging cast.
         key_tile = key_tile.to(tl.bfloat16)
 
-    accumulator = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
-    for head in tl.static_range(heads_per_group):
-        query_tile = tl.load(
-            index_q_ptr
-            + queries[:, None] * stride_q_token
-            + group * stride_q_group
-            + head * stride_q_head
-            + dims[None, :],
-            mask=query_ok[:, None],
-            other=0.0,
-        )
-        head_weight = tl.load(
-            weights_ptr + queries * stride_w_token + group * stride_w_group + head,
-            mask=query_ok,
-            other=0.0,
-        ).to(tl.float32)
-        scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
-        accumulator += tl.maximum(scores, 0.0) * head_weight[:, None]
+    for group in tl.range(0, GROUPS):
+        accumulator = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
+        # Plain ``range``, not ``tl.static_range``: unrolling the head loop inside
+        # the pipelined group loop hangs triton-ascend's compiler.
+        for head in range(heads_per_group):
+            query_tile = tl.load(
+                index_q_ptr
+                + queries[:, None] * stride_q_token
+                + group * stride_q_group
+                + head * stride_q_head
+                + dims[None, :],
+                mask=query_ok[:, None],
+                other=0.0,
+            )
+            head_weight = tl.load(
+                weights_ptr + queries * stride_w_token + group * stride_w_group + head,
+                mask=query_ok,
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
+            accumulator += tl.maximum(scores, 0.0) * head_weight[:, None]
 
-    rows = group * out_q_stride + out_row_base + queries
-    tl.store(
-        out_ptr + rows[:, None] * stride_out_row + keys[None, :],
-        accumulator,
-        mask=query_ok[:, None] & key_ok[None, :],
-    )
+        rows = group * out_q_stride + out_row_base + queries
+        tl.store(
+            out_ptr + rows[:, None] * stride_out_row + keys[None, :],
+            accumulator,
+            mask=query_ok[:, None] & key_ok[None, :],
+        )
 
 
 def round_activations_e4m3(tensor: torch.Tensor) -> torch.Tensor:
@@ -779,8 +789,8 @@ def indexer_logits(
     out: torch.Tensor | None = None,
     out_row_offset: int = 0,
     out_q_stride: int | None = None,
-    block_q: int = 16,
-    block_k: int = 64,
+    block_q: int = 64,
+    block_k: int = 128,
 ) -> torch.Tensor:
     """Weighted-ReLU indexer scores over proxy keys.
 
@@ -821,7 +831,7 @@ def indexer_logits(
         out_row_base = out_row_offset
 
     _indexer_logits_kernel[
-        (triton.cdiv(seq_q, block_q), triton.cdiv(seq_k, block_k), groups)
+        (triton.cdiv(seq_q, block_q), triton.cdiv(seq_k, block_k))
     ](
         index_q,
         index_k,
@@ -840,9 +850,11 @@ def indexer_logits(
         out_row_base,
         heads_per_group=heads_per_group,
         proxy_dim=proxy_dim,
+        GROUPS=groups,
         K_FP8=k_fp8,
         BLOCK_Q=block_q,
         BLOCK_K=block_k,
+        enable_preload=True,
     )
     return out
 
