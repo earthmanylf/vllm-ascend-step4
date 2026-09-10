@@ -25,7 +25,7 @@ except ImportError:
 COMPILE_MODE: str | None = "simd"
 BLOCK_M: int = 16
 
-HEAD_DIM: int = 192
+HEAD_DIM = tl.constexpr(192)
 EPS: float = 1e-5
 NORM_WEIGHT_BIAS: float = 1.0
 
