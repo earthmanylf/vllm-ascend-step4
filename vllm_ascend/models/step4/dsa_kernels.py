@@ -1980,6 +1980,7 @@ def sparse_attention_prefill(
 
     out = torch.empty_like(query)
     lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
+
     _sparse_attn_prefill_kernel[(total_q, num_kv_groups)](
         query,
         key_cache,
@@ -2011,6 +2012,20 @@ def sparse_attention_prefill(
         set_workspace_multibuffer=1,
         enable_preload=False,
     )
+
+    from vllm_ascend.models.step4.dump_sparse_attn import dump_prefill
+    dump_prefill(
+        query, key_cache, value_cache, packed_regions, region_counts,
+        out, lse,
+        num_kv_groups=num_kv_groups, region_size=region_size,
+        softmax_scale=scale, block_regions=block_regions,
+        kernel_kwargs={
+            "topk": topk, "heads_per_group": heads_per_group,
+            "head_dim": head_dim, "BLOCK_H": triton.next_power_of_2(heads_per_group),
+            "BLOCK_D": head_dim, "BLOCK_R": block_regions,
+        },
+    )
+
     return out, lse
 
 
@@ -2356,6 +2371,22 @@ def sparse_attention_decode(
         BLOCK_R=min(block_regions, triton.next_power_of_2(slots_per_split)),
         num_stages=1,
     )
+
+    from vllm_ascend.models.step4.dump_sparse_attn import dump_decode
+    dump_decode(
+        query, key_cache, value_cache, packed_regions, region_counts,
+        kv_seqlens, out, lse,
+        num_kv_groups=num_kv_groups, region_size=region_size,
+        softmax_scale=scale, num_splits=num_splits, block_regions=block_regions,
+        kernel_kwargs={
+            "topk": topk, "heads_per_group": heads_per_group,
+            "head_dim": head_dim, "slots_per_split": slots_per_split,
+            "BLOCK_H": max(16, triton.next_power_of_2(heads_per_group)),
+            "BLOCK_D": triton.next_power_of_2(head_dim),
+            "BLOCK_R": min(block_regions, triton.next_power_of_2(slots_per_split)),
+        },
+    )
+
     if num_splits == 1:
         return out[0], lse[0]
     return out, lse
