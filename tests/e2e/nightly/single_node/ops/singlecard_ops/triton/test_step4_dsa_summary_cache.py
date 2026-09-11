@@ -12,7 +12,8 @@ Covers the kernels in ``vllm_ascend.models.step4.summary_kernels``:
 * ``csa_reset_blocks`` (block lifecycle reset).
 
 The paged indexer scoring against this cache is covered separately in
-``test_step4_indexer_logits_paged.py``.
+``test_step4_indexer_logits_paged.py``; the decode-side region-completion
+flush scenario in ``test_step4_csa_decode_flush.py``.
 
 The reference recomputes region summaries from the raw token stream:
 ``s_d = sum_t exp(z_td - m) * k_td / sum_t exp(z_td - m)`` with one scalar
@@ -23,7 +24,6 @@ import torch
 
 from vllm_ascend.models.step4.summary_kernels import (
     build_decode_summary_layout_step3p5,
-    csa_compact_decode_update,
     csa_compact_prefill_update,
     csa_reset_blocks,
 )
@@ -137,36 +137,6 @@ def _update_prefill(state, slot_mapping, qsl, seq_lens, index_k, index_z, live):
     assert int(state["allocation_success"].item()) == 1
 
 
-def _update_decode(state, slot_mapping, qsl, seq_lens, index_k, index_z, live):
-    flat_slot, _, positions, reset, valid = _layout(
-        slot_mapping, qsl, seq_lens, live
-    )
-    csa_compact_decode_update(
-        state["mean_cache"],
-        state["active_region_ids"],
-        state["active_slot_by_region"],
-        state["allocation_success"],
-        state["numerator"],
-        state["denominator"],
-        state["max_logits"],
-        state["staging_k"],
-        state["staging_z"],
-        state["staging_valid"],
-        flat_slot,
-        reset,
-        valid,
-        positions,
-        index_k.contiguous(),
-        index_z.contiguous(),
-        live_rows=flat_slot.numel(),
-        num_pages=NUM_PAGES,
-        summaries_per_page=SUMMARIES_PER_PAGE,
-        proxy_dim=PROXY_DIM,
-        region_block_size=REGION_SIZE,
-    )
-    assert int(state["allocation_success"].item()) == 1
-
-
 def _prefill_chunk(state, block_table_row, k, z, start, end, seq_len):
     _update_prefill(
         state,
@@ -176,18 +146,6 @@ def _prefill_chunk(state, block_table_row, k, z, start, end, seq_len):
         k.view(end - start, 1, PROXY_DIM),
         z.view(end - start, 1, PROXY_DIM),
         end - start,
-    )
-
-
-def _decode_token(state, block_table_row, k, z, pos):
-    _update_decode(
-        state,
-        _slot_mapping(block_table_row, [pos]),
-        torch.tensor([0, 1], device=DEVICE, dtype=torch.int32),
-        torch.tensor([pos + 1], device=DEVICE, dtype=torch.int32),
-        k.view(1, 1, PROXY_DIM),
-        z.view(1, 1, PROXY_DIM),
-        1,
     )
 
 
@@ -263,29 +221,6 @@ def test_prefill_update_matches_reference():
     ref = _ref_means(k.float(), z.float())
     assert set(ref) == {0, 1}  # region 2 stays pending (4 tokens)
     _check_means(state, block_table[0], ref)
-
-
-def test_decode_stage_flush_matches_reference():
-    torch.manual_seed(1)
-    state = _alloc_state()
-    block_table = torch.tensor([[3, 5]], device=DEVICE, dtype=torch.int32)
-    all_k = [torch.randn(20, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)]
-    all_z = [torch.randn(20, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)]
-    _prefill_chunk(state, block_table[0], all_k[0], all_z[0], 0, 20, 20)
-
-    # Four decode tokens complete region 2 (positions 20..23) via staging.
-    for pos in range(20, 24):
-        k_t = torch.randn(1, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-        z_t = torch.randn(1, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-        all_k.append(k_t)
-        all_z.append(z_t)
-        _decode_token(state, block_table[0], k_t, z_t, pos)
-
-    ref = _ref_means(torch.cat(all_k).float(), torch.cat(all_z).float())
-    assert set(ref) == {0, 1, 2}
-    _check_means(state, block_table[0], ref)
-    # The completed region released its active slot.
-    assert int((state["active_region_ids"] >= 0).sum()) == 0
 
 
 def test_chunked_prefill_prefix_continuation():
