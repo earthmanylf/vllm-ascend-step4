@@ -2,18 +2,18 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
 #
-"""NPU test: Step4 DSA paged summary cache Triton kernels vs torch reference.
+"""NPU test: Step4 DSA paged summary cache layout and reset vs torch reference.
 
-Covers the kernels in ``vllm_ascend.models.step4.summary_kernels``:
+Covers ``vllm_ascend.models.step4.summary_kernels``:
 
 * ``build_decode_summary_layout_step3p5`` (token -> physical region layout),
-* ``csa_compact_prefill_update`` / ``csa_compact_decode_update`` (page-backed
-  fp8 region summaries + active-slot runtime state),
-* ``csa_reset_blocks`` (block lifecycle reset).
+* ``csa_reset_blocks`` (block lifecycle reset; ``_prefill_chunk`` only
+  builds its fixture state).
 
-The paged indexer scoring against this cache is covered separately in
-``test_step4_indexer_logits_paged.py``; the decode-side region-completion
-flush scenario in ``test_step4_csa_decode_flush.py``.
+The summary update paths are covered separately: prefill in
+``test_step4_csa_prefill_update.py``, decode staging/flush in
+``test_step4_csa_decode_flush.py``, and the paged indexer scoring in
+``test_step4_indexer_logits_paged.py``.
 
 The reference recomputes region summaries from the raw token stream:
 ``s_d = sum_t exp(z_td - m) * k_td / sum_t exp(z_td - m)`` with one scalar
@@ -207,79 +207,6 @@ def test_layout_builder_matches_torch():
     assert torch.equal(token_positions, torch.arange(20, device=DEVICE))
     assert torch.equal(reset_slots, ref_reset)
     assert bool(token_valid.all())
-
-
-def test_prefill_update_matches_reference():
-    torch.manual_seed(0)
-    state = _alloc_state()
-    block_table = torch.tensor([[3, 5]], device=DEVICE, dtype=torch.int32)
-    k = torch.randn(20, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    z = torch.randn(20, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-
-    _prefill_chunk(state, block_table[0], k, z, 0, 20, 20)
-
-    ref = _ref_means(k.float(), z.float())
-    assert set(ref) == {0, 1}  # region 2 stays pending (4 tokens)
-    _check_means(state, block_table[0], ref)
-
-
-def test_chunked_prefill_prefix_continuation():
-    torch.manual_seed(2)
-    state = _alloc_state()
-    block_table = torch.tensor([[3, 5]], device=DEVICE, dtype=torch.int32)
-    all_k = torch.randn(28, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    all_z = torch.randn(28, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-
-    # Chunk 1 completes region 0 and leaves region 1 pending as slot N/D/M.
-    _prefill_chunk(state, block_table[0], all_k[:12], all_z[:12], 0, 12, 12)
-    # Chunk 2 folds the prefix and completes regions 1 and 2.
-    _prefill_chunk(state, block_table[0], all_k[12:], all_z[12:], 12, 28, 28)
-
-    ref = _ref_means(all_k.float(), all_z.float())
-    assert set(ref) == {0, 1, 2}
-    _check_means(state, block_table[0], ref)
-
-
-def test_mixed_decode_and_prefill_update():
-    """A mixed batch runs the prefill update over decode rows too."""
-    torch.manual_seed(3)
-    state = _alloc_state()
-    block_table = torch.tensor(
-        [[3, 5, 0, 0], [1, 7, 0, 0]], device=DEVICE, dtype=torch.int32
-    )
-    k0 = torch.randn(20, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    z0 = torch.randn(20, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    _prefill_chunk(state, block_table[0], k0, z0, 0, 20, 20)
-
-    # req0 contributes one decode token (pos 20), req1 a 10-token chunk.
-    k1 = torch.randn(10, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    z1 = torch.randn(10, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    kd = torch.randn(1, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    zd = torch.randn(1, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    slot_mapping = torch.cat(
-        [
-            _slot_mapping(block_table[0], [20]),
-            _slot_mapping(block_table[1], range(10)),
-        ]
-    )
-    qsl = torch.tensor([0, 1, 11], device=DEVICE, dtype=torch.int32)
-    seq_lens = torch.tensor([21, 10], device=DEVICE, dtype=torch.int32)
-    _update_prefill(
-        state,
-        slot_mapping,
-        qsl,
-        seq_lens,
-        torch.cat([kd, k1]).view(11, 1, PROXY_DIM),
-        torch.cat([zd, z1]).view(11, 1, PROXY_DIM),
-        11,
-    )
-
-    ref0 = _ref_means(torch.cat([k0, kd]).float(), torch.cat([z0, zd]).float())
-    assert set(ref0) == {0, 1}  # region 2 pending with 5 tokens
-    _check_means(state, block_table[0], ref0)
-    ref1 = _ref_means(k1.float(), z1.float())
-    assert set(ref1) == {0}
-    _check_means(state, block_table[1], ref1)
 
 
 def test_reset_blocks_clears_payload_and_slots():
