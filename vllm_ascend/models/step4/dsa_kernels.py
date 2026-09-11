@@ -663,30 +663,50 @@ def write_pending_tail(
 @triton.jit
 def _indexer_logits_kernel(
     index_q_ptr,
-    index_k_ptr,
+    mean_cache_ptr,
     weights_ptr,
     out_ptr,
-    seq_q,
+    block_table_ptr,
+    token_req_ptr,
     seq_k,
+    block_table_cols,
     stride_q_token,
     stride_q_group,
     stride_q_head,
-    stride_k_token,
     stride_w_token,
     stride_w_group,
+    stride_keys_page,
+    stride_keys_region,
+    stride_bt_row,
     stride_out_row,
     out_q_stride,
-    out_row_base,
     heads_per_group: tl.constexpr,
     proxy_dim: tl.constexpr,
     GROUPS: tl.constexpr,
-    K_FP8: tl.constexpr,
-    BLOCK_Q: tl.constexpr,
+    SUMMARIES_PER_PAGE: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ) -> None:
-    """Weighted-ReLU indexer scores for one (query tile, key tile), all groups.
+    """Weighted-ReLU indexer scores against the paged fp8 summary cache.
 
-        score[q, r] = sum_h relu(dot(q_qh, k_r)) * w_qh
+        score[t, r] = sum_h relu(dot(q_th, k_r)) * w_th
+
+    One program per (query token, key tile), one kernel launch for the whole
+    batch -- packed prefill and decode share the same form. Query token ``t``
+    scores against its own request's key stream: ``token_req_ptr[t]`` selects
+    the block-table row, and logical region ``r`` of that row lives at
+    physical region ``block_table[req][r // SUMMARIES_PER_PAGE] *
+    SUMMARIES_PER_PAGE + r % SUMMARIES_PER_PAGE``. Unmapped pages (``-1``)
+    contribute zeros; dead columns past a row's live history hold zeros or
+    stale scores, which the top-k stage never reads because each row's
+    candidate range is bounded by its own history length.
+
+    The dot product is a multiply-and-reduce rather than ``tl.dot`` on
+    purpose: one form serves prefill and decode alike, and the shape is
+    memory-bound on the summary read either way. Both operands are e4m3
+    and products and accumulation are fp32, mirroring the upstream SM90
+    WGMMA (``Float8E4M3FN x Float8E4M3FN -> Float32``): widening an e4m3
+    value to fp32 is exact, so in-register conversion preserves the
+    quantized value set bit-for-bit.
 
     The ReLU is per head and *inside* the sum, so the heads cannot be folded into a
     single matmul -- hence the loop. The per-head weights are signed, so applying
@@ -696,307 +716,154 @@ def _indexer_logits_kernel(
     are what the top-k tie-break then has to resolve, so they are load-bearing,
     not noise.
 
-    The e4m3 activation rounding of the query stays on the host on purpose:
-    triton-ascend's in-register fp8 convert does not match torch_npu's
-    ``.to(float8_e4m3fn)`` rounding, and the deployed semantics are the torch
-    ones (the mismatch rate on random bf16 values is ~93%, far beyond
-    accumulation-order noise). The key side reads the fp8 summary cache
-    directly -- widening e4m3 to bf16 is lossless, so only the host's
-    fp8->bf16 staging casts are gone.
+    The e4m3 activation quantization of the query stays on the host on
+    purpose: triton-ascend's in-register fp8 convert does not match
+    torch_npu's ``.to(float8_e4m3fn)`` rounding, and the deployed semantics
+    are the torch ones (the mismatch rate on random bf16 values is ~93%,
+    far beyond accumulation-order noise). Upstream pre-quantizes q on the
+    host for its WGMMA entrypoint the same way; both sides then read the
+    fp8 tensors directly.
 
     The group dimension is a loop inside the kernel rather than a grid axis: the
-    key tile is loaded once per (q_block, k_block) program and every group reuses
-    that UB-resident copy instead of re-reading it from global memory. The group
-    loop is pipelined so group g+1's query loads overlap group g's Cube dots;
-    loads are independent per group, so the pipeliner can hoist them without
-    cross-iteration aliasing concerns.
+    key tile is loaded once per (token, k_block) program and every group reuses
+    that UB-resident copy instead of re-reading it from global memory.
 
-    ``out_q_stride``/``out_row_base`` let the kernel write its block directly into
-    a group-major ``[groups * total_q, width]`` buffer at any row offset, so the
-    caller does not have to copy per-request blocks into place afterwards.
+    ``out_q_stride`` lets the kernel write into a group-major
+    ``[groups * total_q, width]`` buffer: token ``t`` of the batch lands at row
+    ``group * out_q_stride + t``.
     """
-    q_block = tl.program_id(0)
+    token = tl.program_id(0)
     k_block = tl.program_id(1)
-
-    queries = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
     keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
     dims = tl.arange(0, proxy_dim)
-    query_ok = queries < seq_q
     key_ok = keys < seq_k
 
-    key_tile = tl.load(
-        index_k_ptr + dims[:, None] + keys[None, :] * stride_k_token,
-        mask=key_ok[None, :],
-        other=0.0,
+    req = tl.load(token_req_ptr + token).to(tl.int64)
+    page_cols = keys // SUMMARIES_PER_PAGE
+    col_ok = page_cols < block_table_cols
+    pages = tl.load(
+        block_table_ptr + req * stride_bt_row + page_cols,
+        mask=key_ok & col_ok,
+        other=-1,
+    ).to(tl.int64)
+    load_ok = key_ok & col_ok & (pages >= 0)
+    safe_pages = tl.where(load_ok, pages, 0)
+    key_offsets = (
+        safe_pages * stride_keys_page + (keys % SUMMARIES_PER_PAGE) * stride_keys_region
     )
-    if K_FP8:
-        # Widening an e4m3 value to bf16 is lossless, so the kernel can read
-        # the fp8 summary cache directly with no host-side staging cast.
-        key_tile = key_tile.to(tl.bfloat16)
+    k_tile = tl.load(
+        mean_cache_ptr + key_offsets[:, None] + dims[None, :],
+        mask=load_ok[:, None],
+        other=0.0,
+    ).to(tl.float32)
 
     for group in tl.range(0, GROUPS):
-        accumulator = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
-        # Plain ``range``, not ``tl.static_range``: unrolling the head loop inside
-        # the pipelined group loop hangs triton-ascend's compiler.
-        for head in range(heads_per_group):
-            query_tile = tl.load(
-                index_q_ptr
-                + queries[:, None] * stride_q_token
-                + group * stride_q_group
-                + head * stride_q_head
-                + dims[None, :],
-                mask=query_ok[:, None],
-                other=0.0,
-            )
-            head_weight = tl.load(
-                weights_ptr + queries * stride_w_token + group * stride_w_group + head,
-                mask=query_ok,
-                other=0.0,
-            ).to(tl.float32)
-            scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
-            accumulator += tl.maximum(scores, 0.0) * head_weight[:, None]
-
-        rows = group * out_q_stride + out_row_base + queries
-        tl.store(
-            out_ptr + rows[:, None] * stride_out_row + keys[None, :],
-            accumulator,
-            mask=query_ok[:, None] & key_ok[None, :],
-        )
-
-
-def round_activations_e4m3(tensor: torch.Tensor) -> torch.Tensor:
-    """Apply the indexer's e4m3 activation rounding, then widen back to bfloat16.
-
-    The deployed kernel quantizes indexer activations to e4m3 before the score matmul,
-    even though the checkpoint stores these weights in bf16. Skipping the rounding
-    changes which regions get selected, so it is part of the semantics and not an
-    optimization we can decline.
-
-    Widening back to bf16 instead of feeding e4m3 into the matmul is deliberate. It is
-    lossless -- e4m3 keeps 3 mantissa bits and bf16 keeps 8 -- and it keeps the kernel
-    off Triton's fp8 MMA path, which is where portability across Triton versions and
-    non-NVIDIA backends breaks down. The cost is peak throughput on Hopper, not
-    accuracy.
-    """
-    return tensor.to(torch.float8_e4m3fn).to(torch.bfloat16)
-
-
-def indexer_logits(
-    index_q: torch.Tensor,
-    weights: torch.Tensor,
-    index_k: torch.Tensor,
-    *,
-    out: torch.Tensor | None = None,
-    out_row_offset: int = 0,
-    out_q_stride: int | None = None,
-    block_q: int = 64,
-    block_k: int = 128,
-) -> torch.Tensor:
-    """Weighted-ReLU indexer scores over proxy keys.
-
-    Args:
-        index_q: ``[seq_q, groups, heads_per_group, proxy_dim]`` bf16.
-        weights: ``[seq_q, groups, heads_per_group]``, already carrying the
-            ``heads_per_group ** -0.5`` prescale.
-        index_k: ``[seq_k, 1, proxy_dim]`` -- one shared key head (the indexer is MQA
-            even though the main attention is GQA). fp8_e4m3fn is accepted
-            directly (the summary cache's dtype) and widened in-register.
-        out: optional preallocated ``[groups * out_q_stride, seq_k]`` fp32 buffer the
-            kernel writes into, at row ``group * out_q_stride + out_row_offset``;
-            defaults to a fresh ``[groups * seq_q, seq_k]`` tensor. Lets a batched
-            caller assemble one group-major buffer without per-request copies.
-
-    Returns:
-        ``[groups * seq_q, seq_k]`` float32, group-major then query (or ``out`` when
-        given). That row order is what the region selector consumes, so it is a
-        contract rather than a convenience.
-    """
-    if index_k.shape[1] != 1:
-        raise ValueError(f"indexer keys are MQA; expected one head, got {index_k.shape[1]}")
-    seq_q, groups, heads_per_group, proxy_dim = index_q.shape
-    seq_k = index_k.shape[0]
-    if index_k.shape[2] != proxy_dim:
-        raise ValueError(f"proxy_dim mismatch: q={proxy_dim} k={index_k.shape[2]}")
-
-    k_fp8 = index_k.dtype == torch.float8_e4m3fn
-    index_q = round_activations_e4m3(index_q)
-    if not k_fp8:
-        index_k = round_activations_e4m3(index_k)
-    if out is None:
-        out = torch.empty((groups * seq_q, seq_k), device=index_q.device, dtype=torch.float32)
-        out_q_stride = seq_q
-        out_row_base = 0
-    else:
-        out_q_stride = seq_q if out_q_stride is None else out_q_stride
-        out_row_base = out_row_offset
-
-    _indexer_logits_kernel[
-        (triton.cdiv(seq_q, block_q), triton.cdiv(seq_k, block_k))
-    ](
-        index_q,
-        index_k,
-        weights,
-        out,
-        seq_q,
-        seq_k,
-        index_q.stride(0),
-        index_q.stride(1),
-        index_q.stride(2),
-        index_k.stride(0),
-        weights.stride(0),
-        weights.stride(1),
-        out.stride(0),
-        out_q_stride,
-        out_row_base,
-        heads_per_group=heads_per_group,
-        proxy_dim=proxy_dim,
-        GROUPS=groups,
-        K_FP8=k_fp8,
-        BLOCK_Q=block_q,
-        BLOCK_K=block_k,
-        enable_preload=True,
-    )
-    return out
-
-
-@triton.jit
-def _indexer_logits_rows_kernel(
-    q_ptr,
-    w_ptr,
-    summary_ptr,
-    out_ptr,
-    n_rows,
-    seq_k,
-    q_per_row,
-    stride_q_token,
-    stride_q_group,
-    stride_q_head,
-    stride_w_token,
-    stride_w_group,
-    stride_k_row,
-    stride_k_token,
-    stride_out_row,
-    heads_per_group: tl.constexpr,
-    proxy_dim: tl.constexpr,
-    Q_PER_ROW: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-) -> None:
-    """Batched decode scoring: one program per (batch row, key tile, group).
-
-    Every batch row keeps its own summary row in ``summary_ptr`` (the fp8 side
-    cache), so unlike :func:`_indexer_logits_kernel` the key tile is *not* shared
-    across queries -- each program loads the tile of its own row and scores all
-    ``Q_PER_ROW`` query tokens (1 for plain decode, k for spec-decode verify)
-    against it, writing straight into the group-major logits buffer. What used to
-    be one tiny kernel launch per request becomes one launch for the whole batch.
-
-    The dot product is a multiply-and-reduce rather than ``tl.dot`` on purpose: a
-    decode row has at most 8 query tokens, so an MMA tile would be almost entirely
-    padding, while this shape is memory-bound on the summary read either way.
-    Products and accumulation are fp32, matching the fp32 accumulation of the
-    prefill kernel. The query arrives already e4m3-rounded (host semantics --
-    see ``_indexer_logits_kernel``); the fp8 summary tile is widened in-register,
-    which is lossless.
-    """
-    row = tl.program_id(0)
-    k_block = tl.program_id(1)
-    group = tl.program_id(2)
-
-    keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
-    key_ok = keys < seq_k
-    dims = tl.arange(0, proxy_dim)
-
-    k_tile = tl.load(
-        summary_ptr
-        + row.to(tl.int64) * stride_k_row
-        + keys[:, None].to(tl.int64) * stride_k_token
-        + dims[None, :],
-        mask=key_ok[:, None],
-        other=0.0,
-    ).to(tl.bfloat16).to(tl.float32)
-
-    for qi in tl.static_range(Q_PER_ROW):
-        token = row * Q_PER_ROW + qi
         acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
-        for head in tl.static_range(heads_per_group):
+        for head in range(heads_per_group):
             q_vec = tl.load(
-                q_ptr
+                index_q_ptr
                 + token.to(tl.int64) * stride_q_token
                 + group * stride_q_group
                 + head * stride_q_head
                 + dims
             ).to(tl.float32)
             head_weight = tl.load(
-                w_ptr + token * stride_w_token + group * stride_w_group + head
+                weights_ptr + token * stride_w_token + group * stride_w_group + head
             ).to(tl.float32)
             dots = tl.sum(k_tile * q_vec[None, :], axis=1)
             acc += tl.maximum(dots, 0.0) * head_weight
-        out_row = group * (n_rows * Q_PER_ROW) + token
+        out_row = group * out_q_stride + token.to(tl.int64)
         tl.store(
-            out_ptr + out_row.to(tl.int64) * stride_out_row + keys,
+            out_ptr + out_row * stride_out_row + keys,
             acc,
             mask=key_ok,
         )
 
 
-def indexer_logits_rows(
+def quantize_activations_e4m3(tensor: torch.Tensor) -> torch.Tensor:
+    """Quantize indexer activations to e4m3, aligned with the deployed kernels.
+
+    The reference SM90 kernels feed e4m3 operands into a fp32-accumulating
+    WGMMA, and the checkpoint stores these activations in bf16, so the
+    quantization is part of the semantics: skipping it changes which regions
+    get selected. The quantization itself stays on the host on purpose --
+    triton-ascend's in-register fp8 convert does not match torch_npu's
+    ``.to(float8_e4m3fn)`` rounding -- mirroring upstream, which also
+    pre-quantizes q on the host before its WGMMA entrypoint.
+    """
+    return tensor.to(torch.float8_e4m3fn)
+
+
+def indexer_logits_paged(
     index_q: torch.Tensor,
     weights: torch.Tensor,
-    summary: torch.Tensor,
-    out: torch.Tensor,
+    mean_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
     *,
-    q_per_row: int,
+    out: torch.Tensor,
+    out_q_stride: int | None = None,
+    summaries_per_page: int,
     block_k: int = 32,
 ) -> torch.Tensor:
-    """Score every decode row of the batch against its own summary row, one launch.
+    """Score a packed batch's query tokens against the paged fp8 summaries.
+
+    One kernel launch for the whole batch, prefill or decode: query token
+    ``t`` is scored against the key stream of request ``token_to_req[t]``,
+    and the results land at logits rows ``group * out_q_stride + t`` of the
+    group-major buffer. The token -> request map covers every batch shape:
+    a plain decode batch passes ``torch.arange(n)`` (one token per request),
+    a spec-decode verify batch repeats each request id ``k`` times, and a
+    packed prefill batch maps each chunk token to its request. Dead columns
+    past a row's live history hold zeros or stale scores, which the top-k
+    stage never reads because each row's candidate range is bounded by its
+    own history length.
 
     Args:
-        index_q: ``[n_rows * q_per_row, groups, heads_per_group, proxy_dim]`` bf16,
-            row-major over (row, query token) -- exactly how decode and uniform
-            spec-decode verify batches arrive.
-        weights: same token layout, fp32, prescaled.
-        summary: ``[>= n_rows, >= seq_k, 1, proxy_dim]`` fp8 summary cache; row
-            ``r``'s queries are scored against ``summary[r, :seq_k]``.
-        out: ``[groups * n_rows * q_per_row, seq_k]`` fp32, group-major row order,
-            where ``seq_k = out.shape[1]``. Dead columns hold scores of stale
-            summaries, exactly like the eager per-row path wrote them.
-        q_per_row: query tokens per batch row (1 or the spec-decode k).
-
-    Returns:
-        ``out`` (written in place).
+        index_q: ``[total_tokens, groups, heads_per_group, proxy_dim]`` bf16,
+            packed over all requests; quantized to e4m3 on the host so the
+            kernel scores e4m3 x e4m3 -> fp32 like the upstream WGMMA.
+        weights: ``[total_tokens, groups, heads_per_group]`` fp32, prescaled.
+        mean_cache: fp8 ``[num_pages, summaries_per_page, 1, proxy_dim]``
+            (any row stride).
+        block_table: int32 ``[num_reqs, pages]`` KV block table.
+        token_to_req: int32 ``[total_tokens]``; the block-table row (request)
+            each query token belongs to.
+        out: ``[groups * total_tokens, seq_k]`` fp32 destination, where
+            ``seq_k = out.shape[1]``.
+        summaries_per_page: regions per physical page (``block_size //
+            region_block_size``).
     """
-    n_tokens, groups, heads_per_group, proxy_dim = index_q.shape
-    if q_per_row <= 0 or n_tokens % q_per_row:
-        raise ValueError(f"n_tokens {n_tokens} not divisible by q_per_row {q_per_row}")
-    n_rows = n_tokens // q_per_row
+    total_tokens, groups, heads_per_group, proxy_dim = index_q.shape
     seq_k = int(out.shape[1])
-    if summary.shape[0] < n_rows or summary.shape[2] != 1:
-        raise ValueError(
-            f"summary must cover {n_rows} rows with one head, got {tuple(summary.shape)}"
-        )
-    index_q = round_activations_e4m3(index_q)
+    out_q_stride = total_tokens if out_q_stride is None else out_q_stride
+    index_q = quantize_activations_e4m3(index_q)
 
-    _indexer_logits_rows_kernel[
-        (n_rows, triton.cdiv(seq_k, block_k), groups)
+    _indexer_logits_kernel[
+        (total_tokens, triton.cdiv(seq_k, block_k))
     ](
         index_q,
+        mean_cache,
         weights,
-        summary,
         out,
-        n_rows,
+        block_table,
+        token_to_req,
         seq_k,
-        q_per_row,
+        int(block_table.shape[1]),
         index_q.stride(0),
         index_q.stride(1),
         index_q.stride(2),
         weights.stride(0),
         weights.stride(1),
-        summary.stride(0),
-        summary.stride(1),
+        int(mean_cache.stride(0)),
+        int(mean_cache.stride(1)),
+        int(block_table.stride(0)),
         out.stride(0),
+        out_q_stride,
         heads_per_group=heads_per_group,
         proxy_dim=proxy_dim,
-        Q_PER_ROW=q_per_row,
+        GROUPS=groups,
+        SUMMARIES_PER_PAGE=int(summaries_per_page),
         BLOCK_K=block_k,
     )
     return out
@@ -2660,132 +2527,6 @@ def update_summaries_decode(
         cache.summary[request * cache.max_regions + region] = summary_fp8[0]
 
 
-def score_regions(
-    indexer: Step4SparseIndexer,
-    cache: DSALayerCache,
-    index_q: torch.Tensor,
-    weights: torch.Tensor,
-    seq_lens: torch.Tensor,
-    past_lens: torch.Tensor,
-) -> torch.Tensor:
-    """Indexer scores for every query against its own request's region summaries.
-
-    Returns ``[groups * total_q, width]`` float32 in the group-major row order the selector
-    requires, where ``width`` is the largest number of regions any row can see. Rows whose own
-    history is shorter are left at zero past their bound; that is safe only because the
-    selector's candidate range is bounded per row by its own history length and never reads
-    further.
-
-    ``width`` is computed rather than taken as ``cache.max_regions``, and the difference is not
-    cosmetic. ``max_regions`` is the cache's *capacity*: at a 512k context it is 65536, so a
-    4k-token prefill would allocate ``4 groups x 4096 queries x 65536`` fp32 -- 4.3 GB, for a
-    tensor whose live corner is a thousandth of that. Sizing to the live width makes the
-    allocation track the context rather than the reservation.
-
-    The loop is over requests, not a batched GEMM, because each request scores against a
-    different key set. At decode that is one tiny matmul per request; at prefill it is dwarfed
-    by the attention it feeds.
-    """
-    groups = indexer.num_kv_groups
-    total_q = int(index_q.shape[0])
-    region_size = cache.geometry.region_size
-
-    # A row can see every region completed before its query, so the widest row is the one with
-    # the largest final position.
-    last_positions = [
-        int(past_lens[request]) + int(seq_lens[request]) - 1
-        for request in range(cache.batch)
-        if int(seq_lens[request]) > 0
-    ]
-    width = max((position // region_size for position in last_positions), default=0)
-    logits = torch.zeros(
-        (groups * total_q, max(width, 1)), device=index_q.device, dtype=torch.float32
-    )
-
-    offset = 0
-    for request in range(cache.batch):
-        length = int(seq_lens[request])
-        if length == 0:
-            continue
-        regions = (int(past_lens[request]) + length - 1) // region_size
-        if regions == 0:
-            offset += length
-            continue
-
-        base = request * cache.max_regions
-        block = indexer_logits(
-            index_q[offset : offset + length].contiguous(),
-            weights[offset : offset + length].contiguous(),
-            cache.summary[base : base + regions].to(index_q.dtype),
-        )
-        for group in range(groups):
-            rows = slice(group * total_q + offset, group * total_q + offset + length)
-            logits[rows, :regions] = block[group * length : (group + 1) * length]
-        offset += length
-
-    return logits
-
-
-def prefill_metadata(
-    indexer: Step4SparseIndexer,
-    cache: DSALayerCache,
-    index_q: torch.Tensor,
-    weights: torch.Tensor,
-    seq_lens: torch.Tensor,
-    past_lens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score, select, and pack prefill metadata for a packed batch."""
-    groups = indexer.num_kv_groups
-    device = index_q.device
-
-    logits = score_regions(indexer, cache, index_q, weights, seq_lens, past_lens)
-    positions, requests = _packed_positions(seq_lens, past_lens, device)
-    return prefill_sparse_meta(
-        logits,
-        positions.repeat(groups).contiguous(),
-        cache.block_table,
-        requests.repeat(groups).contiguous(),
-        topk=indexer.geometry.topk,
-        region_size=indexer.geometry.region_size,
-        regions_per_page=indexer.geometry.regions_per_page,
-    )
-
-
-def decode_metadata(
-    indexer: Step4SparseIndexer,
-    cache: DSALayerCache,
-    index_q: torch.Tensor,
-    weights: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score, select, and pack decode metadata for one token per request."""
-    ones = torch.ones((cache.batch,), device=index_q.device, dtype=torch.int32)
-    logits = score_regions(
-        indexer, cache, index_q, weights, ones, (cache.lengths - 1).clamp_min(0)
-    )
-    return decode_sparse_meta(
-        logits,
-        cache.lengths,
-        cache.block_table,
-        topk=indexer.geometry.topk,
-        region_size=indexer.geometry.region_size,
-        regions_per_page=indexer.geometry.regions_per_page,
-    )
-
-
-def _packed_positions(
-    seq_lens: torch.Tensor, past_lens: torch.Tensor, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Absolute position and owning request of every token in a packed batch."""
-    positions = []
-    requests = []
-    for request in range(seq_lens.shape[0]):
-        length = int(seq_lens[request])
-        past = int(past_lens[request])
-        positions.append(torch.arange(past, past + length, device=device, dtype=torch.int32))
-        requests.append(torch.full((length,), request, device=device, dtype=torch.int32))
-    return torch.cat(positions), torch.cat(requests)
-
-
 # ============================================================================
 # merged source: inference/fp8_gemm.py
 # ============================================================================
@@ -4007,8 +3748,8 @@ __all__ = [
     "indexer_norm_rope",
     "csa_region_layout",
     "csa_compress_regions",
-    "round_activations_e4m3",
-    "indexer_logits",
+    "quantize_activations_e4m3",
+    "indexer_logits_paged",
     "region_topk_ids",
     "region_topk_pack",
     "prefill_sparse_meta",
@@ -4022,9 +3763,6 @@ __all__ = [
     "Step4SparseIndexer",
     "update_summaries_prefill",
     "update_summaries_decode",
-    "score_regions",
-    "prefill_metadata",
-    "decode_metadata",
     "act_quant",
     "fp8_gemm",
     "linear_fp8_or_bf16",

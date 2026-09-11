@@ -45,6 +45,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCache
 
 from vllm_ascend.models.step4.dsa_kernels import (
     decode_sparse_meta,
+    indexer_logits_paged,
     prefill_sparse_meta,
     sparse_attention_decode,
     sparse_attention_prefill,
@@ -54,8 +55,6 @@ from vllm_ascend.models.step4.summary_kernels import (
     build_decode_summary_layout_step3p5,
     csa_compact_decode_update,
     csa_compact_prefill_update,
-    indexer_logits_paged,
-    indexer_logits_rows_paged,
 )
 
 logger = init_logger(__name__)
@@ -813,12 +812,13 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             device=index_q.device,
             dtype=torch.float32,
         )
-        indexer_logits_rows_paged(
+        indexer_logits_paged(
             index_q[:n],
             weights[:n],
             summary_cache.mean_cache.view(torch.float8_e4m3fn),
             d.block_table,
-            logits,
+            torch.arange(n, device=index_q.device, dtype=torch.int32),
+            out=logits,
             summaries_per_page=int(summary_cache.summaries_per_page),
         )
         seq_lens_i32 = d.seq_lens.to(torch.int32)
@@ -859,10 +859,12 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
 
         Same contract as the reference ``score_regions``: a
         [groups * total_q, width] fp32 tensor in group-major row order, width
-        sized to the live history. Each request's kernel writes its block
-        straight into the buffer at the right group-major offset, reading the
-        fp8 summary pages through the request's block-table row (widened
-        in-register).
+        sized to the live history. The whole packed batch is scored in one
+        kernel launch: each query token reads the fp8 summary pages through
+        its own request's block-table row (widened in-register). Dead columns
+        past a row's live history hold zeros or stale scores, which the
+        top-k stage never reads because each row's candidate range is bounded
+        by its own history length.
         """
         groups = self.num_kv_groups
         # ``seq_lens`` from the common attention metadata hold each request's
@@ -885,28 +887,24 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             device=index_q.device,
             dtype=torch.float32,
         )
+        if num_tokens == 0:
+            return logits
         mean_cache = summary_cache.mean_cache.view(torch.float8_e4m3fn)
-
-        offset = 0
-        for row in range(num_rows):
-            length = query_lens_list[row]
-            if length == 0:
-                continue
-            regions = (int(seq_lens_host[row]) - 1) // self.region_size
-            if regions == 0:
-                offset += length
-                continue
-            indexer_logits_paged(
-                index_q[offset : offset + length],
-                weights[offset : offset + length],
-                mean_cache,
-                block_table[row],
-                out=logits,
-                out_row_offset=offset,
-                out_q_stride=num_tokens,
-                summaries_per_page=int(summary_cache.summaries_per_page),
-            )
-            offset += length
+        # Token -> block-table row map for the packed batch, built once on the
+        # host (the query lengths already live there) and shipped in one copy.
+        token_to_req = torch.repeat_interleave(
+            torch.arange(num_rows, dtype=torch.int32),
+            torch.tensor(query_lens_list, dtype=torch.int64),
+        ).to(index_q.device)
+        indexer_logits_paged(
+            index_q[:num_tokens],
+            weights[:num_tokens],
+            mean_cache,
+            block_table[:num_rows],
+            token_to_req,
+            out=logits,
+            summaries_per_page=int(summary_cache.summaries_per_page),
+        )
         return logits
 
     def _forward_sparse_gqa_prefill(

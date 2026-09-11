@@ -9,16 +9,16 @@ Covers the kernels in ``vllm_ascend.models.step4.summary_kernels``:
 * ``build_decode_summary_layout_step3p5`` (token -> physical region layout),
 * ``csa_compact_prefill_update`` / ``csa_compact_decode_update`` (page-backed
   fp8 region summaries + active-slot runtime state),
-* ``csa_reset_blocks`` (block lifecycle reset),
-* ``indexer_logits_paged`` / ``indexer_logits_rows_paged`` (weighted-ReLU
-  indexer scoring against the paged fp8 summary cache).
+* ``csa_reset_blocks`` (block lifecycle reset).
+
+The paged indexer scoring against this cache is covered separately in
+``test_step4_indexer_logits_paged.py``.
 
 The reference recomputes region summaries from the raw token stream:
 ``s_d = sum_t exp(z_td - m) * k_td / sum_t exp(z_td - m)`` with one scalar
 ``m`` per region, stored through the fp32 -> bf16 -> e4m3 double rounding.
 """
 
-import pytest
 import torch
 
 from vllm_ascend.models.step4.summary_kernels import (
@@ -26,8 +26,6 @@ from vllm_ascend.models.step4.summary_kernels import (
     csa_compact_decode_update,
     csa_compact_prefill_update,
     csa_reset_blocks,
-    indexer_logits_paged,
-    indexer_logits_rows_paged,
 )
 
 DEVICE = "npu"
@@ -377,58 +375,3 @@ def test_reset_blocks_clears_payload_and_slots():
     # Page 3 (logical regions 0-1) is cleared; page 5 (region 2) is not.
     assert int(mean_cache[3 * SUMMARIES_PER_PAGE : 3 * SUMMARIES_PER_PAGE + 2].view(torch.uint8).abs().sum()) == 0
     assert int(mean_cache[5 * SUMMARIES_PER_PAGE].view(torch.uint8).abs().sum()) != 0
-
-
-def test_paged_indexer_scoring_matches_reference():
-    torch.manual_seed(5)
-    state = _alloc_state()
-    block_table = torch.tensor([[3, 5]], device=DEVICE, dtype=torch.int32)
-    k = torch.randn(24, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    z = torch.randn(24, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    _prefill_chunk(state, block_table[0], k, z, 0, 24, 24)
-    ref = _ref_means(k.float(), z.float())
-    width = 3  # completed regions 0..2
-
-    def ref_scores(index_q, weights):
-        q_rounded = (
-            index_q.to(torch.float8_e4m3fn).to(torch.bfloat16).float()
-        )
-        rows, groups, heads, _ = index_q.shape
-        out = torch.zeros((groups * rows, width), device=DEVICE)
-        for g in range(groups):
-            for t in range(rows):
-                for r in range(width):
-                    dots = (q_rounded[t, g] * ref[r].float()).sum(-1)
-                    out[g * rows + t, r] = (dots.relu() * weights[t, g]).sum()
-        return out
-
-    groups, heads = 1, 4
-    # Decode variant: one query token per request.
-    index_q = torch.randn(1, groups, heads, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    weights = torch.randn(1, groups, heads, device=DEVICE, dtype=torch.float32)
-    out = torch.zeros((groups, width), device=DEVICE, dtype=torch.float32)
-    indexer_logits_rows_paged(
-        index_q,
-        weights,
-        state["mean_cache"],
-        block_table[:, :2],
-        out,
-        summaries_per_page=SUMMARIES_PER_PAGE,
-    )
-    torch.testing.assert_close(out, ref_scores(index_q, weights), rtol=1e-4, atol=1e-4)
-
-    # Prefill variant: several query tokens of one request in one call.
-    index_q = torch.randn(3, groups, heads, PROXY_DIM, device=DEVICE, dtype=torch.bfloat16)
-    weights = torch.randn(3, groups, heads, device=DEVICE, dtype=torch.float32)
-    out = torch.zeros((groups * 3, width), device=DEVICE, dtype=torch.float32)
-    indexer_logits_paged(
-        index_q,
-        weights,
-        state["mean_cache"],
-        block_table[0, :2],
-        out=out,
-        out_row_offset=0,
-        out_q_stride=3,
-        summaries_per_page=SUMMARIES_PER_PAGE,
-    )
-    torch.testing.assert_close(out, ref_scores(index_q, weights), rtol=1e-4, atol=1e-4)
