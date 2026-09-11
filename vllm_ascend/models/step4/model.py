@@ -93,10 +93,14 @@ from vllm_ascend.models.step4.dsa_attention import (
     AscendStep4DSABackend,
     AscendStep4DSAImpl,
 )
+
 from vllm_ascend.models.step4.fused_add_rms_norm import fused_add_rms_norm_cast
+from vllm_ascend.models.step4.fused_qknorm_rope import (
+    fused_qknorm_rope,
+    fused_indexer_qkz_kv_norm_rope,
+)
 
 logger = init_logger(__name__)
-
 
 def _kv_cache_torch_dtype(cache_config, vllm_config) -> torch.dtype:
     cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
@@ -307,6 +311,27 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             eps=rms_norm_eps,
         )
 
+        # --- indexer fused norm+rope switch --------------------------------
+        indexer_rope_dim = int(sparse_config.sparse_indexer_rope_dim)
+        self.use_fused_indexer_norm_rope = (
+            os.environ.get("VLLM_STEP4_FUSE_INDEXER_NORM_ROPE", "1") == "1"
+            and indexer_rope_dim > 0
+            and indexer_rope_dim < proxy_dim
+        )
+        if self.use_fused_indexer_norm_rope:
+            self._indexer_rotary_dim = indexer_rope_dim
+            self._indexer_num_q_heads = int(
+                sparse_config.sparse_indexer_num_heads
+            ) // int(sparse_config.index_tp_size)
+            self._indexer_num_k_heads = int(
+                sparse_config.sparse_indexer_num_k_heads
+            )
+            self._indexer_zero_centered = zero_centered
+            indexer_rotary_cache = self.sparse_indexer_rotary_emb.cos_sin_cache
+            self._indexer_rope_cos, self._indexer_rope_sin = (
+                indexer_rotary_cache.chunk(2, dim=-1)
+            )
+
         # --- vLLM attention-layer plumbing (minimax_m3 pattern) ---------------
         self.layer_name = f"{prefix}.attn"
         self.kv_cache_dtype = (
@@ -333,6 +358,20 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[self.layer_name] = self
         self.kv_cache = torch.tensor([])
         self.max_position_embeddings = max_position
+
+        self.use_fused_qknorm_rope = (
+            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1"
+            and self.use_rope
+            and self.head_dim == 192
+        )
+        if self.use_fused_qknorm_rope:
+            self._fused_rotary_pairs = self.rotary_dim // 2
+            rotary_cache = self.rotary_emb.cos_sin_cache
+            self.rope_cos, self.rope_sin = rotary_cache.chunk(2, dim=-1)
+        else:
+            self._fused_rotary_pairs = 0
+            self.rope_cos = None
+            self.rope_sin = None
 
     def get_attn_backend(self) -> type[AscendStep4DSABackend]:
         return self.attn_backend
@@ -369,7 +408,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         index_k: torch.Tensor,
         index_z: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Indexer norm+rope (eager path) and head scores, all local shapes.
+        """Indexer norm+rope and head scores, all local shapes.
 
         Returns index_q [t, groups, heads_per_group, proxy], index_k [t, 1, proxy],
         index_z [t, 1, proxy], weights [t, groups, heads_per_group] fp32.
@@ -382,21 +421,56 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         num_index_k_heads = int(index_k.shape[-1]) // proxy_dim
         heads_per_group = num_index_q_heads // self.num_kv_heads
 
-        index_k = self.sparse_indexer_k_norm(index_k.contiguous())
-        index_q = index_q.view(
-            num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
-        ).contiguous()
-        index_q = self.sparse_indexer_q_norm(index_q)
-        index_k = index_k.view(num_tokens, num_index_k_heads, proxy_dim).contiguous()
-        index_q, index_k = self._apply_sparse_indexer_rope(
-            positions,
-            index_q.reshape(num_tokens, -1, proxy_dim),
-            index_k,
-        )
-        index_q = index_q.reshape(
-            num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
-        )
-        index_z = index_z.view(num_tokens, num_index_k_heads, proxy_dim).contiguous()
+        if self.use_fused_indexer_norm_rope:
+            x_cat = torch.cat([index_q, index_k, index_z], dim=-1)
+            index_q, index_k, index_z = fused_indexer_qkz_kv_norm_rope(
+                x_cat,
+                self.sparse_indexer_q_norm.weight,
+                self.sparse_indexer_k_norm.weight,
+                self._indexer_rope_cos,
+                self._indexer_rope_sin,
+                positions,
+                q_norm_bias=None,
+                k_norm_bias=self.sparse_indexer_k_norm.bias,
+                head_dim=proxy_dim,
+                num_q_heads=num_index_q_heads,
+                num_k_heads=num_index_k_heads,
+                rotary_dim=self._indexer_rotary_dim,
+                eps=self.sparse_indexer_q_norm.variance_epsilon,
+                q_norm_weight_bias=1.0 if self._indexer_zero_centered else 0.0,
+                k_norm_weight_bias=0.0,
+                subtract_mean_q=False,
+                subtract_mean_k=True,
+            )
+            index_q = index_q.reshape(
+                num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
+            )
+            index_k = index_k.reshape(
+                num_tokens, num_index_k_heads, proxy_dim
+            )
+            index_z = index_z.reshape(
+                num_tokens, num_index_k_heads, proxy_dim
+            )
+        else:
+            index_k = self.sparse_indexer_k_norm(index_k.contiguous())
+            index_q = index_q.view(
+                num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
+            ).contiguous()
+            index_q = self.sparse_indexer_q_norm(index_q)
+            index_k = index_k.view(
+                num_tokens, num_index_k_heads, proxy_dim
+            ).contiguous()
+            index_q, index_k = self._apply_sparse_indexer_rope(
+                positions,
+                index_q.reshape(num_tokens, -1, proxy_dim),
+                index_k,
+            )
+            index_q = index_q.reshape(
+                num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
+            )
+            index_z = index_z.view(
+                num_tokens, num_index_k_heads, proxy_dim
+            ).contiguous()
 
         weights = weights.to(dtype=torch.float32)
         weights = weights.view(num_tokens, self.num_kv_heads, heads_per_group)
@@ -426,14 +500,36 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         reduce_scatter_output: bool = False,
     ) -> torch.Tensor:
         qkv, qkzg = self.qkv_indexer_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q_by_head = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
-        q = self.q_norm(q_by_head.contiguous()).view(q.shape)
-        k_by_head = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
-        k = self.k_norm(k_by_head.contiguous()).view(k.shape)
-        if self.use_rope:
-            q, k = self.rotary_emb(positions, q, k)
+        if self.use_fused_qknorm_rope:
+            q, k, v = fused_qknorm_rope(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rope_cos,
+                self.rope_sin,
+                positions,
+                head_dim=self.head_dim,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                rotary_pairs=self._fused_rotary_pairs,
+                eps=self.q_norm.variance_epsilon,
+                norm_weight_bias=1.0 if self.zero_centered else 0.0,
+            )
+        else:
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+            q_by_head = q.view(
+                *q.shape[:-1], self.num_heads, self.head_dim
+            )
+            q = self.q_norm(q_by_head.contiguous()).view(q.shape)
+            k_by_head = k.view(
+                *k.shape[:-1], self.num_kv_heads, self.head_dim
+            )
+            k = self.k_norm(k_by_head.contiguous()).view(k.shape)
+            if self.use_rope:
+                q, k = self.rotary_emb(positions, q, k)
 
         index_q_raw, index_k_raw, index_z_raw, gate = (
             self.qkv_indexer_proj.split_indexer(qkzg)
@@ -658,6 +754,127 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
         return self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
 
+class AscendStep4Attention(Step4Attention):
+    """Upstream Step4Attention with fused QKNorm+RoPE for Ascend.
+
+    Sliding-window layers land here. The upstream forward decomposes RMSNorm
+    and RoPE into ~34 eager aclnn ops because the Optimus/CuTeDSL fused
+    kernels are CUDA-only. This override injects the Ascend SIMD Triton
+    kernel for head_dim=192, falling back to the original eager path
+    otherwise.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.use_fused_qknorm_rope = (
+            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1"
+            and getattr(self, "use_rope", False)
+            and self.head_dim == 192
+            and not getattr(self, "use_dsa_backend", False)
+            and not getattr(self, "use_optimus_qknorm_cache", False)
+            and not getattr(self, "use_optimus_qknorm", False)
+        )
+        if self.use_fused_qknorm_rope:
+            self._fused_rotary_pairs = self.rotary_dim // 2
+            rotary_cache = self.rotary_emb.cos_sin_cache
+            self.rope_cos, self.rope_sin = rotary_cache.chunk(2, dim=-1)
+        else:
+            self._fused_rotary_pairs = 0
+            self.rope_cos = None
+            self.rope_sin = None
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        reduce_scatter_output: bool = False,
+    ) -> torch.Tensor:
+        if self.use_dsa_backend:
+            qkv, qkzg = self.qkv_indexer_proj(hidden_states)
+            extra_dims = None
+        elif self.fuse_qkv_gate:
+            qkvg, _ = self.qkvg_proj(hidden_states)
+            qkv, extra_dims = qkvg.split(
+                [self.q_size + 2 * self.kv_size, self.num_heads], dim=-1
+            )
+            qkv = qkv.contiguous()
+            extra_dims = extra_dims.contiguous()
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            qkzg = None
+            extra_dims = None
+
+        kv_cache_dummy_dep = None
+        if self.use_fused_qknorm_rope:
+            q, k, v = fused_qknorm_rope(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rope_cos,
+                self.rope_sin,
+                positions,
+                head_dim=self.head_dim,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                rotary_pairs=self._fused_rotary_pairs,
+                eps=self.q_norm.variance_epsilon,
+                norm_weight_bias=1.0 if self.zero_centered else 0.0,
+            )
+        else:
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+            q_by_head = q.view(
+                *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
+            )
+            q_by_head = self.q_norm(q_by_head.contiguous())
+            q = q_by_head.view(q.shape)
+            k_by_head = k.view(
+                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
+            )
+            k_by_head = self.k_norm(k_by_head.contiguous())
+            k = k_by_head.view(k.shape)
+            if self.use_rope:
+                q, k = self.rotary_emb(positions, q, k)
+
+        if self.sparse_attn is not None:
+            attn_output, extra_dims = self.sparse_attn.forward(
+                positions, hidden_states, q, k, v, qkzg=qkzg
+            )
+        else:
+            attn_output = self.attn(
+                q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep
+            )
+        if extra_dims is None and self.use_head_wise_attn_gate:
+            extra_dims, _ = self.g_proj(hidden_states)
+
+        if extra_dims is not None:
+            attn_output = torch.ops.vllm.step4_materialize_gate_input(
+                attn_output
+            )
+            extra_dims = torch.ops.vllm.step4_materialize_gate_input(
+                extra_dims
+            )
+
+        if self.use_head_wise_attn_gate:
+            output = (
+                attn_output.view(
+                    *attn_output.shape[:-1], self.num_heads, self.head_dim
+                )
+                * extra_dims.unsqueeze(-1).sigmoid()
+            )
+            attn_output = output.view(*attn_output.shape)
+        if reduce_scatter_output:
+            output, _ = self.o_proj(
+                attn_output,
+                reduce_scatter_results=True,
+                reduce_scatter_dim=0,
+            )
+        else:
+            output, _ = self.o_proj(attn_output)
+        return output
+
+
 class AscendStep4DecoderLayer(Step4DecoderLayer):
     """Upstream decoder layer with the attention swapped per layer type.
 
@@ -756,7 +973,7 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
                 **attn_kwargs,
             )
         else:
-            self.self_attn = Step4Attention(
+            self.self_attn = AscendStep4Attention(
                 sparse_config=None,
                 model_has_dsa_layers=False,
                 **attn_kwargs,
