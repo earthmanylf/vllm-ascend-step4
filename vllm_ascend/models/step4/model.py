@@ -360,7 +360,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         self.max_position_embeddings = max_position
 
         self.use_fused_qknorm_rope = (
-            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "0") == "1"
+            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1"
             and self.use_rope
             and self.head_dim == 192
         )
@@ -767,7 +767,7 @@ class AscendStep4Attention(Step4Attention):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.use_fused_qknorm_rope = (
-            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "0") == "1"
+            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1"
             and getattr(self, "use_rope", False)
             and self.head_dim == 192
             and not getattr(self, "use_dsa_backend", False)
