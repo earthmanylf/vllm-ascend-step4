@@ -2896,8 +2896,7 @@ def sparse_attention_prefill(
     topk = int(packed_regions.shape[1])
     scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
 
-    if block_regions is None:
-        block_regions = min(topk, 16)
+    block_regions = min(topk, 16)
 
     out = torch.empty_like(query)
     lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
