@@ -2,9 +2,9 @@
 """fused_qknorm_rope -- Ascend release build (self-contained).
 
 Independent publishable operator: RMSNorm + NeoX RoPE fused into one SIMD
-Triton kernel for Ascend (910B, Triton-Ascend backend), plus a V passthrough
-kernel. No dependency on inference/kernel.py or _npu_adapt.apply(); import and
-call ``fused_qknorm_rope`` directly.
+Triton kernel for Ascend (910B, Triton-Ascend backend), with in-kernel V
+passthrough. No dependency on inference/kernel.py or _npu_adapt.apply();
+import and call ``fused_qknorm_rope`` directly.
 
 Numerical contract: this is an Ascend-specific SIMD implementation (vector
 tree reduction for RMSNorm, in-kernel libdevice sin/cos for RoPE). It is NOT
@@ -47,10 +47,11 @@ NORM_WEIGHT_BIAS: float = 1.0
     key=["tokens"],
 )
 @triton.jit(do_not_specialize=["tokens"])
-def _qknorm_rope_192_kernel(
+def _split_qkv_norm_rope_192_kernel(
     qkv_ptr,
     q_out_ptr,
     k_out_ptr,
+    v_out_ptr,
     q_weight_ptr,
     k_weight_ptr,
     inv_freq_ptr,
@@ -59,6 +60,7 @@ def _qknorm_rope_192_kernel(
     stride_qkv_token,
     stride_q_out_token,
     stride_k_out_token,
+    stride_v_out_token,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     ROTARY_PAIRS: tl.constexpr,
@@ -75,6 +77,10 @@ def _qknorm_rope_192_kernel(
       - q_weight / k_weight are each loaded once, outside the loops
       - RoPE shared data (angle, cos, sin, idx) hoisted outside both loops
       - No runtime is_q check, no tl.where, no complementary store masks
+
+    V passthrough (formerly _copy_v_192_kernel) rides along the K loop: V is
+    the packed head right after K in qkv, so the same tile traversal copies it
+    as raw BF16 -- saving one kernel launch per call.
     """
     pid_m = tl.program_id(0)
 
@@ -101,6 +107,7 @@ def _qknorm_rope_192_kernel(
     non_rot_mask = (dims >= 2 * ROTARY_PAIRS) & dim_mask
     rot_store_mask = t_mask[:, None] & pair_mask[None, :]
     non_rot_store_mask = non_rot_mask[None, :] & t_mask[:, None]
+    load_mask = t_mask[:, None] & dim_mask[None, :]
 
     for q_head in tl.range(NUM_Q_HEADS):
         head_base = offs_t[:, None] * stride_qkv_token + q_head * HEAD_DIM
@@ -149,29 +156,12 @@ def _qknorm_rope_192_kernel(
         tl.store(k_out_ptr + k_base + idx1, rotated1, mask=rot_store_mask)
         tl.store(k_out_ptr + k_base + dims[None, :], normalized, mask=non_rot_store_mask)
 
-
-@triton.jit
-def _copy_v_192_kernel(
-    qkv_ptr,
-    v_out_ptr,
-    stride_qkv_token,
-    stride_v_out_token,
-    NUM_Q_HEADS: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """V passthrough: BF16 load/store only -- V must retain its original bits."""
-    token = tl.program_id(0)
-    head = tl.program_id(1)
-    dims = tl.arange(0, BLOCK_D)
-    mask = dims < HEAD_DIM
-    input_base = (
-        token * stride_qkv_token + (NUM_Q_HEADS + NUM_KV_HEADS + head) * HEAD_DIM
-    )
-    output_base = token * stride_v_out_token + head * HEAD_DIM
-    value = tl.load(qkv_ptr + input_base + dims, mask=mask)
-    tl.store(v_out_ptr + output_base + dims, value, mask=mask)
+        # V passthrough: V must retain its original bits.
+        v_head = packed_head + NUM_KV_HEADS
+        v_in_base = offs_t[:, None] * stride_qkv_token + v_head * HEAD_DIM
+        v_value = tl.load(qkv_ptr + v_in_base + dims[None, :], mask=load_mask)
+        v_out_base = offs_t[:, None] * stride_v_out_token + kv_head * HEAD_DIM
+        tl.store(v_out_ptr + v_out_base + dims[None, :], v_value, mask=load_mask)
 
 
 _inv_freq_cache: dict[tuple[str, int], torch.Tensor] = {}
@@ -216,10 +206,11 @@ def _fused_qknorm_rope_impl(
         return q_out, k_out, v_out
 
     grid = lambda meta: (triton.cdiv(tokens, meta["BLOCK_M"]),)
-    _qknorm_rope_192_kernel[grid](
+    _split_qkv_norm_rope_192_kernel[grid](
         qkv,
         q_out,
         k_out,
+        v_out,
         q_weight,
         k_weight,
         inv_freq,
@@ -228,6 +219,7 @@ def _fused_qknorm_rope_impl(
         qkv.stride(0),
         q_out.stride(0),
         k_out.stride(0),
+        v_out.stride(0),
         NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,
         ROTARY_PAIRS=rotary_pairs,
@@ -236,18 +228,6 @@ def _fused_qknorm_rope_impl(
         HEAD_DIM=HEAD_DIM,
         BLOCK_D=256,
         BLOCK_R=128,
-    )
-
-    _copy_v_192_kernel[(tokens, num_kv_heads)](
-        qkv,
-        v_out,
-        qkv.stride(0),
-        v_out.stride(0),
-        NUM_Q_HEADS=num_q_heads,
-        NUM_KV_HEADS=num_kv_heads,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_D=256,
-        num_warps=4,
     )
     return q_out, k_out, v_out
 
