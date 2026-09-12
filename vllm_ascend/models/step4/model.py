@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 
 from typing import Any
 
@@ -88,6 +89,7 @@ from vllm.models.step4.model import (
 )
 
 import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
+from vllm_ascend import envs
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.step4.dsa_attention import (
     AscendStep4DSABackend,
@@ -100,6 +102,7 @@ from vllm_ascend.models.step4.fused_qknorm_rope import (
     fused_qknorm_rope,
 )
 from vllm_ascend.models.step4.summary_cache import AscendStep4SparseSummaryCacheLayer
+from vllm_ascend.quantization.configs.fp8_config import AscendFp8Config, Step4Fp8BlockConfig
 
 logger = init_logger(__name__)
 
@@ -114,6 +117,37 @@ def _kv_cache_torch_dtype(cache_config, vllm_config) -> torch.dtype:
     if cache_dtype in ("float", "fp32", "float32"):
         return torch.float32
     raise ValueError(f"Unsupported step4-ascend KV cache dtype: {cache_dtype}")
+
+
+def _step4_fp8_expert_layout(config: Any) -> tuple[set[int], int]:
+    """Return (bf16 expert layer indices, quant block size).
+
+    A Step4 checkpoint either declares ``quantization_config.fp8`` with
+    128x128 weight blocks -- in which case every MoE layer is fp8 except
+    those under ``modules_to_not_convert`` -- or declares nothing, in which
+    case every expert is bf16.
+    """
+    quant_config = getattr(config, "quantization_config", None)
+    if not quant_config:
+        return set(), 0
+    quant_method = quant_config.get("quant_method")
+    if quant_method not in ("fp8", "compressed-tensors"):
+        raise ValueError(
+            f"Step4 Ascend fp8 experts support quant_method=fp8, got "
+            f"{quant_method!r}."
+        )
+    block = quant_config.get("weight_block_size") or [128, 128]
+    if list(block) != [128, 128]:
+        raise ValueError(
+            "Step4 Ascend fp8 experts require 128x128 weight blocks, got "
+            f"{list(block)}."
+        )
+    bf16_layers: set[int] = set()
+    for entry in quant_config.get("modules_to_not_convert") or []:
+        match = re.search(r"layers\.(\d+)\.", entry)
+        if match and ".moe." in entry:
+            bf16_layers.add(int(match.group(1)))
+    return bf16_layers, 128
 
 
 class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
@@ -726,6 +760,33 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
                 )
             activation = "swiglustep"
 
+        # Optional Step4-native fp8 expert execution, gated by the
+        # ``VLLM_ASCEND_ENABLE_STEP4_FP8`` env var (default off): the routed
+        # experts keep the checkpoint's fp8 e4m3 weights and 128x128 block
+        # scales and run them with the kernels vendored from the step4-hf
+        # reference (Step4Fp8BlockFusedMoEMethod), instead of the default
+        # AscendFp8BlockFusedMoEMethod path that resolves to bf16 or
+        # requantizes to MXFP8. Layers the checkpoint left in bf16
+        # (modules_to_not_convert) stay unquantized either way.
+        moe_quant_config = quant_config
+        enable_step4_fp8 = bool(envs.VLLM_ASCEND_ENABLE_STEP4_FP8)
+        if enable_step4_fp8 and isinstance(quant_config, AscendFp8Config):
+            bf16_expert_layers, _ = _step4_fp8_expert_layout(config)
+            if self.layer_idx in bf16_expert_layers:
+                moe_quant_config = None
+            else:
+                # Shallow copy re-bound to the Step4 config so the
+                # framework's fp8-block parsing is preserved while the MoE
+                # route changes.
+                step4_config = copy.copy(quant_config)
+                step4_config.__class__ = Step4Fp8BlockConfig
+                moe_quant_config = step4_config
+                logger.info(
+                    "Layer %s: enable_step4_fp8 is set; routed experts run "
+                    "the native fp8 block kernels (Step4Fp8BlockFusedMoEMethod).",
+                    self.layer_idx,
+                )
+
         share_expert_dim = _pad_size_for_groupwise_quant(
             config.share_expert_dim, quant_config
         )
@@ -769,7 +830,7 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
             reduce_results=reduce_results,
             scoring_func="sigmoid",
             renormalize=config.norm_expert_weight,
-            quant_config=quant_config,
+            quant_config=moe_quant_config,
             activation=activation,
             prefix=f"{prefix}.experts",
             e_score_correction_bias=self.router_bias,
@@ -783,6 +844,40 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
         # metadata (mirrors MiniMaxM3MoE).
         self.experts.global_redundant_expert_num = self.n_redundant_experts
         self.experts.moe_config.global_redundant_expert_num = self.n_redundant_experts
+        if enable_step4_fp8:
+            self._bind_scheme_router()
+
+    def _bind_scheme_router(self) -> None:
+        """Give the fp8 scheme the fp32 router references.
+
+        The framework's router narrows topk_weights to bf16; the scheme
+        recomputes them in fp32 from the gate weight + bias, which needs
+        these bindings.
+        """
+        from vllm_ascend.quantization.methods.w8a8.fp8_block import (
+            Step4Fp8BlockFusedMoEMethod,
+        )
+
+        def _find(obj: Any, depth: int = 0) -> Step4Fp8BlockFusedMoEMethod | None:
+            if depth > 5:
+                return None
+            if isinstance(obj, Step4Fp8BlockFusedMoEMethod):
+                return obj
+            for attr in ("routed_experts", "experts", "layer", "quant_method"):
+                child = getattr(obj, attr, None)
+                if child is not None and child is not obj:
+                    found = _find(child, depth + 1)
+                    if found is not None:
+                        return found
+            return None
+
+        scheme = _find(self.experts)
+        if scheme is not None:
+            scheme.bind_router(
+                self.gate.weight,
+                self.router_bias,
+                self.routed_scaling_factor,
+            )
 
     def forward(
         self,

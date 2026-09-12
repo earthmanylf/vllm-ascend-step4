@@ -641,6 +641,74 @@ def quant_apply_mlp(
     return hidden_states, before_gmm2_evt
 
 
+def fp8_block_apply_mlp(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+    activation: MoEActivation | str,
+) -> torch.Tensor:
+    """Block-fp8 (128x128 ``weight_scale_inv``) expert MLP on the sorted layout.
+
+    Consumes the dispatcher's expert-sorted ``hidden_states`` with the
+    per-expert ``group_list`` intervals, and runs, per expert, the vendored
+    step4-hf kernel pair: dynamic per-128-group e4m3 activation quantization
+    plus the block-scaled fp8 GEMM (scales folded after the fp32 dot).
+    ``swiglustep`` applies the fp32 clamps with a single rounding back to
+    bf16; the limit is fixed at 7.0 (the only value the Step4 model accepts).
+    """
+    # Lazy import: the kernels live under models/step4 and must not cycle
+    # the quantization package at module import time.
+    from vllm_ascend.models.step4.fp8_kernels import act_quant, fp8_gemm
+
+    num_experts, packed_intermediate, _ = w1.shape
+    intermediate = packed_intermediate // 2
+    # group_list conventions: type 0 = per-expert prefix sums (MC2), type 1 =
+    # per-expert token counts (AllGather). Rows of ``hidden_states`` are the
+    # per-expert intervals of the local experts, in local-expert order.
+    if group_list_type == 0:
+        prefix = group_list.tolist()
+        counts = [prefix[0]] + [prefix[i] - prefix[i - 1] for i in range(1, len(prefix))]
+    elif group_list_type == 1:
+        counts = group_list.tolist()
+    else:
+        raise NotImplementedError(f"fp8_block_apply_mlp does not support group_list_type={group_list_type}.")
+    if len(counts) != num_experts:
+        # AllGather's init_routing reports one count per *global* expert; the
+        # sorted rows cover only this rank's contiguous local range (linear
+        # placement), so window the counts to it.
+        from vllm.distributed import get_ep_group
+
+        first_local = get_ep_group().rank_in_group * num_experts
+        counts = counts[first_local : first_local + num_experts]
+
+    x_bf = hidden_states if hidden_states.dtype == torch.bfloat16 else hidden_states.to(torch.bfloat16)
+    out = torch.zeros(x_bf.shape[0], w2.shape[1], dtype=torch.bfloat16, device=x_bf.device)
+    start = 0
+    for expert in range(num_experts):
+        count = counts[expert]
+        if count == 0:
+            continue
+        tokens = x_bf[start : start + count]
+        x_fp8, x_scale = act_quant(tokens)
+        gate_up = fp8_gemm(x_fp8, x_scale, w1[expert], w1_scale[expert])
+        gate, up = gate_up[:, :intermediate], gate_up[:, intermediate:]
+        if str(activation) in ("swiglustep", "MoEActivation.SWIGLUSTEP"):
+            activated = torch.nn.functional.silu(gate.float()).clamp(max=7.0)
+            bounded = up.float().clamp(-7.0, 7.0)
+            hidden = (activated * bounded).to(gate.dtype)
+        else:
+            hidden = (torch.nn.functional.silu(gate.float()) * up.float()).to(gate.dtype)
+        h_fp8, h_scale = act_quant(hidden)
+        out[start : start + count] = fp8_gemm(h_fp8, h_scale, w2[expert], w2_scale[expert])
+        start += count
+    # Contract of unified_apply_mlp's quant path: (output, before_gmm2 event).
+    return out, None
+
+
 def unquant_apply_mlp(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -795,6 +863,18 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     swiglu_beta = mlp_compute_input.swiglu_beta
     activation_situ_beta = mlp_compute_input.activation_situ_beta
     activation_situ_linear_beta = mlp_compute_input.activation_situ_linear_beta
+
+    if mlp_compute_input.quant.quant_type == QuantType.FP8_BLOCK:
+        return fp8_block_apply_mlp(
+            hidden_states=hidden_states,
+            w1=w1,
+            w1_scale=w1_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            group_list=group_list,
+            group_list_type=group_list_type,
+            activation=activation,
+        )
 
     if not mlp_compute_input.quant.is_quant:
         return unquant_apply_mlp(

@@ -367,3 +367,164 @@ class AscendFp8BlockFusedMoEMethod(AscendMoEScheme):
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+
+
+@register_scheme(FP8_METHOD, "step4_moe")
+class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
+    """Step4 routed experts executing the native fp8 block quantization.
+
+    Unlike :class:`AscendFp8BlockFusedMoEMethod`, weights stay
+    ``float8_e4m3fn`` with their fp32 ``weight_scale_inv`` block scales
+    exactly as checkpointed -- no bf16 resolution and no MXFP8 requantize.
+    ``apply`` runs each expert with the kernels vendored from the step4-hf
+    reference (``vllm_ascend/models/step4/fp8_kernels.py``): dynamic
+    per-128-group e4m3 activation quantization plus the block-scaled fp8
+    GEMM, clamped SwiGLU between the two projections, and a top-k
+    slot-order fp32 weighted combine.
+
+    With TP (no EP) every rank holds the intermediate-dim slice of all
+    experts, so each rank produces a partial routed contribution that the
+    decoder layer combines with the shared expert in fp32 before one
+    all-reduce.
+    """
+
+    quant_type: QuantType = QuantType.NONE
+
+    # The only clamp limit Step4 ships (validated by the model's MoE block).
+    SWIGLU_LIMIT = 7.0
+
+    def __init__(self, weight_block_size: tuple[int, int], moe_config) -> None:
+        self.block_n, self.block_k = weight_block_size
+        if (self.block_n, self.block_k) != (128, 128):
+            raise ValueError(f"Step4 fp8 experts require 128x128 weight blocks, got {(self.block_n, self.block_k)}.")
+        # Hints the upstream loader to narrow ``*_weight_scale_inv`` per
+        # expert shard, exactly like AscendFp8BlockFusedMoEMethod.
+        self.group_size = self.block_k
+        self.moe_config = moe_config
+        # Router references for the fp32 weight recompute; bound by the
+        # model's MoE block after construction (see FusedMoEBlock).
+        self._gate_weight: torch.Tensor | None = None
+        self._router_bias: torch.Tensor | None = None
+        self._routed_scaling_factor: float = 1.0
+
+    def bind_router(
+        self,
+        gate_weight: torch.Tensor,
+        router_bias: torch.Tensor,
+        routed_scaling_factor: float,
+    ) -> None:
+        self._gate_weight = gate_weight
+        self._router_bias = router_bias
+        self._routed_scaling_factor = routed_scaling_factor
+
+    def get_weight(
+        self,
+        num_experts: int,
+        intermediate_size_per_partition: int,
+        hidden_sizes: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        return {
+            "w13_weight": torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_sizes,
+                dtype=BLOCK_FP8_WEIGHT_DTYPE,
+            ),
+            "w2_weight": torch.empty(
+                num_experts,
+                hidden_sizes,
+                intermediate_size_per_partition,
+                dtype=BLOCK_FP8_WEIGHT_DTYPE,
+            ),
+        }
+
+    def get_dynamic_quant_param(
+        self,
+        num_experts: int,
+        intermediate_size_per_partition: int,
+        hidden_sizes: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        return {
+            "w13_weight_scale_inv": torch.empty(
+                num_experts,
+                cdiv(2 * intermediate_size_per_partition, self.block_n),
+                cdiv(hidden_sizes, self.block_k),
+                dtype=torch.float32,
+            ),
+            "w2_weight_scale_inv": torch.empty(
+                num_experts,
+                cdiv(hidden_sizes, self.block_n),
+                cdiv(intermediate_size_per_partition, self.block_k),
+                dtype=torch.float32,
+            ),
+        }
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Nothing to resolve or requantize: the fp8 weights and block scales
+        # are executed as loaded.
+        return
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: Any | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ):
+        # Same shape as AscendW8A8MXFP8DynamicFusedMoEMethod.apply: pack the
+        # routed-experts inputs and hand them to the framework's three-stage
+        # pipeline (token_dispatch -> MLP compute -> token_combine). The
+        # dispatcher pair adapts to the active comm method (ALLGATHER sorts
+        # locally and unpermutes, MC2 ships tokens across ranks), and the
+        # FP8_BLOCK quant branch routes the middle stage to the vendored
+        # step4-hf block-fp8 kernels (see fp8_block_apply_mlp).
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+        from vllm_ascend.ops.fused_moe.dataclass.fused_experts import (
+            build_fused_experts_input,
+        )
+
+        weights = self._router_weights_fp32(x, topk_ids, topk_weights)
+
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        return moe_comm_method.fused_experts(
+            fused_experts_input=build_fused_experts_input(
+                hidden_states=x,
+                topk_weights=weights,
+                topk_ids=topk_ids,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                quant_type=QuantType.FP8_BLOCK,
+                dynamic_eplb=False,
+                expert_map=layer.ascend_expert_map,
+                global_redundant_expert_num=layer.global_redundant_expert_num,
+                mc2_mask=layer.ascend_mc2_mask,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                pertoken_scale=None,
+                activation=layer.activation,
+                w1_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+            )
+        )
+
+    def _router_weights_fp32(
+        self,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """The framework's router narrows topk_weights to bf16; recompute them
+        in fp32 from the bound router (bitwise the step4_router_bias_eager
+        arithmetic, which is the deployed kernel's semantics)."""
+        if self._gate_weight is None:
+            return topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
+        logits = torch.nn.functional.linear(x.to(torch.bfloat16).float(), self._gate_weight.float())
+        gate_prob = torch.sigmoid(logits)
+        weights = gate_prob.gather(-1, topk_ids.to(torch.int64))
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+        if self._routed_scaling_factor != 1.0:
+            weights = weights * self._routed_scaling_factor
+        return weights
