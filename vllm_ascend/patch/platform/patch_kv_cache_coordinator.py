@@ -386,7 +386,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | tuple[tuple[list[KVCacheBlock], ...], int, int]:
+        max_returned_cache_hit_length: int | None = None,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
 
@@ -398,18 +399,28 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         Args:
             block_hashes: The block hashes of the request.
             max_cache_hit_length: The maximum length of the cache hit.
+            max_returned_cache_hit_length: A stricter ceiling on the returned
+                hit length (e.g. a model's side-storage
+                ``prefix_cache_recompute_tokens`` replay suffix). The lookup
+                may still inspect up to ``max_cache_hit_length`` so EAGLE/MTP
+                keeps its one-unit lookahead without a second rewind.
 
         Returns:
             A tuple containing:
                 - A tuple of the cache hit blocks for each single type manager.
-                - The number of tokens of the longest cache hit.
+                - The number of tokens of the reconciled (combined) cache hit.
+                - The number of uncached shared-prefix tokens.
         """
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             return block_hashes
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
-        hit_length = max_cache_hit_length
+        returned_ceiling = min(
+            max_cache_hit_length,
+            max_cache_hit_length if max_returned_cache_hit_length is None else max_returned_cache_hit_length,
+        )
+        hit_length = returned_ceiling
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
         hit_length_by_group: list[int] = [0] * num_groups
@@ -456,6 +467,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                         else group_block_size
                     )
                     _max_length = min(curr_hit_length + eagle_margin, max_cache_hit_length)
+                else:
+                    _max_length = min(_max_length, returned_ceiling)
                 hit_result = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,

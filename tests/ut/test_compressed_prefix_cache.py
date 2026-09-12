@@ -375,3 +375,84 @@ def test_hybrid_coordinator_truncates_every_full_attention_group() -> None:
 
     assert hit_length == 6
     assert [len(blocks) for blocks in hit_blocks] == [2, 1, 2]
+
+
+def test_hybrid_coordinator_caps_returned_hit_to_recompute_suffix() -> None:
+    """Regression test: upstream get_computed_blocks passes a third
+    ``max_returned_cache_hit_length`` argument (from a model's side-storage
+    ``prefix_cache_recompute_tokens``) whenever the replay suffix exceeds one
+    token. The coordinator must accept it and cap the returned hit, while the
+    legacy two-argument call shape keeps working."""
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    coordinator = AscendHybridKVCacheCoordinator(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=32,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["full_a"],
+                    FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["full_b"],
+                    FullAttentionSpec(
+                        block_size=2 * block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+            ],
+        ),
+        max_model_len=8192,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        hash_block_size=hash_block_size,
+        scheduler_block_size=2 * block_size,
+        max_num_batched_tokens=8192,
+    )
+    request = _make_request(
+        "a",
+        [index // hash_block_size for index in range(24)],
+        hash_block_size,
+    )
+
+    for group_id in (0, 1):
+        group_block_size = block_size * (1 + group_id)
+        num_full_blocks = len(request.prompt_token_ids) // group_block_size
+        blocks = coordinator.block_pool.get_new_blocks(num_full_blocks)
+        coordinator.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=0,
+            num_full_blocks=num_full_blocks,
+            block_size=group_block_size,
+            kv_cache_group_id=group_id,
+        )
+
+    # Legacy call shape (no recompute suffix): the whole prompt hits.
+    hit_blocks, hit_length, _ = coordinator.find_longest_cache_hit(
+        request.block_hashes,
+        max_cache_hit_length=len(request.prompt_token_ids) - 1,
+    )
+    assert hit_length == 16
+    assert [len(blocks) for blocks in hit_blocks] == [4, 2]
+
+    # Three-argument shape: replay the last 12 tokens, so only the first 12
+    # may be returned; the min-over-groups hit floors to the block boundary.
+    hit_blocks, hit_length, _ = coordinator.find_longest_cache_hit(
+        request.block_hashes,
+        len(request.prompt_token_ids) - 1,
+        len(request.prompt_token_ids) - 12,
+    )
+    assert hit_length == 8
+    assert [len(blocks) for blocks in hit_blocks] == [2, 1]
