@@ -213,6 +213,15 @@ def quant_apply_mlp(
     use_w4a8_per_channel_gmm_swiglu: bool = False,
 ) -> torch.Tensor:
     input_hidden_dtype = hidden_states.dtype
+    # Count-mode group list for swiglustep's valid-row skip (None -> compute
+    # all rows, e.g. type-2 layouts that need conversion context).
+    swiglustep_group_list = (
+        group_list
+        if group_list_type == 1
+        else cumsum_group_list(group_list, group_list_type, 1)
+        if group_list_type == 0
+        else None
+    )
     situ_beta = 1.0 if activation_situ_beta is None else activation_situ_beta
     act_name = getattr(activation, "value", activation)
     is_situ_activation = activation == MoEActivation.SITU
@@ -310,7 +319,11 @@ def quant_apply_mlp(
                     }
                 )
             hidden_states = torch_npu.npu_grouped_matmul(**gmm1_kwargs)[0]
-            hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=7.0)
+            hidden_states = AscendSwigluStepAndMul.swiglustep_forward(
+                hidden_states,
+                limit=7.0,
+                group_list=swiglustep_group_list,
+            )
             hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
                 hidden_states, act_quant_type=act_quant_type, use_mxfp_quant=use_mxfp_quant
             )
@@ -410,7 +423,11 @@ def quant_apply_mlp(
         dispose_tensor(unquantized_hidden_states)
         # act_fn: swiglu
         if activation == MoEActivation.SWIGLUSTEP:
-            hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=swiglu_limit or 7.0)
+            hidden_states = AscendSwigluStepAndMul.swiglustep_forward(
+                hidden_states,
+                limit=swiglu_limit or 7.0,
+                group_list=swiglustep_group_list,
+            )
         elif is_gelu_activation:
             gate, up = hidden_states.chunk(2, dim=-1)
             approximate = "tanh" if activation == MoEActivation.GELU_TANH else "none"
@@ -551,7 +568,11 @@ def quant_apply_mlp(
                 dispose_tensor(quantized_hidden_states)
             # act_fn: swiglu
             if activation == MoEActivation.SWIGLUSTEP:
-                hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=swiglu_limit or 7.0)
+                hidden_states = AscendSwigluStepAndMul.swiglustep_forward(
+                    hidden_states,
+                    limit=swiglu_limit or 7.0,
+                    group_list=swiglustep_group_list,
+                )
                 hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
                     hidden_states, act_quant_type=act_quant_type, use_mxfp_quant=use_mxfp_quant
                 )
@@ -665,6 +686,16 @@ def unquant_apply_mlp(
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
 
+    # Count-mode group list for swiglustep's valid-row skip (None -> compute
+    # all rows, e.g. type-2 layouts that need conversion context).
+    swiglustep_group_list = (
+        group_list
+        if group_list_type == 1
+        else cumsum_group_list(group_list, group_list_type, 1)
+        if group_list_type == 0
+        else None
+    )
+
     gate_up_out = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w1],
@@ -731,7 +762,11 @@ def unquant_apply_mlp(
             swiglu_beta=swiglu_beta,
         )
     elif activation == MoEActivation.SWIGLUSTEP:
-        gate_up_out = AscendSwigluStepAndMul.swiglustep_forward(gate_up_out, limit=swiglu_limit or 7.0)
+        gate_up_out = AscendSwigluStepAndMul.swiglustep_forward(
+            gate_up_out,
+            limit=swiglu_limit or 7.0,
+            group_list=swiglustep_group_list,
+        )
     elif activation == MoEActivation.GELU:
         gate, up = gate_up_out.chunk(2, dim=-1)
         gate_up_out = torch.nn.functional.gelu(gate) * up

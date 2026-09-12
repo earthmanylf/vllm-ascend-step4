@@ -46,18 +46,37 @@ def _swiglustep_kernel(
     x_ptr,
     out_ptr,
     M,  # total rows (runtime value, not constexpr)
+    group_list_ptr,  # per-group valid row counts (count mode); sum = total valid rows
     TOTAL_COLS: tl.constexpr,  # 2N
     HALF_COLS: tl.constexpr,  # N
     LIMIT: tl.constexpr,
     NUM_CORES: tl.constexpr,
+    HAS_GROUP_LIST: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,  # group_list length
+    BLOCK_E: tl.constexpr,  # next_power_of_2(NUM_EXPERTS)
 ):
+    # Same valid-row semantics as npu_dequant_swiglu_quant's group_index:
+    # only the first sum(group_list) rows hold real tokens; the tail is GMM
+    # padding, so it is neither read nor written. The count-mode list is
+    # summed on device -- no host sync.
+    if HAS_GROUP_LIST:
+        expert_offsets = tl.arange(0, BLOCK_E)
+        counts = tl.load(
+            group_list_ptr + expert_offsets,
+            mask=expert_offsets < NUM_EXPERTS,
+            other=0,
+        ).to(tl.int64)
+        valid_rows = tl.minimum(tl.sum(counts), M)
+    else:
+        valid_rows = M
+
     # even split of rows across cores; tail core handles the remainder
-    block_size = (M - 1) // NUM_CORES + 1
+    block_size = (valid_rows - 1) // NUM_CORES + 1
     pid = tl.program_id(0)
     row_begin = pid * block_size
-    if row_begin >= M:
+    if row_begin >= valid_rows:
         return
-    row_end = tl.minimum((pid + 1) * block_size, M)
+    row_end = tl.minimum((pid + 1) * block_size, valid_rows)
 
     col_offsets = tl.arange(0, TOTAL_COLS)
     out_offsets = tl.arange(0, HALF_COLS)
@@ -82,14 +101,22 @@ def _swiglustep_kernel(
         )
 
 
-def swiglustep_forward_triton(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
+def swiglustep_forward_triton(
+    x: torch.Tensor, limit: float = 7.0, group_list: torch.Tensor | None = None
+) -> torch.Tensor:
     """Fused SwigluStep: silu(gate).clamp(max=limit) * up.clamp(±limit).
 
     Args:
         x: row-major tensor of shape [..., 2N] (dtype: float16 / bfloat16).
         limit: clamp bound (scalar). Step-3.7 uses 7.0 for expert layers.
+        group_list: optional per-group valid row counts (count mode, i.e.
+            ``group_list_type == 1``). Only the first ``sum(group_list)`` rows
+            are computed and the GMM padding tail is skipped (summed on
+            device, no host sync); mirrors ``npu_dequant_swiglu_quant``'s
+            ``group_index`` valid-row semantics.
     Returns:
-        tensor of shape [..., N], same dtype as x.
+        tensor of shape [..., N], same dtype as x. Rows at or beyond
+        ``sum(group_list)`` are left uninitialized when group_list is given.
     """
     assert x.shape[-1] % 2 == 0, f"swiglustep: last dim must be 2N (even), got {x.shape[-1]}"
     if not x.is_contiguous():
@@ -110,6 +137,18 @@ def swiglustep_forward_triton(x: torch.Tensor, limit: float = 7.0) -> torch.Tens
         f"swiglustep: N (={half_cols}) must be a multiple of {align_elems} for 32-byte UB alignment on NPU vector core"
     )
 
+    has_group_list = group_list is not None
+    if has_group_list:
+        assert group_list.ndim == 1 and group_list.numel() > 0, (
+            f"swiglustep: group_list must be a non-empty 1D tensor, got shape {tuple(group_list.shape)}"
+        )
+        assert group_list.is_contiguous(), "swiglustep: group_list must be contiguous"
+        num_experts = group_list.numel()
+    else:
+        # unused when HAS_GROUP_LIST is False; pass a valid pointer and 1
+        group_list = x_2d
+        num_experts = 1
+
     out_2d = torch.empty(M, half_cols, dtype=x.dtype, device=x.device)
 
     # idempotent: worker.py calls it once at serve time; standalone scripts need it
@@ -120,10 +159,14 @@ def swiglustep_forward_triton(x: torch.Tensor, limit: float = 7.0) -> torch.Tens
         x_2d,
         out_2d,
         M,
+        group_list,
         TOTAL_COLS=total_cols,
         HALF_COLS=half_cols,
         LIMIT=limit,
         NUM_CORES=num_vectorcore,
+        HAS_GROUP_LIST=has_group_list,
+        NUM_EXPERTS=num_experts,
+        BLOCK_E=triton.next_power_of_2(num_experts),
         multibuffer=True,
     )
 

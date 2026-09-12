@@ -80,3 +80,58 @@ def test_swiglustep_triton_handles_non_contiguous_input():
 
     assert out_triton.shape == out_ref.shape
     assert torch.allclose(out_triton, out_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    ("counts", "m"),
+    [
+        ([3, 5, 7], 128),  # heavy padding tail
+        ([64], 64),  # full coverage
+        ([40, 41], 81),  # exactly full
+        ([1, 1, 1], 512),  # tiny valid prefix, big tail
+    ],
+)
+@torch.inference_mode()
+def test_swiglustep_triton_group_list_skips_padding(index_dtype, counts, m):
+    """with a count-mode group_list only [0, sum(group_list)) rows are
+    computed, matching npu_dequant_swiglu_quant's group_index valid-row
+    semantics."""
+    init_device_properties_triton()
+    torch.manual_seed(0)
+    x = torch.randn(m, 2560, dtype=torch.bfloat16, device="npu")
+    group_list = torch.tensor(counts, dtype=index_dtype, device="npu")
+    valid = sum(counts)
+
+    out = swiglustep_forward_triton(x, limit=7.0, group_list=group_list)
+    out_ref = _swiglustep_reference(x[:valid], limit=7.0)
+
+    assert out.shape == (m, 1280)
+    assert out.dtype == x.dtype
+    assert torch.allclose(out[:valid], out_ref, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_swiglustep_triton_group_list_clamps_to_m():
+    """a sum(group_list) beyond M is clamped: every row is computed."""
+    init_device_properties_triton()
+    torch.manual_seed(0)
+    x = torch.randn(32, 2560, dtype=torch.bfloat16, device="npu")
+    group_list = torch.tensor([16, 48], dtype=torch.int64, device="npu")
+
+    out = swiglustep_forward_triton(x, limit=7.0, group_list=group_list)
+
+    assert torch.allclose(out, _swiglustep_reference(x, limit=7.0), atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_swiglustep_triton_group_list_zero_valid_rows():
+    """sum(group_list) == 0: nothing is computed, nothing crashes."""
+    init_device_properties_triton()
+    x = torch.randn(32, 2560, dtype=torch.bfloat16, device="npu")
+    group_list = torch.zeros(4, dtype=torch.int64, device="npu")
+
+    out = swiglustep_forward_triton(x, limit=7.0, group_list=group_list)
+
+    assert out.shape == (32, 1280)
+    assert not torch.isnan(out).any()

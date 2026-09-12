@@ -66,14 +66,18 @@ class AscendSwigluStepAndMul(SwigluStepAndMul):
             )
             return swiglustep_forward_triton(x, self.limit)
 
-    def swiglustep_forward(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
+    def swiglustep_forward(
+        x: torch.Tensor, limit: float = 7.0, group_list: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if limit is None:
             raise ValueError("SwigluStepAndMul requires limit to be set.")
 
         # Triton fused path: 1D-grid row-loop kernel that fuses
         # silu + clamp + mul into a single launch (see
         # vllm_ascend/ops/triton/activation/swiglustep.py). Numerically
-        # equivalent to forward_native below.
+        # equivalent to forward_native below. group_list (count-mode
+        # per-group valid row counts) restricts computation to valid rows,
+        # mirroring npu_dequant_swiglu_quant's group_index.
         from vllm.triton_utils import HAS_TRITON
 
         if HAS_TRITON:
@@ -81,7 +85,7 @@ class AscendSwigluStepAndMul(SwigluStepAndMul):
                 swiglustep_forward_triton,
             )
 
-            return swiglustep_forward_triton(x, limit)
+            return swiglustep_forward_triton(x, limit, group_list)
 
         # Fallback when triton is unavailable: vllm's native silu+clamp+mul.
         class MinimalSwigluStepAndMul:
