@@ -423,6 +423,13 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
     # The only clamp limit Step4 ships (validated by the model's MoE block).
     SWIGLU_LIMIT = 7.0
 
+    # Keep the router's fp32 topk_weights: AscendRoutedExperts._select_experts
+    # skips its hidden-dtype cast for schemes opting in here. npu_moe_gating_top_k
+    # already produced the weights in fp32 (Step4 feeds it fp32 logits and the
+    # op's output dtype follows its input); the cast to bf16 would be a one-way
+    # precision loss on the routed combine.
+    keep_fp32_topk_weights = True
+
     def __init__(self, weight_block_size: tuple[int, int], moe_config) -> None:
         self.block_n, self.block_k = weight_block_size
         if (self.block_n, self.block_k) != (128, 128):
@@ -513,12 +520,12 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
         # FP8_BLOCK quant branch routes the middle stage to the vendored
         # step4-hf block-fp8 kernels (see fp8_block_apply_mlp).
         #
-        # topk_weights come straight from the fused gating op: Step4's fp32
-        # gate (FP32ReplicatedLinear / the internal router's weight_fp32)
-        # feeds fp32 logits into npu_moe_gating_top_k, whose output dtype
-        # follows its input, so the weights arrive in fp32. The cast is a
-        # no-op on that path and only guards router fallbacks that narrow
-        # to the hidden dtype.
+        # topk_weights come straight from npu_moe_gating_top_k: Step4's fp32
+        # gate feeds fp32 logits into the op (whose output dtype follows its
+        # input) and keep_fp32_topk_weights opts out of the framework's
+        # hidden-dtype cast in _select_experts, so the weights arrive in fp32.
+        # The .float() is a no-op on that path and only guards unexpected
+        # bf16 producers.
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
         from vllm_ascend.ops.fused_moe.dataclass.fused_experts import (
             build_fused_experts_input,
