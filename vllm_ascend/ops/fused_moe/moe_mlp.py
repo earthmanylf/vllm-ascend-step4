@@ -663,10 +663,12 @@ def fp8_block_apply_mlp(
       (aclnnGroupedMatmulV5 G-B scenario: e4m3 weights + fp32 128x128 block
       scales + fp32 per-token-per-128-group activation scales), once per
       projection, with the vendored ``act_quant`` producing the activation
-      scales.
+      scales. Fully device-side (no host round-trips), so it is capturable
+      by NPU graphs.
     * triton fallback (checkpoint layout): per expert, the vendored step4-hf
       kernel pair -- dynamic per-128-group e4m3 activation quantization plus
-      the block-scaled fp8 GEMM (scales folded after the fp32 dot).
+      the block-scaled fp8 GEMM (scales folded after the fp32 dot). Host
+      counts per expert, so it is not NPU-graph capturable (eager fallback).
 
     ``swiglustep`` applies the fp32 clamps with a single rounding back to
     bf16; the limit is fixed at 7.0 (the only value the Step4 model accepts).
@@ -677,6 +679,16 @@ def fp8_block_apply_mlp(
 
     num_experts, packed_intermediate, _ = w1.shape
     intermediate = packed_intermediate // 2
+
+    x_bf = hidden_states if hidden_states.dtype == torch.bfloat16 else hidden_states.to(torch.bfloat16)
+
+    # K-major marker: the hidden size appears as w1's K dim and w2's N dim
+    # while w2's K dim is w1's N dim halved (checkpoint layout has the hidden
+    # size as w1's N dim and w2's K dim instead).
+    if w1.shape[1] == w2.shape[2] and 2 * w2.shape[1] == w1.shape[2]:
+        group_prefix = _fp8_block_group_prefix(group_list, group_list_type, num_experts)
+        return _fp8_block_apply_mlp_aclnn(x_bf, w1, w1_scale, w2, w2_scale, group_prefix, activation, act_quant)
+
     # group_list conventions: type 0 = per-expert prefix sums (MC2), type 1 =
     # per-expert token counts (AllGather). Rows of ``hidden_states`` are the
     # per-expert intervals of the local experts, in local-expert order.
@@ -696,14 +708,31 @@ def fp8_block_apply_mlp(
         first_local = get_ep_group().rank_in_group * num_experts
         counts = counts[first_local : first_local + num_experts]
 
-    x_bf = hidden_states if hidden_states.dtype == torch.bfloat16 else hidden_states.to(torch.bfloat16)
-
-    # K-major marker: the hidden size appears as w1's K dim and w2's N dim
-    # while w2's K dim is w1's N dim halved (checkpoint layout has the hidden
-    # size as w1's N dim and w2's K dim instead).
-    if w1.shape[1] == w2.shape[2] and 2 * w2.shape[1] == w1.shape[2]:
-        return _fp8_block_apply_mlp_aclnn(x_bf, w1, w1_scale, w2, w2_scale, counts, activation, act_quant)
     return _fp8_block_apply_mlp_triton(x_bf, w1, w1_scale, w2, w2_scale, counts, intermediate, activation, act_quant)
+
+
+def _fp8_block_group_prefix(group_list: torch.Tensor, group_list_type: int, num_experts: int) -> torch.Tensor:
+    """Per-local-expert prefix sums (int64) built entirely on device.
+
+    Capture-safe: only shape queries, static slicing and device kernels --
+    no ``.tolist()`` D2H sync and no ``torch.tensor(...)`` H2D copy, both of
+    which are illegal inside an NPU-graph capture region.
+
+    group_list conventions: type 0 = per-expert prefix sums (MC2, already
+    local), type 1 = per-expert token counts (AllGather, possibly one entry
+    per *global* expert, windowed to this rank's contiguous local range).
+    """
+    counts = group_list
+    if group_list_type == 0:
+        counts = torch.diff(counts, prepend=torch.zeros(1, dtype=counts.dtype, device=counts.device))
+    if counts.numel() > num_experts:
+        from vllm.distributed import get_ep_group
+
+        first_local = get_ep_group().rank_in_group * num_experts
+        counts = counts[first_local : first_local + num_experts]
+    # aclnnGroupedMatmulV5 requires an int64 groupList; cumsum already
+    # promotes to int64.
+    return torch.cumsum(counts, dim=0)
 
 
 def _fp8_block_apply_mlp_aclnn(
@@ -712,18 +741,20 @@ def _fp8_block_apply_mlp_aclnn(
     w1_scale: torch.Tensor,
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
-    counts: list[int],
+    group_prefix: torch.Tensor,
     activation: MoEActivation | str,
     act_quant,
 ) -> tuple[torch.Tensor, None]:
-    """Whole-batch block-fp8 expert MLP through aclnnGroupedMatmulV5."""
+    """Whole-batch block-fp8 expert MLP through aclnnGroupedMatmulV5.
+
+    ``group_prefix`` holds the per-local-expert prefix sums (int32) already
+    built on device (see ``_fp8_block_group_prefix``); everything here is
+    async device work, so the whole path is NPU-graph capturable.
+    """
     from vllm_ascend.ops.grouped_matmul_v5 import grouped_matmul_block_fp8
 
     if x_bf.shape[0] == 0:
         return torch.zeros(0, w2.shape[2], dtype=torch.bfloat16, device=x_bf.device), None
-
-    # V5 G-B consumes one group_list of per-expert prefix sums (int32).
-    group_prefix = torch.cumsum(torch.tensor(counts, dtype=torch.int32, device=x_bf.device), dim=0)
 
     x_fp8, x_scale = act_quant(x_bf)
     gate_up = grouped_matmul_block_fp8([x_fp8], [w1], [w1_scale], [x_scale], group_prefix)[0]
