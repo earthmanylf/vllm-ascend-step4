@@ -660,138 +660,148 @@ def write_pending_tail(
     )
 
 
+def quantize_activations_e4m3(tensor: torch.Tensor) -> torch.Tensor:
+    """Torch device-side conversion preserves the deployed e4m3 rounding."""
+    return tensor.to(torch.float8_e4m3fn)
+
+
+@triton.jit
+def _prepare_indexer_cache(
+    cache_ptr, block_table_ptr, prepared_ptr, valid_ptr,
+    seq_k, padded_rows, block_table_cols,
+    stride_page, stride_region, stride_dim, stride_table_row, stride_table_col,
+    SUMMARIES_PER_PAGE: tl.constexpr, PROXY_DIM: tl.constexpr,
+    HAS_CACHE: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """Gather logical pages and widen once, before the persistent CV kernel."""
+    req = tl.program_id(1)
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    dims = tl.arange(0, BLOCK_D)
+    page_cols = rows // SUMMARIES_PER_PAGE
+    pages = tl.load(
+        block_table_ptr + req.to(tl.int64) * stride_table_row
+        + page_cols.to(tl.int64) * stride_table_col,
+        mask=(rows < seq_k) & (page_cols < block_table_cols), other=-1,
+    ).to(tl.int64)
+    live = (rows < seq_k) & (page_cols < block_table_cols) & (pages >= 0) & HAS_CACHE
+    safe_pages = tl.where(live, pages, 0)
+    values = tl.load(
+        cache_ptr + safe_pages[:, None] * stride_page
+        + (rows % SUMMARIES_PER_PAGE)[:, None] * stride_region
+        + dims[None, :] * stride_dim,
+        mask=live[:, None] & (dims[None, :] < PROXY_DIM), other=0.0,
+    ).to(tl.bfloat16)
+    tl.store(
+        prepared_ptr + (req.to(tl.int64) * padded_rows + rows[:, None]) * BLOCK_D
+        + dims[None, :],
+        values, mask=rows[:, None] < padded_rows,
+    )
+    tl.store(valid_ptr + req.to(tl.int64) * padded_rows + rows,
+             live.to(tl.int32), mask=rows < padded_rows)
+
+
+@triton.jit
+def _prepare_indexer_segments(
+    token_req_ptr, segments_ptr, counts_ptr, total_tokens, stride_req,
+    GROUPS: tl.constexpr, CHUNK_ROWS: tl.constexpr,
+    SEGMENT_STRIDE: tl.constexpr, BLOCK_SCAN: tl.constexpr,
+):
+    """Compact request-run boundaries independently within each Q chunk."""
+    chunk = tl.program_id(0)
+    lanes = tl.arange(0, BLOCK_SCAN)
+    segment_base = chunk * SEGMENT_STRIDE
+    end = tl.minimum((chunk + 1) * CHUNK_ROWS, total_tokens * GROUPS)
+    count = 0
+    for offset in range(0, CHUNK_ROWS + 1, BLOCK_SCAN):
+        local_rows = offset + lanes
+        rows = chunk * CHUNK_ROWS + local_rows
+        live = (local_rows < CHUNK_ROWS) & (rows < total_tokens * GROUPS)
+        owners = tl.load(token_req_ptr + (rows % total_tokens).to(tl.int64) * stride_req,
+                         mask=live, other=-1)
+        previous = tl.load(
+            token_req_ptr + ((rows - 1) % total_tokens).to(tl.int64) * stride_req,
+            mask=live & (local_rows > 0), other=-1,
+        )
+        starts = live & ((local_rows == 0) | (owners != previous))
+        boundaries = starts | (rows == end)
+        ranks = tl.cumsum(boundaries.to(tl.int32)) + count
+        tl.store(segments_ptr + segment_base + ranks - 1, rows, mask=boundaries)
+        count += tl.sum(starts.to(tl.int32), 0)
+    tl.store(counts_ptr + chunk, count)
+
+
 @triton.jit
 def _indexer_logits_kernel(
-    index_q_ptr,
-    mean_cache_ptr,
-    weights_ptr,
-    out_ptr,
-    block_table_ptr,
-    token_req_ptr,
-    seq_k,
-    block_table_cols,
-    stride_q_token,
-    stride_q_group,
-    stride_q_head,
-    stride_w_token,
-    stride_w_group,
-    stride_keys_page,
-    stride_keys_region,
-    stride_bt_row,
-    stride_out_row,
-    out_q_stride,
-    heads_per_group: tl.constexpr,
-    proxy_dim: tl.constexpr,
-    GROUPS: tl.constexpr,
-    SUMMARIES_PER_PAGE: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-) -> None:
-    """Weighted-ReLU indexer scores against the paged fp8 summary cache.
+    index_q_ptr, mean_cache_ptr, weights_ptr, out_ptr, key_valid_ptr, token_req_ptr,
+    segments_ptr, counts_ptr, total_tokens, seq_k, padded_rows,
+    stride_req, stride_out_row, stride_out_col,
+    OUT_GROUP_GAP: tl.constexpr, SEGMENT_STRIDE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """One Q-chunk/K-tile program traverses homogeneous request segments.
 
-        score[t, r] = sum_h relu(dot(q_th, k_r)) * w_th
-
-    One program per (query token, key tile), one kernel launch for the whole
-    batch -- packed prefill and decode share the same form. Query token ``t``
-    scores against its own request's key stream: ``token_req_ptr[t]`` selects
-    the block-table row, and logical region ``r`` of that row lives at
-    physical region ``block_table[req][r // SUMMARIES_PER_PAGE] *
-    SUMMARIES_PER_PAGE + r % SUMMARIES_PER_PAGE``. Unmapped pages (``-1``)
-    contribute zeros; dead columns past a row's live history hold zeros or
-    stale scores, which the top-k stage never reads because each row's
-    candidate range is bounded by its own history length.
-
-    The dot product is a multiply-and-reduce rather than ``tl.dot`` on
-    purpose: one form serves prefill and decode alike, and the shape is
-    memory-bound on the summary read either way. Both operands are e4m3
-    and products and accumulation are fp32, mirroring the upstream SM90
-    WGMMA (``Float8E4M3FN x Float8E4M3FN -> Float32``): widening an e4m3
-    value to fp32 is exact, so in-register conversion preserves the
-    quantized value set bit-for-bit.
-
-    The ReLU is per head and *inside* the sum, so the heads cannot be folded into a
-    single matmul -- hence the loop. The per-head weights are signed, so applying
-    ReLU to each dot does **not** make the final weighted sum non-negative. Exact
-    zeros are still common because a score is zero whenever every head dot is
-    negative; for Step-4's 4 heads per group that event is about 6.25%. Those zeros
-    are what the top-k tie-break then has to resolve, so they are load-bearing,
-    not noise.
-
-    The e4m3 activation quantization of the query stays on the host on
-    purpose: triton-ascend's in-register fp8 convert does not match
-    torch_npu's ``.to(float8_e4m3fn)`` rounding, and the deployed semantics
-    are the torch ones (the mismatch rate on random bf16 values is ~93%,
-    far beyond accumulation-order noise). Upstream pre-quantizes q on the
-    host for its WGMMA entrypoint the same way; both sides then read the
-    fp8 tensors directly.
-
-    The group dimension is a loop inside the kernel rather than a grid axis: the
-    key tile is loaded once per (token, k_block) program and every group reuses
-    that UB-resident copy instead of re-reading it from global memory.
-
-    ``out_q_stride`` lets the kernel write into a group-major
-    ``[groups * total_q, width]`` buffer: token ``t`` of the batch lands at row
-    ``group * out_q_stride + t``.
+    The same loops serve every request count. Full padded input loads feed
+    the CV pipeline; each output mask is a contiguous segment/tile boundary.
     """
-    token = tl.program_id(0)
-    k_block = tl.program_id(1)
-    keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
-    dims = tl.arange(0, proxy_dim)
-    key_ok = keys < seq_k
+    rows = tl.arange(0, BLOCK_M)
+    dims = tl.arange(0, BLOCK_D)
+    key_lanes = tl.arange(0, BLOCK_K)
+    score_lanes = tl.arange(0, BLOCK_M // BLOCK_H)
+    num_k_blocks = tl.cdiv(seq_k, BLOCK_K)
+    chunk = tl.program_id(0) // num_k_blocks
+    keys = (tl.program_id(0) % num_k_blocks) * BLOCK_K + key_lanes
+    count = tl.load(counts_ptr + chunk)
+    segment_base = chunk * SEGMENT_STRIDE
 
-    req = tl.load(token_req_ptr + token).to(tl.int64)
-    page_cols = keys // SUMMARIES_PER_PAGE
-    col_ok = page_cols < block_table_cols
-    pages = tl.load(
-        block_table_ptr + req * stride_bt_row + page_cols,
-        mask=key_ok & col_ok,
-        other=-1,
-    ).to(tl.int64)
-    load_ok = key_ok & col_ok & (pages >= 0)
-    safe_pages = tl.where(load_ok, pages, 0)
-    key_offsets = (
-        safe_pages * stride_keys_page + (keys % SUMMARIES_PER_PAGE) * stride_keys_region
-    )
-    k_tile = tl.load(
-        mean_cache_ptr + key_offsets[:, None] + dims[None, :],
-        mask=load_ok[:, None],
-        other=0.0,
-    ).to(tl.float32)
-
-    for group in tl.range(0, GROUPS):
-        acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
-        for head in range(heads_per_group):
-            q_vec = tl.load(
-                index_q_ptr
-                + token.to(tl.int64) * stride_q_token
-                + group * stride_q_group
-                + head * stride_q_head
-                + dims
-            ).to(tl.float32)
-            head_weight = tl.load(
-                weights_ptr + token * stride_w_token + group * stride_w_group + head
-            ).to(tl.float32)
-            dots = tl.sum(k_tile * q_vec[None, :], axis=1)
-            acc += tl.maximum(dots, 0.0) * head_weight
-        out_row = group * out_q_stride + token.to(tl.int64)
-        tl.store(
-            out_ptr + out_row * stride_out_row + keys,
-            acc,
-            mask=key_ok,
+    for segment in range(0, count):
+        q_start = tl.load(segments_ptr + segment_base + segment)
+        q_end = tl.load(segments_ptr + segment_base + segment + 1)
+        req = tl.load(token_req_ptr + (q_start % total_tokens).to(tl.int64) * stride_req)
+        cache_rows = req.to(tl.int64) * padded_rows + keys
+        k_tile = tl.load(
+            mean_cache_ptr + cache_rows[:, None] * BLOCK_D + dims[None, :],
         )
+        k_transposed = tl.trans(k_tile)
 
+        for q_local_start in range(0, q_end - q_start, BLOCK_M // BLOCK_H):
+            q_group_start = q_start + q_local_start
+            score_ids = q_group_start + score_lanes
+            flat_rows = q_group_start.to(tl.int64) * BLOCK_H + rows
+            q = tl.load(
+                index_q_ptr + flat_rows[:, None] * BLOCK_D + dims[None, :],
+            ).to(tl.bfloat16)
+            weights = tl.load(weights_ptr + flat_rows).to(tl.float32)
+            dots = tl.dot(q, k_transposed, out_dtype=tl.float32)
+            dots_by_head = dots.reshape((BLOCK_M // BLOCK_H, BLOCK_H, BLOCK_K))
+            weights_by_head = weights.reshape((BLOCK_M // BLOCK_H, BLOCK_H))
+            scores = tl.full((BLOCK_M // BLOCK_H, BLOCK_K), 0.0, tl.float32)
+            for head in tl.static_range(BLOCK_H):
+                head_dots = tl.extra.cann.extension.extract_slice(
+                    dots_by_head,
+                    offsets=(0, head, 0),
+                    sizes=(BLOCK_M // BLOCK_H, 1, BLOCK_K),
+                    strides=(1, 1, 1),
+                ).reshape((BLOCK_M // BLOCK_H, BLOCK_K))
+                head_weights = tl.extra.cann.extension.extract_slice(
+                    weights_by_head,
+                    offsets=(0, head),
+                    sizes=(BLOCK_M // BLOCK_H, 1),
+                    strides=(1, 1),
+                ).reshape((BLOCK_M // BLOCK_H,))
+                scores = tl.maximum(head_dots, 0.0, propagate_nan=tl.PropagateNan.ALL) * head_weights[:, None] + scores
 
-def quantize_activations_e4m3(tensor: torch.Tensor) -> torch.Tensor:
-    """Quantize indexer activations to e4m3, aligned with the deployed kernels.
-
-    The reference SM90 kernels feed e4m3 operands into a fp32-accumulating
-    WGMMA, and the checkpoint stores these activations in bf16, so the
-    quantization is part of the semantics: skipping it changes which regions
-    get selected. The quantization itself stays on the host on purpose --
-    triton-ascend's in-register fp8 convert does not match torch_npu's
-    ``.to(float8_e4m3fn)`` rounding -- mirroring upstream, which also
-    pre-quantizes q on the host before its WGMMA entrypoint.
-    """
-    return tensor.to(torch.float8_e4m3fn)
+            key_ok = tl.load(key_valid_ptr + cache_rows) != 0
+            out_rows = (
+                score_ids.to(tl.int64)
+                + (score_ids // total_tokens).to(tl.int64) * OUT_GROUP_GAP
+            )
+            tl.store(
+                out_ptr + out_rows[:, None] * stride_out_row
+                + keys[None, :].to(tl.int64) * stride_out_col,
+                tl.where(key_ok[None, :], scores, 0.0),
+                mask=(score_ids[:, None] < q_end) & (keys[None, :] < seq_k),
+            )
 
 
 def indexer_logits_paged(
@@ -804,67 +814,96 @@ def indexer_logits_paged(
     out: torch.Tensor,
     out_q_stride: int | None = None,
     summaries_per_page: int,
-    block_k: int = 32,
+    block_k: int = 128,
 ) -> torch.Tensor:
-    """Score a packed batch's query tokens against the paged fp8 summaries.
+    """Score Q[T,G,H,D] against paged e4m3 summaries, with signed weights[T,G,H].
 
-    One kernel launch for the whole batch, prefill or decode: query token
-    ``t`` is scored against the key stream of request ``token_to_req[t]``,
-    and the results land at logits rows ``group * out_q_stride + t`` of the
-    group-major buffer. The token -> request map covers every batch shape:
-    a plain decode batch passes ``torch.arange(n)`` (one token per request),
-    a spec-decode verify batch repeats each request id ``k`` times, and a
-    packed prefill batch maps each chunk token to its request. Dead columns
-    past a row's live history hold zeros or stale scores, which the top-k
-    stage never reads because each row's candidate range is bounded by its
-    own history length.
+    Cache: [physical_pages, summaries_per_page, 1, D], arbitrary page stride.
+    Page table: [requests, logical_pages], -1 means unmapped. token_to_req[T]
+    selects each token's request. Output is group-major [G*T, R] by default,
+    with row g*out_q_stride+t (out_q_stride defaults to T).
 
-    Args:
-        index_q: ``[total_tokens, groups, heads_per_group, proxy_dim]`` bf16,
-            packed over all requests; quantized to e4m3 on the host so the
-            kernel scores e4m3 x e4m3 -> fp32 like the upstream WGMMA.
-        weights: ``[total_tokens, groups, heads_per_group]`` fp32, prescaled.
-        mean_cache: fp8 ``[num_pages, summaries_per_page, 1, proxy_dim]``
-            (any row stride).
-        block_table: int32 ``[num_reqs, pages]`` KV block table.
-        token_to_req: int32 ``[total_tokens]``; the block-table row (request)
-            each query token belongs to.
-        out: ``[groups * total_tokens, seq_k]`` fp32 destination, where
-            ``seq_k = out.shape[1]``.
-        summaries_per_page: regions per physical page (``block_size //
-            region_block_size``).
+    Q is quantized to e4m3 and packed with weights in [G,T,H] order so score
+    tiles can be stored contiguously. A Vector preprocessing kernel resolves
+    logical pages, widens to BF16 and zeros missing/tail rows once. The prepared
+    cache is padded to whole K tiles and loaded directly into L1. A second
+    preparation pass records consecutive request segments within each Q chunk,
+    without moving Q rows or synchronizing with the host. All requests use the
+    same segment/K-tile loops, reusing K across Q. Q widening stays on Vector,
+    preserving the ssbuffer Vector->Cube->Vector stage structure.
+    H/D input padding makes the CV loads full and aligned; output masks retain
+    only real score rows and columns. K is prepared separately per request.
+    There is no causal mask; the downstream selector bounds valid candidates.
     """
     total_tokens, groups, heads_per_group, proxy_dim = index_q.shape
     seq_k = int(out.shape[1])
     out_q_stride = total_tokens if out_q_stride is None else out_q_stride
-    index_q = quantize_activations_e4m3(index_q)
-
-    _indexer_logits_kernel[
-        (total_tokens, triton.cdiv(seq_k, block_k))
-    ](
-        index_q,
-        mean_cache,
-        weights,
-        out,
-        block_table,
-        token_to_req,
-        seq_k,
-        int(block_table.shape[1]),
-        index_q.stride(0),
-        index_q.stride(1),
-        index_q.stride(2),
-        weights.stride(0),
-        weights.stride(1),
-        int(mean_cache.stride(0)),
-        int(mean_cache.stride(1)),
-        int(block_table.stride(0)),
-        out.stride(0),
-        out_q_stride,
-        heads_per_group=heads_per_group,
-        proxy_dim=proxy_dim,
-        GROUPS=groups,
-        SUMMARIES_PER_PAGE=int(summaries_per_page),
-        BLOCK_K=block_k,
+    if total_tokens == 0 or seq_k == 0:
+        return out
+    if block_k <= 0 or block_k & (block_k - 1):
+        raise ValueError("block_k must be a positive power of two")
+    if summaries_per_page <= 0:
+        raise ValueError("summaries_per_page must be positive")
+    block_m = 64
+    block_h = triton.next_power_of_2(heads_per_group)
+    block_m = max(block_m, block_h)
+    block_d = max(16, triton.next_power_of_2(proxy_dim))
+    block_k = max(16, block_k)
+    num_requests = int(block_table.shape[0])
+    properties = triton.runtime.driver.active.utils.get_device_properties("npu")
+    compute_heads = block_h
+    compute_dim = block_d
+    block_k = min(block_k, max(16, triton.next_power_of_2(seq_k)))
+    num_k_blocks = triton.cdiv(seq_k, block_k)
+    num_q_tiles = triton.cdiv(total_tokens * groups * compute_heads, block_m)
+    num_cores = properties["num_aicore"]
+    q_chunks = min(num_cores // math.gcd(num_cores, num_k_blocks), num_q_tiles)
+    chunk_rows = triton.cdiv(num_q_tiles, q_chunks) * (block_m // compute_heads)
+    q_chunks = triton.cdiv(total_tokens * groups, chunk_rows)
+    grid = (num_k_blocks * q_chunks,)
+    index_q = quantize_activations_e4m3(index_q).permute(1, 0, 2, 3).contiguous()
+    weights = weights.permute(1, 0, 2).contiguous()
+    if compute_heads != heads_per_group or compute_dim != proxy_dim:
+        index_q = torch.nn.functional.pad(
+            index_q.view(torch.uint8),
+            (0, compute_dim - proxy_dim, 0, compute_heads - heads_per_group),
+        ).view(torch.float8_e4m3fn)
+    if compute_heads != heads_per_group:
+        weights = torch.nn.functional.pad(weights, (0, compute_heads - heads_per_group))
+    extra_rows = block_m - compute_heads
+    if extra_rows:
+        index_q = torch.nn.functional.pad(
+            index_q.view(torch.uint8).reshape(-1, compute_dim), (0, 0, 0, extra_rows),
+        ).view(torch.float8_e4m3fn)
+        weights = torch.nn.functional.pad(weights.reshape(-1), (0, extra_rows))
+    padded_rows = triton.cdiv(seq_k, block_k) * block_k
+    prepared_cache = torch.empty(
+        (num_requests, padded_rows, block_d), device=mean_cache.device, dtype=torch.bfloat16,
+    )
+    key_valid = torch.empty((num_requests, padded_rows), device=mean_cache.device, dtype=torch.int32)
+    _prepare_indexer_cache[(triton.cdiv(padded_rows, 32), num_requests)](
+        mean_cache, block_table, prepared_cache, key_valid,
+        seq_k, padded_rows, int(block_table.shape[1]),
+        mean_cache.stride(0), mean_cache.stride(1), mean_cache.stride(3),
+        block_table.stride(0), block_table.stride(1),
+        SUMMARIES_PER_PAGE=int(summaries_per_page), PROXY_DIM=proxy_dim,
+        HAS_CACHE=mean_cache.shape[0] > 0, BLOCK_R=32, BLOCK_D=block_d,
+    )
+    segment_stride = triton.next_power_of_2(chunk_rows + 1)
+    segments = torch.empty((q_chunks, segment_stride), device=index_q.device, dtype=torch.int32)
+    segment_counts = torch.empty((q_chunks,), device=index_q.device, dtype=torch.int32)
+    _prepare_indexer_segments[(q_chunks,)](
+        token_to_req, segments, segment_counts, total_tokens, token_to_req.stride(0),
+        GROUPS=groups, CHUNK_ROWS=chunk_rows, SEGMENT_STRIDE=segment_stride, BLOCK_SCAN=min(512, segment_stride),
+    )
+    _indexer_logits_kernel[grid](
+        index_q, prepared_cache, weights, out, key_valid, token_to_req,
+        segments, segment_counts, total_tokens, seq_k, padded_rows,
+        token_to_req.stride(0), out.stride(0), out.stride(1),
+        OUT_GROUP_GAP=out_q_stride - total_tokens, SEGMENT_STRIDE=segment_stride,
+        BLOCK_M=block_m, BLOCK_H=compute_heads, BLOCK_K=block_k, BLOCK_D=block_d,
+        enable_auto_bind_sub_block=False,
+        multibuffer=False,
     )
     return out
 
