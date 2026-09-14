@@ -654,15 +654,26 @@ def fp8_block_apply_mlp(
     """Block-fp8 (128x128 ``weight_scale_inv``) expert MLP on the sorted layout.
 
     Consumes the dispatcher's expert-sorted ``hidden_states`` with the
-    per-expert ``group_list`` intervals, and runs, per expert, the vendored
-    step4-hf kernel pair: dynamic per-128-group e4m3 activation quantization
-    plus the block-scaled fp8 GEMM (scales folded after the fp32 dot).
+    per-expert ``group_list`` intervals. Two execution paths, chosen by the
+    weight layout ``Step4Fp8BlockFusedMoEMethod.process_weights_after_loading``
+    left on the tensors:
+
+    * aclnn fast path (K-major weights, needs the packaged custom op): the
+      whole sorted batch goes through ``_C_ascend.grouped_matmul_block_fp8``
+      (aclnnGroupedMatmulV5 G-B scenario: e4m3 weights + fp32 128x128 block
+      scales + fp32 per-token-per-128-group activation scales), once per
+      projection, with the vendored ``act_quant`` producing the activation
+      scales.
+    * triton fallback (checkpoint layout): per expert, the vendored step4-hf
+      kernel pair -- dynamic per-128-group e4m3 activation quantization plus
+      the block-scaled fp8 GEMM (scales folded after the fp32 dot).
+
     ``swiglustep`` applies the fp32 clamps with a single rounding back to
     bf16; the limit is fixed at 7.0 (the only value the Step4 model accepts).
     """
     # Lazy import: the kernels live under models/step4 and must not cycle
     # the quantization package at module import time.
-    from vllm_ascend.models.step4.fp8_kernels import act_quant, fp8_gemm
+    from vllm_ascend.models.step4.fp8_kernels import act_quant
 
     num_experts, packed_intermediate, _ = w1.shape
     intermediate = packed_intermediate // 2
@@ -686,9 +697,66 @@ def fp8_block_apply_mlp(
         counts = counts[first_local : first_local + num_experts]
 
     x_bf = hidden_states if hidden_states.dtype == torch.bfloat16 else hidden_states.to(torch.bfloat16)
+
+    # K-major marker: the hidden size appears as w1's K dim and w2's N dim
+    # while w2's K dim is w1's N dim halved (checkpoint layout has the hidden
+    # size as w1's N dim and w2's K dim instead).
+    if w1.shape[1] == w2.shape[2] and 2 * w2.shape[1] == w1.shape[2]:
+        return _fp8_block_apply_mlp_aclnn(x_bf, w1, w1_scale, w2, w2_scale, counts, activation, act_quant)
+    return _fp8_block_apply_mlp_triton(x_bf, w1, w1_scale, w2, w2_scale, counts, intermediate, activation, act_quant)
+
+
+def _fp8_block_apply_mlp_aclnn(
+    x_bf: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    counts: list[int],
+    activation: MoEActivation | str,
+    act_quant,
+) -> tuple[torch.Tensor, None]:
+    """Whole-batch block-fp8 expert MLP through aclnnGroupedMatmulV5."""
+    from vllm_ascend.ops.grouped_matmul_v5 import grouped_matmul_block_fp8
+
+    if x_bf.shape[0] == 0:
+        return torch.zeros(0, w2.shape[2], dtype=torch.bfloat16, device=x_bf.device), None
+
+    # V5 G-B consumes one group_list of per-expert prefix sums (int32).
+    group_prefix = torch.cumsum(torch.tensor(counts, dtype=torch.int32, device=x_bf.device), dim=0)
+
+    x_fp8, x_scale = act_quant(x_bf)
+    gate_up = grouped_matmul_block_fp8([x_fp8], [w1], [w1_scale], [x_scale], group_prefix)[0]
+    gate, up = gate_up[:, : gate_up.shape[1] // 2], gate_up[:, gate_up.shape[1] // 2 :]
+    if str(activation) in ("swiglustep", "MoEActivation.SWIGLUSTEP"):
+        activated = torch.nn.functional.silu(gate.float()).clamp(max=7.0)
+        bounded = up.float().clamp(-7.0, 7.0)
+        hidden = (activated * bounded).to(gate.dtype)
+    else:
+        hidden = (torch.nn.functional.silu(gate.float()) * up.float()).to(gate.dtype)
+    h_fp8, h_scale = act_quant(hidden)
+    out = grouped_matmul_block_fp8([h_fp8], [w2], [w2_scale], [h_scale], group_prefix)[0]
+    # Contract of unified_apply_mlp's quant path: (output, before_gmm2 event).
+    return out, None
+
+
+def _fp8_block_apply_mlp_triton(
+    x_bf: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    counts: list[int],
+    intermediate: int,
+    activation: MoEActivation | str,
+    act_quant,
+) -> tuple[torch.Tensor, None]:
+    """Per-expert block-fp8 expert MLP through the vendored triton kernels."""
+    from vllm_ascend.models.step4.fp8_kernels import fp8_gemm
+
     out = torch.zeros(x_bf.shape[0], w2.shape[1], dtype=torch.bfloat16, device=x_bf.device)
     start = 0
-    for expert in range(num_experts):
+    for expert in range(len(counts)):
         count = counts[expert]
         if count == 0:
             continue

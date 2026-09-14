@@ -668,6 +668,64 @@ at::Tensor npu_causal_conv1d_custom(
     return output;
 }
 
+// Grouped matmul over the CANN V5 G-B scenario: fp8 e4m3 weights with
+// FLOAT32 128x128 block scales and FLOAT32 per-token-per-128-group
+// activation scales. torch_npu's wrapper routes fp8 inputs to the V4 entry
+// and rejects them, so this calls aclnnGroupedMatmulV5 directly.
+std::vector<at::Tensor> grouped_matmul_block_fp8(
+    at::TensorList x,
+    at::TensorList weight,
+    at::TensorList scale,
+    at::TensorList per_token_scale,
+    const at::Tensor& group_list,
+    int64_t split_item,
+    int64_t group_type,
+    int64_t group_list_type
+)
+{
+    TORCH_CHECK(x.size() > 0, "x must contain at least one tensor");
+    TORCH_CHECK(x.size() == weight.size(), "x/weight list length mismatch");
+    TORCH_CHECK(weight.size() == scale.size(), "weight/scale list length mismatch");
+    TORCH_CHECK(weight.size() == per_token_scale.size(), "weight/per_token_scale list length mismatch");
+
+    std::vector<at::Tensor> y;
+    y.reserve(x.size());
+    for (size_t i = 0; i < x.size(); i++) {
+        const auto& w = weight[i];
+        // V5 layout: weight is [g, K, N] (K-major); out is [M, N] bf16.
+        auto n = w.dim() == 3 ? w.sizes()[2] : w.sizes()[1];
+        auto m = x[i].sizes()[0];
+        y.emplace_back(at::empty({m, n}, x[i].options().dtype(at::kBFloat16)));
+    }
+    at::TensorList result = at::TensorList(y);
+
+    // EXEC_NPU_CMD binds parameters by reference; optional slots need lvalues.
+    at::TensorList no_tensors = at::TensorList();
+    at::IntArrayRef no_tuning;
+    int64_t act_type = 0;
+    EXEC_NPU_CMD(aclnnGroupedMatmulV5,
+                x,            // x
+                weight,       // weight
+                no_tensors,   // biasOptional
+                scale,        // scaleOptional (fp32 block scales)
+                no_tensors,   // offsetOptional
+                no_tensors,   // antiquantScaleOptional
+                no_tensors,   // antiquantOffsetOptional
+                per_token_scale,   // perTokenScaleOptional
+                group_list,   // groupListOptional
+                no_tensors,   // activationInputOptional
+                no_tensors,   // activationQuantScaleOptional
+                no_tensors,   // activationQuantOffsetOptional
+                split_item, group_type, group_list_type, act_type,
+                no_tuning,    // tuningConfigOptional (aclIntArray*)
+                result,       // out
+                no_tensors,   // activationFeatureOutOptional
+                no_tensors    // dynQuantScaleOutOptional
+                );
+
+    return y;
+}
+
 // It is expected that further improvements will be made after it is incorporated into CANN on June 30th.
 std::vector<at::Tensor> moe_grouped_matmul(
     at::Tensor x,
@@ -2313,6 +2371,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> Tensor[]"
     );
     ops.impl("moe_grouped_matmul", torch::kPrivateUse1,&vllm_ascend::moe_grouped_matmul);
+
+    ops.def(
+        "grouped_matmul_block_fp8(Tensor[] x, Tensor[] weight, Tensor[] scale, Tensor[] per_token_scale,"
+        "                          Tensor group_list, int split_item, int group_type, int group_list_type) -> Tensor[]");
+    ops.impl("grouped_matmul_block_fp8", torch::kPrivateUse1, &vllm_ascend::grouped_matmul_block_fp8);
 
     ops.def(
         "moe_gating_top_k_hash("

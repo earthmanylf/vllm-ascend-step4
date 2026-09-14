@@ -360,16 +360,35 @@ class TestStep4Fp8BlockFusedMoEMethod(TestBase):
         scheme = self.build_scheme()
         self.assertEqual(scheme.group_size, 128)
 
-    def test_process_weights_after_loading_is_a_noop(self):
+    def test_process_weights_after_loading_is_a_noop_without_aclnn(self):
         scheme = self.build_scheme()
         layer = self._make_step4_layer()
         w13_before = layer.w13_weight.data.clone()
         scale_before = layer.w13_weight_scale_inv.data.clone()
 
-        scheme.process_weights_after_loading(layer)
+        with patch(f"{MODULE}._aclnn_block_fp8_available", return_value=False):
+            scheme.process_weights_after_loading(layer)
 
         self.assertTrue(torch.equal(layer.w13_weight.data, w13_before))
         self.assertTrue(torch.equal(layer.w13_weight_scale_inv.data, scale_before))
+        self.assertEqual(layer.w13_weight.dtype, torch.float8_e4m3fn)
+
+    def test_process_weights_after_loading_transposes_to_kmajor_with_aclnn(self):
+        scheme = self.build_scheme()
+        layer = self._make_step4_layer(num_experts=2, intermediate=128, hidden=512)
+        w13_before = layer.w13_weight.data.clone()
+        w13_scale_before = layer.w13_weight_scale_inv.data.clone()
+
+        with patch(f"{MODULE}._aclnn_block_fp8_available", return_value=True):
+            scheme.process_weights_after_loading(layer)
+
+        # Pure layout change: the fp8 payload and scales are bitwise preserved
+        # under the [g, N, K] -> [g, K, N] (and matching scale) transpose that
+        # aclnnGroupedMatmulV5 expects.
+        self.assertEqual(tuple(layer.w13_weight.shape), (2, 512, 256))
+        self.assertTrue(torch.equal(layer.w13_weight.data, w13_before.transpose(1, 2)))
+        self.assertTrue(torch.equal(layer.w13_weight_scale_inv.data, w13_scale_before.transpose(1, 2)))
+        self.assertEqual(tuple(layer.w2_weight.shape), (2, 128, 512))
         self.assertEqual(layer.w13_weight.dtype, torch.float8_e4m3fn)
 
     def _make_step4_layer(self, num_experts=2, intermediate=256, hidden=512):

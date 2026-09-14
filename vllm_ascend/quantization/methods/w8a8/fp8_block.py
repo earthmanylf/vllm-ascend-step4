@@ -33,6 +33,7 @@ Both paths read the same checkpoint, so no per-model patch or offline
 re-quantization step is needed.
 """
 
+import functools
 from typing import Any
 
 import torch
@@ -369,6 +370,35 @@ class AscendFp8BlockFusedMoEMethod(AscendMoEScheme):
         )
 
 
+@functools.lru_cache(maxsize=1)
+def _aclnn_block_fp8_available() -> bool:
+    """Whether the packaged custom-op lib registers the V5 block-fp8 GMM.
+
+    ``_C_ascend.grouped_matmul_block_fp8`` wraps the aclnnGroupedMatmulV5
+    G-B scenario (e4m3 weights + fp32 128x128 block scales + fp32
+    per-token-per-128-group activation scales), which torch_npu's
+    npu_grouped_matmul wrapper cannot reach (it routes fp8 to the V4 entry
+    and rejects it). Needs a build with COMPILE_CUSTOM_KERNELS=1; when the
+    op is absent the Step4 fp8 path falls back to the vendored triton
+    kernels.
+    """
+    from vllm_ascend.ops.grouped_matmul_v5 import block_fp8_gmm_available
+
+    return block_fp8_gmm_available()
+
+
+def _to_kmajor(weight: torch.Tensor, scale_inv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transpose one MoE weight (and its block scales) to the V5 layout.
+
+    aclnnGroupedMatmulV5 expects K-major weights: ``[g, K, N]`` fp8 with
+    ``[g, ceil(K/128), ceil(N/128)]`` fp32 block scales, while the
+    checkpoint (and the loader) store ``[g, N, K]`` with
+    ``[g, ceil(N/128), ceil(K/128)]`` scales. Pure layout change -- the
+    fp8 payload and the scales are bitwise untouched.
+    """
+    return weight.transpose(1, 2).contiguous(), scale_inv.transpose(1, 2).contiguous()
+
+
 @register_scheme(FP8_METHOD, "step4_moe")
 class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
     """Step4 routed experts executing the native fp8 block quantization.
@@ -463,8 +493,23 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Nothing to resolve or requantize: the fp8 weights and block scales
-        # are executed as loaded.
-        return
+        # are executed as loaded. The only preparation is a pure layout
+        # change: when the aclnnGroupedMatmulV5 custom op is packaged, both
+        # weights and scales move to the K-major layout that operator
+        # expects, so fp8_block_apply_mlp can run the whole expert batch
+        # through the grouped kernel instead of the per-expert triton loop.
+        self.use_aclnn_gmm = _aclnn_block_fp8_available()
+        if self.use_aclnn_gmm:
+            logger.info_once(
+                "Step4 fp8 experts: aclnnGroupedMatmulV5 block-fp8 G-B path enabled (K-major weight layout)."
+            )
+            for weight_name, scale_name in (
+                ("w13_weight", "w13_weight_scale_inv"),
+                ("w2_weight", "w2_weight_scale_inv"),
+            ):
+                weight, scale = _to_kmajor(getattr(layer, weight_name).data, getattr(layer, scale_name).data)
+                replace_parameter(layer, weight_name, weight)
+                replace_parameter(layer, scale_name, scale)
 
     def apply(
         self,
