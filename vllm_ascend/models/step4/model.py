@@ -844,40 +844,6 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
         # metadata (mirrors MiniMaxM3MoE).
         self.experts.global_redundant_expert_num = self.n_redundant_experts
         self.experts.moe_config.global_redundant_expert_num = self.n_redundant_experts
-        if enable_step4_fp8:
-            self._bind_scheme_router()
-
-    def _bind_scheme_router(self) -> None:
-        """Give the fp8 scheme the fp32 router references.
-
-        The framework's router narrows topk_weights to bf16; the scheme
-        recomputes them in fp32 from the gate weight + bias, which needs
-        these bindings.
-        """
-        from vllm_ascend.quantization.methods.w8a8.fp8_block import (
-            Step4Fp8BlockFusedMoEMethod,
-        )
-
-        def _find(obj: Any, depth: int = 0) -> Step4Fp8BlockFusedMoEMethod | None:
-            if depth > 5:
-                return None
-            if isinstance(obj, Step4Fp8BlockFusedMoEMethod):
-                return obj
-            for attr in ("routed_experts", "experts", "layer", "quant_method"):
-                child = getattr(obj, attr, None)
-                if child is not None and child is not obj:
-                    found = _find(child, depth + 1)
-                    if found is not None:
-                        return found
-            return None
-
-        scheme = _find(self.experts)
-        if scheme is not None:
-            scheme.bind_router(
-                self.gate.weight,
-                self.router_bias,
-                self.routed_scaling_factor,
-            )
 
     def forward(
         self,

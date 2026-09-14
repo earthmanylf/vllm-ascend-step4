@@ -433,31 +433,30 @@ class TestStep4Fp8BlockFusedMoEMethod(TestBase):
         self.assertEqual(fused_input.quant.quant_type, QuantType.FP8_BLOCK)
         self.assertEqual(fused_input.activation, "swiglustep")
 
-    def test_router_weights_are_recomputed_in_fp32(self):
+    def test_apply_passes_router_weights_through_in_fp32(self):
+        # topk_weights come straight from npu_moe_gating_top_k (fp32 out with
+        # fp32 logits in); apply must hand them to the pipeline as fp32, so a
+        # router fallback that narrows them to bf16 is only ever a cast away.
         scheme = self.build_scheme()
-        gate_weight = torch.randn(8, 4)
-        router_bias = torch.randn(8)
-        scheme.bind_router(gate_weight, router_bias, routed_scaling_factor=2.5)
+        layer = self._make_step4_layer()
+        x = torch.randn(3, 512, dtype=torch.bfloat16)
+        topk_ids = torch.tensor([[0, 1]] * 3, dtype=torch.int32)
+        topk_weights = torch.rand(3, 2, dtype=torch.bfloat16)
 
-        x = torch.randn(5, 4)
-        topk_ids = torch.tensor([[0, 3], [1, 2], [0, 7], [5, 6], [4, 3]], dtype=torch.int64)
-        bf16_weights = torch.rand(5, 2, dtype=torch.bfloat16)
+        with patch("vllm_ascend.ascend_forward_context._EXTRA_CTX") as mock_ctx:
+            mock_ctx.moe_comm_method.fused_experts.return_value = "routed"
+            scheme.apply(layer, x, topk_weights, topk_ids)
 
-        weights = scheme._router_weights_fp32(x, topk_ids, bf16_weights)
+        fused_input = mock_ctx.moe_comm_method.fused_experts.call_args.kwargs["fused_experts_input"]
+        self.assertEqual(fused_input.topk_weights.dtype, torch.float32)
+        self.assertTrue(torch.equal(fused_input.topk_weights, topk_weights.float()))
 
-        logits = torch.nn.functional.linear(x.to(torch.bfloat16).float(), gate_weight.float())
-        expected = torch.sigmoid(logits).gather(-1, topk_ids)
-        expected = expected / (expected.sum(dim=-1, keepdim=True) + 1e-20)
-        expected = expected * 2.5
-        self.assertEqual(weights.dtype, torch.float32)
-        self.assertTrue(torch.allclose(weights, expected, atol=1e-6))
-
-    def test_unbound_router_falls_back_to_casting_topk_weights(self):
-        scheme = self.build_scheme()
-        weights = scheme._router_weights_fp32(
-            torch.randn(2, 4), torch.tensor([[0, 1]]), torch.ones(2, 2, dtype=torch.bfloat16)
-        )
-        self.assertEqual(weights.dtype, torch.float32)
+        fp32_weights = torch.rand(3, 2, dtype=torch.float32)
+        with patch("vllm_ascend.ascend_forward_context._EXTRA_CTX") as mock_ctx:
+            mock_ctx.moe_comm_method.fused_experts.return_value = "routed"
+            scheme.apply(layer, x, fp32_weights, topk_ids)
+        fused_input = mock_ctx.moe_comm_method.fused_experts.call_args.kwargs["fused_experts_input"]
+        self.assertIs(fused_input.topk_weights, fp32_weights)
 
 
 class TestStep4Fp8BlockConfig(TestBase):

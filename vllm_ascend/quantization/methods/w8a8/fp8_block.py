@@ -431,21 +431,6 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
         # expert shard, exactly like AscendFp8BlockFusedMoEMethod.
         self.group_size = self.block_k
         self.moe_config = moe_config
-        # Router references for the fp32 weight recompute; bound by the
-        # model's MoE block after construction (see FusedMoEBlock).
-        self._gate_weight: torch.Tensor | None = None
-        self._router_bias: torch.Tensor | None = None
-        self._routed_scaling_factor: float = 1.0
-
-    def bind_router(
-        self,
-        gate_weight: torch.Tensor,
-        router_bias: torch.Tensor,
-        routed_scaling_factor: float,
-    ) -> None:
-        self._gate_weight = gate_weight
-        self._router_bias = router_bias
-        self._routed_scaling_factor = routed_scaling_factor
 
     def get_weight(
         self,
@@ -527,18 +512,23 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
         # locally and unpermutes, MC2 ships tokens across ranks), and the
         # FP8_BLOCK quant branch routes the middle stage to the vendored
         # step4-hf block-fp8 kernels (see fp8_block_apply_mlp).
+        #
+        # topk_weights come straight from the fused gating op: Step4's fp32
+        # gate (FP32ReplicatedLinear / the internal router's weight_fp32)
+        # feeds fp32 logits into npu_moe_gating_top_k, whose output dtype
+        # follows its input, so the weights arrive in fp32. The cast is a
+        # no-op on that path and only guards router fallbacks that narrow
+        # to the hidden dtype.
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
         from vllm_ascend.ops.fused_moe.dataclass.fused_experts import (
             build_fused_experts_input,
         )
 
-        weights = self._router_weights_fp32(x, topk_ids, topk_weights)
-
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         return moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
-                topk_weights=weights,
+                topk_weights=topk_weights.float(),
                 topk_ids=topk_ids,
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
@@ -554,22 +544,3 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
                 w2_scale=layer.w2_weight_scale_inv,
             )
         )
-
-    def _router_weights_fp32(
-        self,
-        x: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """The framework's router narrows topk_weights to bf16; recompute them
-        in fp32 from the bound router (bitwise the step4_router_bias_eager
-        arithmetic, which is the deployed kernel's semantics)."""
-        if self._gate_weight is None:
-            return topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
-        logits = torch.nn.functional.linear(x.to(torch.bfloat16).float(), self._gate_weight.float())
-        gate_prob = torch.sigmoid(logits)
-        weights = gate_prob.gather(-1, topk_ids.to(torch.int64))
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-        if self._routed_scaling_factor != 1.0:
-            weights = weights * self._routed_scaling_factor
-        return weights
