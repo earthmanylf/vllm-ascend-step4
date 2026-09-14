@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -457,6 +458,52 @@ class TestStep4Fp8BlockFusedMoEMethod(TestBase):
             scheme.apply(layer, x, fp32_weights, topk_ids)
         fused_input = mock_ctx.moe_comm_method.fused_experts.call_args.kwargs["fused_experts_input"]
         self.assertIs(fused_input.topk_weights, fp32_weights)
+
+    def test_select_experts_keeps_fp32_weights_for_opted_in_schemes(self):
+        # AscendRoutedExperts._select_experts narrows topk_weights to the
+        # hidden dtype before the quant method sees them; the step4 scheme
+        # opts out via keep_fp32_topk_weights so the gating op's fp32 output
+        # reaches the routed combine untouched.
+        from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
+
+        experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
+        experts.log2phy = None
+        experts.n_shared_experts = 0
+        experts.moe_config = MagicMock()
+        experts.moe_config.num_experts = 4
+        experts.global_redundant_expert_num = 0
+        experts.mix_placement = False
+        experts.router = MagicMock()
+        fp32_weights = torch.rand(2, 3, dtype=torch.float32)
+        experts.router._select_experts.return_value = (fp32_weights, torch.zeros(2, 3, dtype=torch.int32))
+        hidden = torch.randn(2, 8, dtype=torch.bfloat16)
+
+        experts.quant_method = MagicMock()
+        experts.quant_method.quant_method = self.build_scheme()
+        with (
+            patch("vllm_ascend.ops.fused_moe.routed_experts.get_moe_num_logical_experts", return_value=4),
+            patch("vllm_ascend.ops.fused_moe.routed_experts.get_ascend_config") as mock_cfg,
+        ):
+            mock_cfg.return_value.enable_force_eplb = False
+            weights, _ = experts._select_experts(
+                hidden_states=hidden, router_logits=None, enable_force_load_balance=False
+            )
+        self.assertEqual(weights.dtype, torch.float32)
+        self.assertIs(weights, fp32_weights)
+
+        # A plain quant method without the opt-in flag (no auto-attrs, unlike
+        # MagicMock) goes through the hidden-dtype cast.
+        experts.quant_method = types.SimpleNamespace()
+        experts.router._select_experts.return_value = (fp32_weights.clone(), torch.zeros(2, 3, dtype=torch.int32))
+        with (
+            patch("vllm_ascend.ops.fused_moe.routed_experts.get_moe_num_logical_experts", return_value=4),
+            patch("vllm_ascend.ops.fused_moe.routed_experts.get_ascend_config") as mock_cfg,
+        ):
+            mock_cfg.return_value.enable_force_eplb = False
+            weights, _ = experts._select_experts(
+                hidden_states=hidden, router_logits=None, enable_force_load_balance=False
+            )
+        self.assertEqual(weights.dtype, torch.bfloat16)
 
 
 class TestStep4Fp8BlockConfig(TestBase):
