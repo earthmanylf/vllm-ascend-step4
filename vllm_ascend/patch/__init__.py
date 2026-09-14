@@ -186,6 +186,28 @@
 #       model types or resolves MLA from the config contents instead of a
 #       model_type whitelist.
 #
+# ** 7b. File: platform/patch_step4_vl_config.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.transformers_utils.config._CONFIG_REGISTRY`
+#    Why:
+#       Step4 vision-language wrapper checkpoints (`Step-4-new-2609-*`) ship a
+#       nested config with `model_type="step4_vl"` that is not in vLLM's
+#       `model_type` lookup table, so `AutoConfig` cannot resolve it and
+#       `ModelConfig` creation fails before the server starts.
+#    How：
+#       Register `Step4VLConfig` (a `Step4Config` subclass) under `step4_vl`.
+#       Its `__init__` flattens the nested `text_config` mapping into the top
+#       level with `text_config` taking precedence, so the parsed instance is
+#       equivalent to the flat Step4 checkpoints (`model_type == "step4"`,
+#       `architectures == ["Step4ForCausalLM"]`) and routes to the already
+#       registered Step4 model implementation. Wrapper-only fields such as
+#       `vision_config` are kept as plain attributes.
+#    Related PR (if no, explain why):
+#       No, downstream-only wrapper config published with the checkpoints.
+#    Future Plan:
+#       Remove this patch once the supported vLLM version registers `step4_vl`
+#       itself or the checkpoints ship the flat Step4 config layout.
+#
 # ** 8. File: platform/patch_kv_cache_coordinator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.kv_cache_coordinator.HybridKVCacheCoordinator.find_longest_cache_hit_per_group`
