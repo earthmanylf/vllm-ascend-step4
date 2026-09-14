@@ -340,15 +340,14 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         )
         self.kv_cache_torch_dtype = _kv_cache_torch_dtype(cache_config, vllm_config)
         self.attn_backend = AscendStep4DSABackend
+        # Mirror the upstream CUDA wiring (vllm.models.step4.model): the MTP
+        # speculative token count is handed to the DSA impl so verify batches
+        # (K+1 rows per request) take the staged/deferred-flush summary path.
+        num_speculative_tokens = 0
         spec_config = vllm_config.speculative_config
-        if (
-            spec_config is not None
-            and int(getattr(spec_config, "num_speculative_tokens", 0) or 0) > 0
-        ):
-            raise NotImplementedError(
-                "Ascend Step4 DSA with the paged summary sidecar does not "
-                "support speculative decoding yet (the upstream MTP "
-                "transaction machinery is not ported)."
+        if spec_config is not None and spec_config.method == "mtp":
+            num_speculative_tokens = int(
+                getattr(spec_config, "num_speculative_tokens", 0) or 0
             )
         self.impl = AscendStep4DSAImpl(
             self.num_heads,
@@ -366,6 +365,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
                 vllm_config.scheduler_config.max_num_batched_tokens
             ),
             decode_out_dtype=vllm_config.model_config.dtype,
+            num_speculative_tokens=num_speculative_tokens,
         )
         compilation_config = vllm_config.compilation_config
         if self.layer_name in compilation_config.static_forward_context:

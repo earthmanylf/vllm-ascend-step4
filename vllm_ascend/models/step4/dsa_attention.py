@@ -14,9 +14,17 @@ The CuTeDSL-only operators are replaced by the Triton kernels in
 scoring); region selection, metadata packing and the sparse attention itself
 reuse the parity-pinned kernels of ``dsa_kernels.py``.
 
-Spec-decode verify (multi-token decode rows) is not supported on this path
-yet: the upstream MTP transaction machinery (per-token state snapshots +
-rollback) is CUDA-only and not ported.
+Spec-decode verify batches (multi-token decode rows, ``query_len = K+1``)
+follow the upstream ``Step4DSAMTP`` contract with an equivalent Ascend
+mechanism: verify rows are *staged* into the active-slot tail state instead
+of folded (staging is last-write-wins per (region, offset), so the next
+round's rewrite of rejected positions is an exact rollback to the accepted
+prefix), and completed regions are only materialized into the fp8 page
+cache by the deferred flush once their last position is below the request's
+committed context. The verify attention itself reuses the prefill-style
+causal selection (``prefill_sparse_meta`` bounds each row's candidate
+regions by its own position and force-appends the row's current region),
+which is bit-compatible with the eager prefill path.
 """
 
 from __future__ import annotations
@@ -55,6 +63,8 @@ from vllm_ascend.models.step4.summary_kernels import (
     build_decode_summary_layout_step3p5,
     csa_compact_decode_update,
     csa_compact_prefill_update,
+    csa_deferred_flush,
+    csa_verify_stage_update,
 )
 
 logger = init_logger(__name__)
@@ -177,9 +187,8 @@ class AscendStep4DSADecodeMetadata:
     """(num_decodes, max_pages) int32 rows for the decode requests."""
 
     query_len: int = 1
-    """Uniform decode query length K. Only K == 1 is supported: spec-decode
-    verify batches need the upstream MTP transaction machinery, which is not
-    ported to Ascend yet."""
+    """Uniform decode query length K (1 for plain decode, 1+num_spec for
+    MTP verify batches)."""
 
 
 @dataclass
@@ -369,6 +378,7 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
         block_size: int,
         max_num_batched_tokens: int,
         decode_out_dtype: torch.dtype | None = None,
+        num_speculative_tokens: int = 0,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -383,6 +393,18 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             raise ValueError(
                 "Step4 DSA requires block_size to be a multiple of the region "
                 f"size, got block_size={block_size}, region_size={region_size}."
+            )
+        self.num_speculative_tokens = int(num_speculative_tokens)
+        if self.num_speculative_tokens > 0 and (
+            self.num_speculative_tokens + 1 > region_size
+        ):
+            # Same constraint as the upstream CUDA impl: a verify batch's
+            # K+1 rows must fit inside one region for the staged-rewrite
+            # rollback to stay exact.
+            raise ValueError(
+                "Step4 DSA MTP requires num_speculative_tokens + 1 <= "
+                f"region_size, got {self.num_speculative_tokens + 1} > "
+                f"{region_size}."
             )
         self.regions_per_page = block_size // region_size
         self.num_kv_groups = self.num_kv_heads
@@ -589,10 +611,15 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
         )
         # Decode indexer-score workspace, shared by all layers (they run
         # sequentially on one stream and each consumes its scores before the
-        # next layer overwrites them).
+        # next layer overwrites them). With MTP verify batches every decode
+        # request contributes K+1 scoring rows.
+        decode_rows_per_req = 1 + (self.num_speculative_tokens if self.num_speculative_tokens > 0 else 0)
         self._get_dsa_tensor_buffer_at_least(
             "sparse_decode_logits",
-            (self.num_kv_groups * self.max_num_seqs, self._max_regions),
+            (
+                self.num_kv_groups * self.max_num_seqs * decode_rows_per_req,
+                self._max_regions,
+            ),
             device=device,
             dtype=torch.float32,
         )
@@ -693,7 +720,10 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
         Mirrors upstream: a pure decode batch (single token per request)
         stages tokens and flushes completed regions; any batch containing
         prefill tokens (mixed included) runs the ordered two-pass update over
-        all tokens of the batch.
+        all tokens of the batch. MTP verify batches (uniform K+1 rows per
+        decode request) stage their rows without flushing and materialize
+        fully-committed regions through the deferred flush, so rejected
+        tokens never pollute the fp8 page cache.
         """
         num_tokens = int(md.num_actual_tokens)
         if num_tokens <= 0:
@@ -713,6 +743,23 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             proxy_dim=int(self.proxy_dim),
             region_block_size=int(self.region_size),
         )
+        verify_batch = (
+            self.num_speculative_tokens > 0
+            and md.decode is not None
+            and md.decode.query_len > 1
+        )
+        if verify_batch:
+            self._update_summary_cache_verify(
+                summary_cache=summary_cache,
+                md=md,
+                layout=layout,
+                index_k=index_k,
+                index_z=index_z,
+                allocation_success=allocation_success,
+                mean_cache=mean_cache,
+                common=common,
+            )
+            return
         use_decode_update = md.num_prefills == 0 and md.decode is not None
         if use_decode_update:
             csa_compact_decode_update(
@@ -779,6 +826,124 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             )
         self._assert_csa_allocation_success(allocation_success)
 
+    def _update_summary_cache_verify(
+        self,
+        *,
+        summary_cache: AscendStep4SparseSummaryCache,
+        md: AscendStep4DSAMetadata,
+        layout: AscendStep4DSARuntimeLayout,
+        index_k: torch.Tensor,
+        index_z: torch.Tensor,
+        allocation_success: torch.Tensor,
+        mean_cache: torch.Tensor,
+        common: dict,
+    ) -> None:
+        """Summary update for MTP verify batches (uniform K+1 decode rows).
+
+        Deferred flush first: any region whose last position is below the
+        committed context (``seq_len - query_len``) is provably final and is
+        materialized into the fp8 page cache. The verify rows themselves are
+        only staged, so the next round's rewrite of rejected positions
+        replaces their contribution exactly (the Ascend equivalent of the
+        upstream MTP transaction's rollback-to-accepted-prefix). In a mixed
+        batch, the prefill tail still runs the ordinary ordered fold over
+        its own rows; a request never contributes rows to both segments.
+        """
+        d = md.decode
+        n = md.num_decodes
+        query_len = int(d.query_len)
+        # 1) Materialize fully-committed tail regions (releases their slots
+        #    for reuse by this step's staging).
+        csa_deferred_flush(
+            mean_cache,
+            summary_cache._step4_csa_active_region_ids,
+            summary_cache._step4_csa_active_slot_by_region,
+            summary_cache._step4_csa_numerator_cache,
+            summary_cache._step4_csa_denominator_cache,
+            summary_cache._step4_csa_max_cache,
+            summary_cache._step4_csa_active_token_k,
+            summary_cache._step4_csa_active_token_z,
+            summary_cache._step4_csa_active_token_valid,
+            d.seq_lens,
+            d.block_table,
+            num_reqs=n,
+            query_len=query_len,
+            num_pages=int(summary_cache.num_pages),
+            summaries_per_page=int(summary_cache.summaries_per_page),
+            region_block_size=int(summary_cache.region_block_size),
+            page_size=int(summary_cache.page_size),
+        )
+        # 2) Stage the verify rows (decode segment leads the batch).
+        nv = int(md.num_decode_tokens)
+        csa_verify_stage_update(
+            mean_cache,
+            summary_cache._step4_csa_active_region_ids,
+            summary_cache._step4_csa_active_slot_by_region,
+            allocation_success,
+            summary_cache._step4_csa_numerator_cache,
+            summary_cache._step4_csa_denominator_cache,
+            summary_cache._step4_csa_max_cache,
+            summary_cache._step4_csa_active_token_k,
+            summary_cache._step4_csa_active_token_z,
+            summary_cache._step4_csa_active_token_valid,
+            layout.token_flat_slot[:nv],
+            layout.reset_slots[:nv],
+            layout.token_valid[:nv],
+            layout.token_positions[:nv],
+            index_k[:nv],
+            index_z[:nv],
+            live_rows=nv,
+            query_len=query_len,
+            **common,
+        )
+        # 3) Mixed batch: fold the prefill tail with the ordinary ordered
+        #    two-pass update (prefill requests own private pages; their
+        #    regions never collide with the verify requests' regions).
+        if md.num_prefills > 0:
+            device = index_k.device
+            prefill_rows = int(md.num_actual_tokens) - nv
+            padded_rows = self._round_up(prefill_rows, 64)
+            scratch_region_ids = self._get_dsa_tensor_buffer_at_least(
+                "csa_prefill_scratch_region_ids",
+                (padded_rows,),
+                device=device,
+                dtype=torch.int32,
+            )
+            scratch_row_map = self._get_dsa_tensor_buffer_at_least(
+                "csa_prefill_scratch_row_map",
+                (padded_rows * self.region_size,),
+                device=device,
+                dtype=torch.int32,
+            )
+            scratch_reset_map = self._get_dsa_tensor_buffer_at_least(
+                "csa_prefill_scratch_reset_map",
+                (padded_rows,),
+                device=device,
+                dtype=torch.int32,
+            )
+            csa_compact_prefill_update(
+                mean_cache,
+                summary_cache._step4_csa_active_region_ids,
+                summary_cache._step4_csa_active_slot_by_region,
+                allocation_success,
+                summary_cache._step4_csa_numerator_cache,
+                summary_cache._step4_csa_denominator_cache,
+                summary_cache._step4_csa_max_cache,
+                summary_cache._step4_csa_active_token_valid,
+                scratch_region_ids,
+                scratch_row_map,
+                scratch_reset_map,
+                layout.token_flat_slot[nv:],
+                layout.reset_slots[nv:],
+                layout.token_valid[nv:],
+                layout.token_positions[nv:],
+                index_k[nv:],
+                index_z[nv:],
+                live_rows=prefill_rows,
+                **common,
+            )
+        self._assert_csa_allocation_success(allocation_success)
+
     # -- sparse attention ------------------------------------------------------
 
     def _forward_sparse_gqa_decode(
@@ -796,10 +961,16 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
         d = md.decode
         assert d is not None
         if d.query_len != 1:
+            if self.num_speculative_tokens <= 0:
+                raise NotImplementedError(
+                    "Ascend Step4 DSA paged summary path received a "
+                    "multi-token decode batch without MTP enabled "
+                    f"(query_len={d.query_len})."
+                )
             raise NotImplementedError(
-                "Ascend Step4 DSA paged summary path does not support "
-                "multi-token spec-decode verify batches yet "
-                f"(query_len={d.query_len})."
+                "Ascend Step4 DSA verify attention must be dispatched through"
+                " _forward_sparse_gqa_verify (query_len="
+                f"{d.query_len})."
             )
         n = md.num_decodes
         groups = self.num_kv_groups
@@ -843,6 +1014,82 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             block_regions=2,
         )
         output[:n] = out.to(output.dtype)
+
+    def _forward_sparse_gqa_verify(
+        self,
+        *,
+        summary_cache: AscendStep4SparseSummaryCache,
+        md: AscendStep4DSAMetadata,
+        query: torch.Tensor,
+        key_flat: torch.Tensor,
+        value_flat: torch.Tensor,
+        index_q: torch.Tensor,
+        weights: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Sparse attention for an MTP verify batch (K+1 rows per request).
+
+        Follows the prefill-style causal selection proven equivalent by the
+        reference flow: each verify row is scored against the paged summary,
+        its candidate regions are bounded by its own absolute position
+        (``prefill_sparse_meta`` derives the visible-region count from
+        ``q_position // region_size`` and force-appends the row's current
+        region), and the exact attention runs through
+        ``sparse_attention_prefill``, whose per-region ``valid`` counts mask
+        intra-region tokens past each row's position. Everything is
+        device-driven on static per-bucket shapes, so uniform verify batches
+        stay ACL-graph capturable.
+        """
+        d = md.decode
+        n = md.num_decodes
+        k = int(d.query_len)
+        total = n * k
+        groups = self.num_kv_groups
+        logits = self._get_dsa_tensor_buffer_at_least(
+            "sparse_decode_logits",
+            (groups * total, self._max_regions),
+            device=index_q.device,
+            dtype=torch.float32,
+        )
+        # Token -> request map: each request contributes K consecutive rows.
+        token_to_req = (
+            torch.arange(total, device=index_q.device, dtype=torch.int32) // k
+        )
+        indexer_logits_paged(
+            index_q[:total],
+            weights[:total],
+            summary_cache.mean_cache.view(torch.float8_e4m3fn),
+            d.block_table[:n],
+            token_to_req,
+            out=logits,
+            summaries_per_page=int(summary_cache.summaries_per_page),
+        )
+        q_positions = positions[:total].to(torch.int32)
+        if groups > 1:
+            q_positions = q_positions.repeat(groups).contiguous()
+            token_to_req = token_to_req.repeat(groups).contiguous()
+        packed, counts = prefill_sparse_meta(
+            logits,
+            q_positions,
+            d.block_table[:n],
+            token_to_req,
+            topk=self.topk_regions,
+            region_size=self.region_size,
+            regions_per_page=self.regions_per_page,
+        )
+        out, _ = sparse_attention_prefill(
+            query,
+            key_flat,
+            value_flat,
+            packed,
+            counts,
+            num_kv_groups=groups,
+            region_size=self.region_size,
+            softmax_scale=self.scale,
+            block_regions=2,
+        )
+        output[:total] = out.to(output.dtype)
 
     def _score_regions(
         self,
@@ -1019,16 +1266,33 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
 
         if md.num_decodes > 0:
             n = md.num_decodes
-            self._forward_sparse_gqa_decode(
-                summary_cache=summary_cache,
-                md=md,
-                query=query[:n].contiguous(),
-                key_flat=key_flat,
-                value_flat=value_flat,
-                index_q=index_q[:n],
-                weights=weights[:n],
-                output=output,
-            )
+            decode_query_len = int(md.decode.query_len) if md.decode else 1
+            if decode_query_len > 1:
+                # MTP verify batch: every decode request contributes K+1
+                # consecutive rows (positions ctx..ctx+K).
+                total = n * decode_query_len
+                self._forward_sparse_gqa_verify(
+                    summary_cache=summary_cache,
+                    md=md,
+                    query=query[:total].contiguous(),
+                    key_flat=key_flat,
+                    value_flat=value_flat,
+                    index_q=index_q[:total],
+                    weights=weights[:total],
+                    positions=positions,
+                    output=output,
+                )
+            else:
+                self._forward_sparse_gqa_decode(
+                    summary_cache=summary_cache,
+                    md=md,
+                    query=query[:n].contiguous(),
+                    key_flat=key_flat,
+                    value_flat=value_flat,
+                    index_q=index_q[:n],
+                    weights=weights[:n],
+                    output=output,
+                )
 
         if md.num_prefills > 0:
             start = md.num_decode_tokens

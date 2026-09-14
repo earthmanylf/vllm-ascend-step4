@@ -660,9 +660,17 @@ class AscendStep3p5MTPProposer(AscendEagleProposer):
                 model_positions,
             )
             if forward_context is not None and multi_steps_attn_metadata:
-                if spec_step_idx >= len(multi_steps_attn_metadata):
-                    raise AssertionError("Step3.5 MTP metadata must contain one entry per draft step")
-                forward_context.attn_metadata = multi_steps_attn_metadata[spec_step_idx]
+                # Step-4 has a single MTP layer (num_mtp_layers=1) whose
+                # weights are reused for every draft step when K>1, so the
+                # number of draft KV-cache groups (1) is smaller than the
+                # number of draft steps (K). Each full-window replay
+                # re-seeds that shared group's KV before attending, making
+                # the step-0 window metadata valid for every step; index
+                # modulo the group count instead of requiring one group
+                # per step.
+                forward_context.attn_metadata = multi_steps_attn_metadata[
+                    spec_step_idx % len(multi_steps_attn_metadata)
+                ]
 
             model_kwargs = {
                 "input_ids": model_input_ids,

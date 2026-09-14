@@ -21,6 +21,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
+
+# Debug prints for the eager MTP replay loop (draft tokens + hidden stats).
+_MTP_DEBUG = _os.environ.get("VLLM_STEP4_MTP_DEBUG", "0") == "1"
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
@@ -215,6 +218,39 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     "speculative decoding will be added in a future release. "
                 )
             self.use_cuda_graph = False
+
+        # Step-4 MTP: the MTP head is trained depth-1 -- every draft step
+        # must consume a true target hidden state. The eager ``_mtp_rerun``
+        # path implements this (each rerun pairs the planted draft token
+        # with the committed token's target hidden h_{s+1}); the graph-mode
+        # generic loop feeds the draft model's own output hidden back,
+        # which is out-of-distribution and collapses per-position
+        # acceptance beyond position 0. Force the draft model to eager,
+        # keeping the target model's graph-mode setting untouched (same
+        # contract as the GLM switch above).
+        if (
+            self.method == "mtp"
+            and getattr(draft_hf_config, "model_type", None) == "step4_mtp"
+        ):
+            if self.use_cuda_graph:
+                logger.warning(
+                    "Step-4 MTP drafting requires the eager rerun path; the "
+                    "draft model has been automatically switched to eager "
+                    "mode. The target model keeps its graph-mode setting."
+                )
+            self.use_cuda_graph = False
+
+        # Step-4 MTP: force-enable probabilistic draft sampling (upstream
+        # draft_sample_method='probabilistic' semantics) so temp>0 traffic
+        # is verified with the standard min(1, p/q) ratio test instead of
+        # argmax matching. Greedy traffic is unaffected: all-greedy
+        # batches still draft with argmax and produce no draft_probs.
+        # Done in code so serve.sh needs no extra flag.
+        if (
+            self.method == "mtp"
+            and getattr(draft_hf_config, "model_type", None) == "step4_mtp"
+        ):
+            self._enable_probabilistic_draft_probs = True
 
         # NOTE: _enable_probabilistic_draft_probs is set by the upstream
         # SpecDecodeBaseProposer.__init__.
@@ -1474,47 +1510,115 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         _mtp_rerun = self.method == "mtp" and not self.use_cuda_graph
         if _mtp_rerun:
-            # Eager MTP: draft d2..dk by re-running the whole window through
-            # the already-verified spec forward path. Each rerun plants the
-            # previous draft token into the next chain row (row tis+j, which
-            # sits at position s+j+1) paired with the target hidden from row
-            # tis (h_{s+1}: hidden of the last committed token) -- the only
-            # true target-style hidden available at draft time. Feeding the
-            # MTP layer's own output hidden back (raw or shared_head.norm'd)
-            # is out-of-distribution for this model, which is trained to
-            # consume a target hidden per MTP call. The next draft is sampled
-            # from the planted row's output.
+            # Eager MTP: draft d2..dk with the packed-window replay of the
+            # upstream Step3p5MTPProposer. Each step (1) feeds the previous
+            # forward's full-window output back as the hidden input, (2)
+            # shifts every request's window tokens left by one row so row j
+            # pairs token_{j+1} with out_j -- the (e_{k+1}, h_k) -> h_{k+1}
+            # recursion the MTP head was trained for -- and plants the
+            # freshly sampled token at the frontier row, (3) re-runs the
+            # whole window through the MTP layer with the same window
+            # attention metadata (positions and KV slots are unchanged, so
+            # each replay simply overwrites the window's draft KV), and (4)
+            # samples the next draft token at the frontier rows. Every
+            # request can always produce all K draft tokens this way,
+            # regardless of how many tokens were rejected last round.
             _fctx = get_forward_context()
             _tis_long = _mtp_tis_vec.long()
-            for _j in range(1, self.num_speculative_tokens):
-                _rows = (_mtp_tis_vec + _j).long()
-                if bool((_rows >= num_input_tokens).any()):
-                    break
-                self.input_ids[_rows] = draft_token_ids_tensor[_j - 1][: _rows.shape[0]].to(self.input_ids.dtype)
-                self.hidden_states[_rows] = self.hidden_states[_tis_long]
-                _ids = self.input_ids[:num_input_tokens]
-                _pos = self._get_positions(num_input_tokens)
-                _hid = self.hidden_states[:num_input_tokens]
-                _kw = {"input_ids": _ids, "positions": _pos, "inputs_embeds": inputs_embeds}
-                if self.pass_hidden_states_to_model:
-                    _hid2, _pos2 = self.maybe_pad_and_reduce(_hid, _pos)
-                    _kw["hidden_states"] = _hid2
-                    if self.method == "mtp":
-                        _kw["positions"] = _pos2
-                if _fctx is not None and multi_steps_attn_metadata:
-                    _fctx.attn_metadata = multi_steps_attn_metadata[0]
-                    _fctx.moe_layer_index = 0
-                _dm = getattr(self.model, "model", None)
-                if self._share_mtp_indices and _dm is not None and hasattr(_dm, "set_skip_topk"):
-                    _dm.set_skip_topk(False)
-                _ret = self.model(**_kw)
-                _lh, _ = _split_draft_outputs(_ret)
-                _lh, _, _ = self.maybe_all_gather_and_unpad(
-                    _lh, _kw["positions"], _lh
-                )
-                _h_fb = _lh[_rows]
-                _dj, _ = self.compute_draft_token_ids(_h_fb, sampling_metadata)
-                draft_token_ids_tensor[_j] = _dj[: _rows.shape[0]]
+            _qsl = getattr(self, "_mtp_packed_qsl", None)
+            # Dummy/profile runs bypass the packed-input assembly; their
+            # draft outputs are discarded, so skip the replay there.
+            _has_qsl = _qsl is not None and _qsl.shape[0] >= batch_size + 1
+            if _has_qsl:
+                _win_end = _qsl[1 : batch_size + 1]
+                _prev_out = last_hidden_states
+                for _j in range(1, self.num_speculative_tokens):
+                    # Chain step j extends the draft chain at row tis+j of
+                    # each request's window: by the packing convention row k
+                    # holds the pair (e(x_{k+1}), h_k) at RoPE p_k, the pair
+                    # (e(d_j), out_{tis+j-1}) belongs exactly at row tis+j.
+                    # The hidden feedback is the previous forward's output
+                    # one row below (out_tis for j=1, the j=1 output at
+                    # row tis+1 for j=2, ...), mirroring the upstream
+                    # Step3p5MTPProposer recursion h_in[t] = out[t-1].
+                    # Rows only exist inside the request's window
+                    # (tis+j < window_end iff at least j tokens were
+                    # rejected last round); requests without room keep a
+                    # zero draft for this position instead of corrupting a
+                    # neighbouring request's rows (the old batch-level
+                    # break zeroed them for the whole batch).
+                    _rows = _tis_long + _j
+                    _ok = _rows < _win_end
+                    _safe_rows = torch.where(_ok, _rows, _tis_long)
+                    _d_prev = draft_token_ids_tensor[_j - 1][:batch_size]
+                    self.input_ids[_safe_rows] = torch.where(
+                        _ok,
+                        _d_prev.to(self.input_ids.dtype),
+                        self.input_ids[_safe_rows],
+                    )
+                    # Hidden: variant E -- every chain row pairs with the
+                    # frontier row's true target hidden h_{s+1} (row tis),
+                    # the only genuine target hidden available at draft
+                    # time. Measured best chain quality of all hidden
+                    # sources (self-feedback and stale per-row hiddens
+                    # both underperform).
+                    self.hidden_states[_safe_rows] = self.hidden_states[_tis_long]
+                    _ids = self.input_ids[:num_input_tokens]
+                    _pos = self._get_positions(num_input_tokens)
+                    _hid = self.hidden_states[:num_input_tokens]
+                    _kw = {"input_ids": _ids, "positions": _pos, "inputs_embeds": inputs_embeds}
+                    if self.pass_hidden_states_to_model:
+                        _hid2, _pos2 = self.maybe_pad_and_reduce(_hid, _pos)
+                        _kw["hidden_states"] = _hid2
+                        if self.method == "mtp":
+                            _kw["positions"] = _pos2
+                    if _fctx is not None and multi_steps_attn_metadata:
+                        _fctx.attn_metadata = multi_steps_attn_metadata[0]
+                        _fctx.moe_layer_index = 0
+                    _dm = getattr(self.model, "model", None)
+                    if self._share_mtp_indices and _dm is not None and hasattr(_dm, "set_skip_topk"):
+                        _dm.set_skip_topk(False)
+                    _ret = self.model(**_kw)
+                    _lh, _ = _split_draft_outputs(_ret)
+                    _lh, _, _ = self.maybe_all_gather_and_unpad(
+                        _lh, _kw["positions"], _lh
+                    )
+                    _prev_out = _lh
+                    _dj, _dp = self.compute_draft_token_ids(
+                        _lh[_safe_rows], sampling_metadata
+                    )
+                    _dj = _dj[:batch_size]
+                    if bool(_ok.all()):
+                        draft_token_ids_tensor[_j] = _dj
+                    else:
+                        draft_token_ids_tensor[_j][_ok] = _dj[_ok]
+                    # Probabilistic rejection sampling: collect this step's
+                    # draft distribution. All-or-nothing like the graph-mode
+                    # loop below -- a missing/mismatched step drops the
+                    # whole list (the sampler then falls back to greedy
+                    # semantics instead of crashing on a ragged stack).
+                    if draft_probs_list is not None:
+                        if (
+                            _dp is not None
+                            and _dp.shape[0] == draft_probs_list[0].shape[0]
+                        ):
+                            draft_probs_list.append(_dp[:batch_size].contiguous())
+                        else:
+                            draft_probs_list = None
+                    if _MTP_DEBUG:
+                        _fh = _lh[_safe_rows].float()
+                        logger.warning(
+                            "[mtp-dbg] step=%d n_tok=%d batch=%d ok=%d d=%s "
+                            "fb|out|=%.4f d_prev=%s tis=%s",
+                            _j,
+                            num_input_tokens,
+                            batch_size,
+                            int(_ok.sum().item()),
+                            _dj[:8].tolist(),
+                            _fh.abs().mean().item(),
+                            draft_token_ids_tensor[_j - 1][:8].tolist(),
+                            _tis_long[:8].tolist(),
+                        )
         for draft_index in ([] if _mtp_rerun else range(self.num_speculative_tokens - 1)):
             # Reset MOE layer index for each draft step iteration
             forward_context = get_forward_context()
@@ -1637,7 +1741,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
-        if draft_probs_list is not None:
+        # Length guard: the eager MTP rerun may skip its prob collection
+        # (e.g. no packed-window qsl); a ragged list must not produce a
+        # short [B, <K, V] stack that would break downstream slicing.
+        if draft_probs_list is not None and len(draft_probs_list) == self.num_speculative_tokens:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
 
@@ -1655,6 +1762,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_prefill_reqs=0,
         num_decode_reqs=0,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata, tuple[Any, Any] | None]:
+        # Window (per-request) row boundaries for the eager MTP rerun loop's
+        # shift-replay: rows [qsl[i], qsl[i+1]) belong to request i.
+        self._mtp_packed_qsl = (
+            cad.query_start_loc[: cad.num_reqs + 1].to(torch.int64).clone()
+        )
         if not self.needs_extra_input_slots:
             # Default EAGLE pathway: no reshaping of input tensors needed.
             # Simply rotate the input ids and leave the positions unchanged,
@@ -2397,6 +2509,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=common_attn_metadata.token_to_req,
+        )
+
+        # Window (per-request) row boundaries for the eager MTP rerun loop's
+        # shift-replay: rows [qsl[i], qsl[i+1]) belong to request i.
+        self._mtp_packed_qsl = (
+            common_attn_metadata.query_start_loc[: common_attn_metadata.num_reqs + 1]
+            .to(torch.int64)
+            .clone()
         )
 
         return spec_common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu

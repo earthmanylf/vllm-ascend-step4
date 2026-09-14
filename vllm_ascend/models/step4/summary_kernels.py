@@ -807,3 +807,427 @@ def csa_compact_prefill_update(
             num_warps=4,
         )
 
+
+# ---------------------------------------------------------------------------
+# MTP verify batches: staged tokens + deferred region flush
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _csa_verify_stage_kernel(
+    mean_cache,
+    active_region_ids,
+    active_slot_by_region,
+    allocation_success,
+    active_numerator,
+    denominator,
+    max_logits,
+    staging_k,
+    staging_z,
+    staging_valid,
+    flat_slot,
+    reset_slots,
+    token_valid,
+    token_positions,
+    index_k,
+    index_z,
+    num_blocks,
+    live_rows,
+    total_regions,
+    mean_stride_page,
+    numerator_stride_slot,
+    denominator_stride_slot,
+    max_stride_slot,
+    SUMMARIES_PER_PAGE: tl.constexpr,
+    PROXY_DIM: tl.constexpr,
+    REGION_BLOCK_SIZE: tl.constexpr,
+    ACTIVE_CAPACITY: tl.constexpr,
+    ALLOC_PROBE: tl.constexpr,
+    K_ROWS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+) -> None:
+    """Stage one request's verify rows in position order; never flush.
+
+    Spec-decode verify rows are provisional: the rejection sampler commits
+    only an accepted prefix, and the next verify round rewrites the rejected
+    positions at the same slots. Staging is last-write-wins per
+    (region, offset), so a rewrite cleanly replaces a rejected token's
+    contribution -- this is the Ascend equivalent of the upstream
+    ``Step4DSAMTPTransaction`` rollback, with the accepted-prefix state
+    recovered by replay instead of by fp32 snapshots. Regions therefore only
+    materialize into the fp8 page cache through the deferred flush below,
+    once they are provably fully committed.
+
+    One program per request stages its K+1 rows sequentially in row order:
+    a region-start row's reset must be ordered before the staging of the
+    region's later offsets, which parallel per-token programs cannot
+    guarantee.
+    """
+    block = tl.program_id(0)
+    if block >= num_blocks:
+        return
+    dims = tl.arange(0, BLOCK_D)
+    dim_mask = dims < PROXY_DIM
+    toks = tl.arange(0, BLOCK_T)
+
+    for j in tl.static_range(K_ROWS):
+        # triton-ascend rejects `continue` in static_range; guard the body.
+        row = block * K_ROWS + j
+        row_ok = row < live_rows
+        valid = tl.load(token_valid + row).to(tl.int1)
+        region = tl.load(flat_slot + row)
+        region_ok = (region >= 0) & (region < total_regions)
+        if row_ok & valid & region_ok:
+            position = tl.load(token_positions + row)
+            offset = position % REGION_BLOCK_SIZE
+
+            region_i32 = region.to(tl.int32)
+            hint = tl.load(active_slot_by_region + region).to(tl.int64)
+            hint_ok = (hint >= 0) & (hint < ACTIVE_CAPACITY)
+            safe_hint = tl.where(hint_ok, hint, 0)
+            hint_owner = tl.load(active_region_ids + safe_hint, mask=hint_ok, other=-1)
+            slot = tl.where(hint_ok & (hint_owner == region_i32), hint, ACTIVE_CAPACITY)
+            has_slot = slot != ACTIVE_CAPACITY
+            safe_slot = tl.where(has_slot, slot, 0)
+
+            # Region restart at offset 0 clears any older state for this
+            # region (fresh region after a page flush, or an abandoned
+            # generation tail).
+            reset = tl.load(reset_slots + row) == region
+            if reset:
+                if has_slot:
+                    tl.store(
+                        active_numerator + safe_slot * numerator_stride_slot + dims,
+                        0.0,
+                        mask=dim_mask,
+                    )
+                    tl.store(
+                        denominator + safe_slot * denominator_stride_slot + dims,
+                        0.0,
+                        mask=dim_mask,
+                    )
+                    tl.store(max_logits + safe_slot * max_stride_slot, -float("inf"))
+                    tl.store(
+                        staging_valid + safe_slot * REGION_BLOCK_SIZE + toks,
+                        0,
+                        mask=toks < REGION_BLOCK_SIZE,
+                    )
+                _csa_store_fp8_mean(
+                    mean_cache
+                    + (region // SUMMARIES_PER_PAGE) * mean_stride_page
+                    + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
+                    dims,
+                    tl.zeros((BLOCK_D,), dtype=tl.float32),
+                    dim_mask,
+                )
+                # The slot (if any) is now empty for this region.
+                has_slot = False
+                slot = tl.full((), ACTIVE_CAPACITY, tl.int64)
+
+            cur_k = tl.load(
+                index_k + row * PROXY_DIM + dims, mask=dim_mask, other=0.0
+            ).to(tl.float32)
+            cur_z = tl.load(
+                index_z + row * PROXY_DIM + dims, mask=dim_mask, other=0.0
+            ).to(tl.float32)
+
+            # Allocate a slot on first touch (the region may still be
+            # slotless when the verify batch is the first to touch it after
+            # a page flush).
+            if slot == ACTIVE_CAPACITY:
+                start = region % ACTIVE_CAPACITY
+                empty = tl.full((), -1, tl.int32)
+                for probe in tl.range(0, ALLOC_PROBE):
+                    if slot == ACTIVE_CAPACITY:
+                        cand = (start + probe) % ACTIVE_CAPACITY
+                        old = tl.atomic_cas(active_region_ids + cand, empty, region_i32)
+                        if (old == empty) | (old == region_i32):
+                            slot = cand.to(tl.int64)
+                if slot == ACTIVE_CAPACITY:
+                    tl.store(allocation_success, 0)
+            slot_ok = (slot >= 0) & (slot < ACTIVE_CAPACITY)
+            safe_slot = tl.where(slot_ok, slot, 0)
+            if slot_ok:
+                tl.store(active_slot_by_region + region, slot.to(tl.int32))
+                tl.store(
+                    staging_k
+                    + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
+                    + offset * PROXY_DIM
+                    + dims,
+                    cur_k.to(staging_k.dtype.element_ty),
+                    mask=dim_mask,
+                )
+                tl.store(
+                    staging_z
+                    + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
+                    + offset * PROXY_DIM
+                    + dims,
+                    cur_z.to(staging_z.dtype.element_ty),
+                    mask=dim_mask,
+                )
+                tl.store(staging_valid + safe_slot * REGION_BLOCK_SIZE + offset, 1)
+
+
+def csa_verify_stage_update(
+    mean_cache: torch.Tensor,
+    active_region_ids: torch.Tensor,
+    active_slot_by_region: torch.Tensor,
+    allocation_success: torch.Tensor,
+    active_numerator: torch.Tensor,
+    denominator: torch.Tensor,
+    max_logits: torch.Tensor,
+    staging_k: torch.Tensor,
+    staging_z: torch.Tensor,
+    staging_valid: torch.Tensor,
+    flat_slot: torch.Tensor,
+    reset_slots: torch.Tensor,
+    token_valid: torch.Tensor,
+    token_positions: torch.Tensor,
+    index_k: torch.Tensor,
+    index_z: torch.Tensor,
+    *,
+    live_rows: int,
+    query_len: int,
+    num_pages: int,
+    summaries_per_page: int,
+    proxy_dim: int,
+    region_block_size: int,
+) -> None:
+    """Stage the verify rows of an MTP batch into the active slot state."""
+    rows = int(flat_slot.numel())
+    if rows == 0 or live_rows <= 0 or query_len <= 1:
+        return
+    num_blocks = (min(rows, live_rows) + query_len - 1) // query_len
+    _csa_verify_stage_kernel[(num_blocks,)](
+        mean_cache,
+        active_region_ids,
+        active_slot_by_region,
+        allocation_success,
+        active_numerator,
+        denominator,
+        max_logits,
+        staging_k,
+        staging_z,
+        staging_valid,
+        flat_slot,
+        reset_slots,
+        token_valid,
+        token_positions,
+        index_k,
+        index_z,
+        int(num_blocks),
+        int(live_rows),
+        int(num_pages) * int(summaries_per_page),
+        int(mean_cache.stride(0)),
+        int(active_numerator.stride(0)),
+        int(denominator.stride(0)),
+        int(max_logits.stride(0)),
+        SUMMARIES_PER_PAGE=int(summaries_per_page),
+        PROXY_DIM=int(proxy_dim),
+        REGION_BLOCK_SIZE=int(region_block_size),
+        ACTIVE_CAPACITY=int(active_region_ids.numel()),
+        ALLOC_PROBE=_ALLOC_PROBE,
+        K_ROWS=int(query_len),
+        BLOCK_T=triton.next_power_of_2(int(region_block_size)),
+        BLOCK_D=triton.next_power_of_2(int(proxy_dim)),
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _csa_deferred_flush_kernel(
+    mean_cache,
+    active_region_ids,
+    active_slot_by_region,
+    active_numerator,
+    denominator,
+    max_logits,
+    staging_k,
+    staging_z,
+    staging_valid,
+    seq_lens,
+    block_table,
+    num_flush_reqs,
+    query_len,
+    max_table_cols,
+    total_regions,
+    mean_stride_page,
+    numerator_stride_slot,
+    denominator_stride_slot,
+    max_stride_slot,
+    SUMMARIES_PER_PAGE: tl.constexpr,
+    PROXY_DIM: tl.constexpr,
+    REGION_BLOCK_SIZE: tl.constexpr,
+    REGIONS_PER_PAGE: tl.constexpr,
+    ACTIVE_CAPACITY: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+) -> None:
+    """Flush one request's highest fully-committed region, if any.
+
+    A region is committable when its last position is below the request's
+    committed context ``ctx = seq_len - query_len``: verify acceptance is at
+    least one token per round and never retreats, so once ``region_end <=
+    ctx`` the region's staged tokens can no longer be rewritten. The fold is
+    the same shared-max online-softmax merge the decode flush uses (prefill
+    prefix N/D/M plus every staged token).
+    """
+    req = tl.program_id(0)
+    if req >= num_flush_reqs:
+        return
+    seq_len = tl.load(seq_lens + req).to(tl.int32)
+    ctx = seq_len - query_len
+    region_idx = ctx // REGION_BLOCK_SIZE - 1
+    if region_idx < 0:
+        return
+    page_col = region_idx // REGIONS_PER_PAGE
+    if page_col >= max_table_cols:
+        return
+    page = tl.load(block_table + req * max_table_cols + page_col).to(tl.int32)
+    if page < 0:
+        return
+    region = (page * REGIONS_PER_PAGE + region_idx % REGIONS_PER_PAGE).to(tl.int64)
+    if (region < 0) | (region >= total_regions):
+        return
+
+    hint = tl.load(active_slot_by_region + region).to(tl.int64)
+    hint_ok = (hint >= 0) & (hint < ACTIVE_CAPACITY)
+    safe_hint = tl.where(hint_ok, hint, 0)
+    hint_owner = tl.load(active_region_ids + safe_hint, mask=hint_ok, other=-1)
+    if ~(hint_ok & (hint_owner == region.to(tl.int32))):
+        # Not staged (already flushed, or owned by prefill state): nothing
+        # to do. Prefill-flushed complete regions release their slots, and
+        # an N/D/M-only tail region belongs to the current context.
+        return
+    slot = safe_hint
+
+    dims = tl.arange(0, BLOCK_D)
+    dim_mask = dims < PROXY_DIM
+    toks = tl.arange(0, BLOCK_T)
+    tok_mask = toks < REGION_BLOCK_SIZE
+
+    # Eligibility (region_end <= ctx) already proves every offset of the
+    # region was written: positions are covered contiguously by successive
+    # verify batches, and never rewritten once committed. Prefill-written
+    # offsets live in the prefix N/D/M, verify-written offsets in staging,
+    # so the fold below covers the region exactly.
+    staged_ok = (
+        tl.load(
+            staging_valid + slot * REGION_BLOCK_SIZE + toks, mask=tok_mask, other=0
+        )
+        != 0
+    )
+
+    prefix_num = tl.load(
+        active_numerator + slot * numerator_stride_slot + dims,
+        mask=dim_mask,
+        other=0.0,
+    )
+    prefix_den = tl.load(
+        denominator + slot * denominator_stride_slot + dims,
+        mask=dim_mask,
+        other=0.0,
+    )
+    prefix_max = tl.load(max_logits + slot * max_stride_slot).to(tl.float32)
+
+    staged_z = tl.load(
+        staging_z + slot * (REGION_BLOCK_SIZE * PROXY_DIM) + toks[:, None] * PROXY_DIM + dims[None, :],
+        mask=staged_ok[:, None] & dim_mask[None, :],
+        other=-float("inf"),
+    ).to(tl.float32)
+    staged_k = tl.load(
+        staging_k + slot * (REGION_BLOCK_SIZE * PROXY_DIM) + toks[:, None] * PROXY_DIM + dims[None, :],
+        mask=staged_ok[:, None] & dim_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    has_prefix = tl.max(prefix_den) > 0.0
+    base_max = tl.where(has_prefix, prefix_max, -float("inf"))
+    shared_max = tl.maximum(base_max, tl.max(tl.where(staged_ok[:, None], staged_z, -float("inf"))))
+    scale = tl.where(has_prefix, tl.exp(prefix_max - shared_max), 0.0)
+    staged_w = tl.where(staged_ok[:, None], tl.exp(staged_z - shared_max), 0.0)
+    numerator = prefix_num * scale + tl.sum(staged_w * staged_k, axis=0)
+    denominator_acc = prefix_den * scale + tl.sum(staged_w, axis=0)
+    mean = tl.where(
+        denominator_acc > 0.0,
+        numerator / tl.maximum(denominator_acc, 1.0e-20),
+        0.0,
+    )
+    _csa_store_fp8_mean(
+        mean_cache
+        + (region // SUMMARIES_PER_PAGE) * mean_stride_page
+        + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
+        dims,
+        mean,
+        dim_mask,
+    )
+    # Release the slot: the region now lives only in the page cache.
+    tl.store(active_slot_by_region + region, -1)
+    tl.store(active_region_ids + slot, -1)
+    tl.store(
+        active_numerator + slot * numerator_stride_slot + dims, 0.0, mask=dim_mask
+    )
+    tl.store(
+        denominator + slot * denominator_stride_slot + dims, 0.0, mask=dim_mask
+    )
+    tl.store(max_logits + slot * max_stride_slot, -float("inf"))
+    tl.store(
+        staging_valid + slot * REGION_BLOCK_SIZE + toks, 0, mask=tok_mask
+    )
+
+
+def csa_deferred_flush(
+    mean_cache: torch.Tensor,
+    active_region_ids: torch.Tensor,
+    active_slot_by_region: torch.Tensor,
+    active_numerator: torch.Tensor,
+    denominator: torch.Tensor,
+    max_logits: torch.Tensor,
+    staging_k: torch.Tensor,
+    staging_z: torch.Tensor,
+    staging_valid: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    num_reqs: int,
+    query_len: int,
+    num_pages: int,
+    summaries_per_page: int,
+    region_block_size: int,
+    page_size: int,
+) -> None:
+    """Materialize fully-committed tail regions of MTP verify requests."""
+    rows = int(seq_lens.numel())
+    if rows == 0 or num_reqs <= 0 or query_len <= 1:
+        return
+    _csa_deferred_flush_kernel[(rows,)](
+        mean_cache,
+        active_region_ids,
+        active_slot_by_region,
+        active_numerator,
+        denominator,
+        max_logits,
+        staging_k,
+        staging_z,
+        staging_valid,
+        seq_lens,
+        block_table,
+        int(num_reqs),
+        int(query_len),
+        int(block_table.stride(0)),
+        int(num_pages) * int(summaries_per_page),
+        int(mean_cache.stride(0)),
+        int(active_numerator.stride(0)),
+        int(denominator.stride(0)),
+        int(max_logits.stride(0)),
+        SUMMARIES_PER_PAGE=int(summaries_per_page),
+        PROXY_DIM=int(staging_k.shape[-1]),
+        REGION_BLOCK_SIZE=int(region_block_size),
+        REGIONS_PER_PAGE=int(page_size) // int(region_block_size),
+        ACTIVE_CAPACITY=int(active_region_ids.numel()),
+        BLOCK_T=triton.next_power_of_2(int(region_block_size)),
+        BLOCK_D=triton.next_power_of_2(int(staging_k.shape[-1])),
+        num_warps=4,
+    )
+
