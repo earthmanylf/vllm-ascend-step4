@@ -46,7 +46,7 @@ def get_spec_decode_method(method, vllm_config, device, runner):
         return AscendDSparkProposer(vllm_config, device, runner)
     elif method in ("eagle", "eagle3", "mtp"):
         speculative_config = vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.use_step3p5_mtp():
+        if speculative_config is not None and speculative_config.use_step_mtp():
             return AscendStep3p5MTPProposer(vllm_config, device, runner)
         return AscendEagleProposer(vllm_config, device, runner)
     elif method == "dflash":
