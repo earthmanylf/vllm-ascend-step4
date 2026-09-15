@@ -42,11 +42,6 @@ __all__ = [
     "csa_reset_blocks",
 ]
 
-# CAS probe window for active-slot allocation. The slot table is sized at
-# 8x max_num_seqs and a probe starts at region % capacity; upstream's CuTe
-# allocator probes 32 entries, the Triton fast path a fixed window too.
-_ALLOC_PROBE = 64
-
 
 @triton.jit
 def _csa_store_fp8_mean(mean_cache_ptr, offset, value, mask):
@@ -86,6 +81,7 @@ def _csa_reset_blocks_kernel(
     ACTIVE_CAPACITY: tl.constexpr,
     REGION_BLOCK_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    CLEAR_MEAN: tl.constexpr,
 ) -> None:
     """Reset one summary fragment of one physical page (grid: block, frag).
 
@@ -104,11 +100,12 @@ def _csa_reset_blocks_kernel(
 
     dims = tl.arange(0, BLOCK_D)
     dim_mask = dims < PROXY_DIM
-    tl.store(
-        mean_cache + safe_page * mean_stride_page + fragment * PROXY_DIM + dims,
-        0,
-        mask=valid & dim_mask,
-    )
+    if CLEAR_MEAN:
+        tl.store(
+            mean_cache + safe_page * mean_stride_page + fragment * PROXY_DIM + dims,
+            0,
+            mask=valid & dim_mask,
+        )
 
     region = page * SUMMARIES_PER_PAGE + fragment
     safe_region = tl.where(valid, region, 0)
@@ -155,6 +152,7 @@ def csa_reset_blocks(
     summaries_per_page: int,
     proxy_dim: int,
     region_block_size: int,
+    clear_mean: bool = True,
 ) -> None:
     """Reset the summary payload and active-slot state of physical pages."""
     if block_ids.numel() == 0:
@@ -179,6 +177,7 @@ def csa_reset_blocks(
         ACTIVE_CAPACITY=int(active_region_ids.numel()),
         REGION_BLOCK_SIZE=int(region_block_size),
         BLOCK_D=triton.next_power_of_2(int(proxy_dim)),
+        CLEAR_MEAN=bool(clear_mean),
         num_warps=4,
     )
 
@@ -470,7 +469,7 @@ def csa_compact_decode_update(
         PROXY_DIM=int(proxy_dim),
         REGION_BLOCK_SIZE=int(region_block_size),
         ACTIVE_CAPACITY=int(active_region_ids.numel()),
-        ALLOC_PROBE=_ALLOC_PROBE,
+        ALLOC_PROBE=int(active_region_ids.numel()),
         BLOCK_T=triton.next_power_of_2(int(region_block_size)),
         BLOCK_D=triton.next_power_of_2(int(proxy_dim)),
         num_warps=4,
@@ -921,9 +920,10 @@ def _csa_verify_stage_kernel(
                     tl.zeros((BLOCK_D,), dtype=tl.float32),
                     dim_mask,
                 )
-                # The slot (if any) is now empty for this region.
-                has_slot = False
-                slot = tl.full((), ACTIVE_CAPACITY, tl.int64)
+                # The slot keeps its ownership: staging continues in the
+                # same slot. Nulling it here would force a re-allocation
+                # whose CAS probe can claim a second slot for the same
+                # region and orphan the old one.
 
             cur_k = tl.load(
                 index_k + row * PROXY_DIM + dims, mask=dim_mask, other=0.0
@@ -1027,7 +1027,7 @@ def csa_verify_stage_update(
         PROXY_DIM=int(proxy_dim),
         REGION_BLOCK_SIZE=int(region_block_size),
         ACTIVE_CAPACITY=int(active_region_ids.numel()),
-        ALLOC_PROBE=_ALLOC_PROBE,
+        ALLOC_PROBE=int(active_region_ids.numel()),
         K_ROWS=int(query_len),
         BLOCK_T=triton.next_power_of_2(int(region_block_size)),
         BLOCK_D=triton.next_power_of_2(int(proxy_dim)),
@@ -1230,4 +1230,3 @@ def csa_deferred_flush(
         BLOCK_D=triton.next_power_of_2(int(staging_k.shape[-1])),
         num_warps=4,
     )
-

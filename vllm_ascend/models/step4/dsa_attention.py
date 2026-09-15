@@ -147,7 +147,7 @@ class AscendStep4DSABackend(AttentionBackend):
 @dataclass
 class AscendStep4DSAPrefillMetadata:
     seq_lens: torch.Tensor
-    """(num_prefills,) tokens contributed by each prefill request this step."""
+    """(num_prefills,) full sequence lengths (cached prefix + this chunk)."""
 
     context_lens: torch.Tensor
     """(num_prefills,) tokens already cached before this chunk."""

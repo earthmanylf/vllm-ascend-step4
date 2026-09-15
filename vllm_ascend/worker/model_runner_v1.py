@@ -966,6 +966,12 @@ class NPUModelRunner(GPUModelRunner):
                 self.cached.setdefault(cur_hash, set()).add(new_req_data.req_id)
 
     def _on_request_state_removed(self, req_id: str, req_state: Any | None) -> None:
+        # Mirror the upstream hook: drop the finished request's KV side
+        # storage (Step4 CSA active-slot state). The preemption path calls
+        # _release_request_kv_cache_side_storage directly; without this the
+        # finish path would leak one staged region per finished request
+        # until the active-slot pool is exhausted.
+        super()._on_request_state_removed(req_id, req_state)
         if req_state is None:
             return
         if not self.use_score_encoder_cache:
