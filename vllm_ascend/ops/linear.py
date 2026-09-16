@@ -355,8 +355,36 @@ class AscendRowParallelLinear(RowParallelLinear):
     def forward(
         self,
         input_,
+        reduce_scatter_results: bool = False,
+        reduce_scatter_dim: int = 0,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if reduce_scatter_results:
+            # Sequence-parallel contract: compute the row-parallel partial and
+            # reduce-scatter it across TP instead of all-reducing (half the
+            # communication volume). Callers pad rows to a TP multiple.
+            if self.custom_op is not None:
+                raise NotImplementedError("reduce_scatter_results is not supported with custom ops")
+            if not self.reduce_results:
+                raise ValueError("reduce_scatter_results requires reduce_results=True")
+            from vllm.distributed import split_tensor_along_last_dim, tensor_model_parallel_reduce_scatter
+
+            if self.input_is_parallel:
+                input_parallel = input_
+            else:
+                input_parallel = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)[
+                    self.tp_rank
+                ].contiguous()
+            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+            if self.tp_size > 1:
+                output = tensor_model_parallel_reduce_scatter(output_parallel, reduce_scatter_dim)
+            else:
+                output = output_parallel
+            output_bias = self.bias if self.skip_bias_add else None
+            if not self.return_bias:
+                return output
+            return output, output_bias
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
 
