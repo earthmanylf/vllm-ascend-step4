@@ -38,7 +38,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import RowParallelLinear
@@ -1233,6 +1233,16 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
 
 
 
+def _batch_has_prefill_requests() -> bool:
+    """True when the current forward batch contains any prefill request."""
+    if not is_forward_context_available():
+        return False
+    attn_metadata = get_forward_context().attn_metadata
+    if not isinstance(attn_metadata, dict):
+        return False
+    return any(getattr(md, "num_prefills", 0) > 0 for md in attn_metadata.values())
+
+
 class AscendStep4Model(Step4Model):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
@@ -1297,6 +1307,19 @@ class AscendStep4Model(Step4Model):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
         residual = self._cast_for_residual(hidden_states)
+
+        if envs.VLLM_ASCEND_SKIP_PREFILL and _batch_has_prefill_requests():
+            # Debug switch: skip all decoder-layer computation (including KV
+            # cache writes) when the batch contains prefill requests; return
+            # the embedded inputs so downstream logits/sampling shapes stay
+            # intact.
+            if not get_pp_group().is_last_rank:
+                return IntermediateTensors(
+                    {
+                        "hidden_states": hidden_states,
+                    }
+                )
+            return hidden_states
 
         # The per-layer tail (cast the FFN output to the residual dtype and
         # add the residual) is deferred and fused with the *next* layer's

@@ -78,6 +78,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Ascend 950, MXFP8 requantize on Ascend 950). Valid values: "0" or "1".
     # Not sensitive.
     "VLLM_ASCEND_ENABLE_STEP4_FP8": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_STEP4_FP8", "0"))),
+    # Whether to skip the Step4 model's decoder-layer computation whenever the
+    # current batch contains prefill requests (debug/perf use only). When
+    # enabled, AscendStep4Model.forward returns the embedded inputs without
+    # running any decoder layer (and without writing KV cache), so the logits
+    # produced for that step are garbage. If not set, the default value is 0,
+    # which computes normally. Valid values: "0" or "1". Not sensitive.
+    "VLLM_ASCEND_SKIP_PREFILL": lambda: bool(int(os.getenv("VLLM_ASCEND_SKIP_PREFILL", "0"))),
 }
 
 # end-env-vars-definition
