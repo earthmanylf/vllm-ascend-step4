@@ -124,6 +124,15 @@ class NPUInputBatch(InputBatch):
             pin_memory=pin_memory,
         )
         self.num_prompt_tokens = self.num_prompt_tokens_cpu_tensor.numpy()
+        # Scheduler-owned prefill lifecycle state, zeroed and refilled each
+        # step by the upstream _update_states; inherited methods such as
+        # swap_states/condense also touch these rows.
+        self.is_prefilling = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.bool,
+            pin_memory=pin_memory,
+        )
         self.num_computed_tokens_cpu_tensor = torch.zeros(
             (max_num_reqs,),
             device="cpu",

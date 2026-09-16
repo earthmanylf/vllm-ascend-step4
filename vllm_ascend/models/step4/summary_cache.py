@@ -46,10 +46,14 @@ class AscendStep4SparseSummaryCache(Step4SparseSummaryCache):
     and the slot's numerator/denominator/max/staging state in one launch.
     """
 
-    def reset_blocks(self, block_ids: torch.Tensor | list[int]) -> None:
-        self.reset_scheduler_blocks(block_ids)
+    def reset_blocks(
+        self, block_ids: torch.Tensor | list[int], *, clear_mean: bool = True
+    ) -> None:
+        self.reset_scheduler_blocks(block_ids, clear_mean=clear_mean)
 
-    def reset_scheduler_blocks(self, block_ids: torch.Tensor | list[int]) -> None:
+    def reset_scheduler_blocks(
+        self, block_ids: torch.Tensor | list[int], *, clear_mean: bool = True
+    ) -> None:
         device = self.mean_cache.device
         if isinstance(block_ids, torch.Tensor):
             ids = block_ids
@@ -99,6 +103,7 @@ class AscendStep4SparseSummaryCache(Step4SparseSummaryCache):
             summaries_per_page=int(self.summaries_per_page),
             proxy_dim=int(self.proxy_dim),
             region_block_size=int(self.region_block_size),
+            clear_mean=clear_mean,
         )
 
     def warmup_scheduler_block_reset(self) -> None:

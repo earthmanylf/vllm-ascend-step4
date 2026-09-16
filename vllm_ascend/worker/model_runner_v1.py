@@ -966,6 +966,12 @@ class NPUModelRunner(GPUModelRunner):
                 self.cached.setdefault(cur_hash, set()).add(new_req_data.req_id)
 
     def _on_request_state_removed(self, req_id: str, req_state: Any | None) -> None:
+        # Mirror the upstream hook: drop the finished request's KV side
+        # storage (Step4 CSA active-slot state). The preemption path calls
+        # _release_request_kv_cache_side_storage directly; without this the
+        # finish path would leak one staged region per finished request
+        # until the active-slot pool is exhausted.
+        super()._on_request_state_removed(req_id, req_state)
         if req_state is None:
             return
         if not self.use_score_encoder_cache:
@@ -2144,7 +2150,7 @@ class NPUModelRunner(GPUModelRunner):
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
-                        self._dummy_run(1)
+                        self._dummy_run(1, disable_kv_cache_writes=True)
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
@@ -3201,7 +3207,11 @@ class NPUModelRunner(GPUModelRunner):
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
             :num_reqs_padded
         ]
-        is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
+        # Use the scheduler-owned lifecycle state. Prompt length alone
+        # misclassifies reset-prefix-cache replay after the prompt has been
+        # recomputed but generated output tokens still need replay.
+        is_prefilling = self.input_batch.is_prefilling[:num_reqs_padded]
+        # Padded CUDA Graph rows can retain state from a larger prior batch.
         is_prefilling[num_reqs:] = False
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
         if self.use_async_spec_decode:
@@ -3431,6 +3441,7 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
+        disable_kv_cache_writes: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -3582,10 +3593,17 @@ class NPUModelRunner(GPUModelRunner):
                         batch_desc.num_reqs,
                     )
 
-                # Dummy graph runs do not go through _prepare_inputs(), but GDN/Mamba
-                # metadata reads block_table[:num_reqs_padded] below. Sync padded
-                # rows as well so device-side metadata does not see stale block ids.
-                self.input_batch.block_table.commit_block_table(num_reqs_padded)
+                if disable_kv_cache_writes:
+                    # Align with upstream gpu_model_runner: keep live block
+                    # IDs out of this temporary device-only forward while
+                    # preserving the CPU rows for the next real step.
+                    self.input_batch.block_table.clear_device_rows(num_reqs_padded)
+                else:
+                    # Dummy graph runs do not go through _prepare_inputs(), but
+                    # GDN/Mamba metadata reads block_table[:num_reqs_padded]
+                    # below. Sync padded rows as well so device-side metadata
+                    # does not see stale block ids.
+                    self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 # Invalidate real-request slots before attention backends derive
                 # or copy their backend-specific metadata for dummy execution.
