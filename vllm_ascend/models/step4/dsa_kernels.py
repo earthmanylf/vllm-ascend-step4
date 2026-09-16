@@ -1014,6 +1014,7 @@ def _region_topk_pack_kernel(
     block_table_ptr,
     request_ptr,
     out_ptr,
+    total_rows,
     seq_regions,
     stride_logits_row,
     stride_table_row,
@@ -1021,6 +1022,8 @@ def _region_topk_pack_kernel(
     topk: tl.constexpr,
     region_size: tl.constexpr,
     regions_per_page: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SUB_ROWS: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ) -> None:
@@ -1031,65 +1034,720 @@ def _region_topk_pack_kernel(
     the cut take a *prefix* of the tied group, they do not drop it -- and that case is
     common rather than exotic, because post-ReLU indexer scores are exactly zero about
     6.25% of the time, so the group sitting at the cut is usually the zero group.
+
+    NPU optimisation: each program processes ``BLOCK_ROWS`` rows, but instead of
+    looping one row at a time it operates on 2-D ``[SUB_ROWS, BLOCK_R]`` tiles so
+    the vector engine processes ``SUB_ROWS`` rows concurrently.  Two-phase binary
+    search on int32 ordered-float keys (14 + 16 iterations) finds the top-k
+    threshold; the tie-breaking phase is guarded by a single scalar check so it
+    is skipped entirely when no row in the sub-tile has ties at the cut.
+    """
+    pid = tl.program_id(0)
+
+    # --- Initialise all output rows to -1 (single 2-D store) ------------
+    all_rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    all_row_ok = all_rows < total_rows
+    all_slots = tl.arange(0, BLOCK_TOPK)
+    tl.store(
+        out_ptr + all_rows[:, None] * stride_out_row + all_slots[None, :],
+        -1,
+        mask=all_row_ok[:, None] & (all_slots[None, :] < topk),
+    )
+
+    regions = tl.arange(0, BLOCK_R)
+    NUM_SUBS: tl.constexpr = BLOCK_ROWS // SUB_ROWS
+
+    # --- Process rows in SUB_ROWS-wide 2-D tiles -------------------------
+    for sub_id in tl.range(0, NUM_SUBS, num_stages=2):
+        sub_rows = pid * BLOCK_ROWS + sub_id * SUB_ROWS + tl.arange(0, SUB_ROWS)
+        sub_ok = sub_rows < total_rows
+
+        # Per-row metadata (1-D)
+        visible = tl.load(lengths_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+        visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+        q_position = tl.load(q_positions_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+        request = tl.load(request_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+
+        # 2-D live mask
+        live = sub_ok[:, None] & (regions[None, :] < visible[:, None])
+
+        # 2-D score load
+        scores = tl.load(
+            logits_ptr + sub_rows[:, None] * stride_logits_row + regions[None, :],
+            mask=live,
+            other=0.0,
+        )
+
+        # Ordered-float keys (2-D)
+        bits = scores.to(tl.int32, bitcast=True)
+        keys_i32 = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+        keys_16 = tl.where(live, keys_i32 >> 16, -2147483648)
+
+        # Phase 1: per-row binary search on upper 16 bits.
+        # 14 iterations narrow the range to ≤ 4, then resolve the
+        # residual 4-candidate uncertainty with parallel counts that
+        # have no sequential dependency on each other.
+        lo = tl.full((SUB_ROWS,), -32768, dtype=tl.int32)
+        hi = tl.full((SUB_ROWS,), 32767, dtype=tl.int32)
+        for _bs in tl.static_range(14):
+            mid = (lo + hi + 1) >> 1
+            count_geq = tl.sum((keys_16 >= mid[:, None]).to(tl.int32), axis=1)
+            ge_topk = count_geq >= topk
+            lo = tl.where(ge_topk, mid, lo)
+            hi = tl.where(ge_topk, hi, mid - 1)
+
+        # Resolve residual: check 4 candidates (lo, lo+1, lo+2, lo+3)
+        c0 = tl.sum((keys_16 >= lo[:, None]).to(tl.int32), axis=1)
+        c1 = tl.sum((keys_16 >= (lo + 1)[:, None]).to(tl.int32), axis=1)
+        c2 = tl.sum((keys_16 >= (lo + 2)[:, None]).to(tl.int32), axis=1)
+        c3 = tl.sum((keys_16 >= (lo + 3)[:, None]).to(tl.int32), axis=1)
+        threshold_16 = tl.where(c3 >= topk, lo + 3,
+                       tl.where(c2 >= topk, lo + 2,
+                       tl.where(c1 >= topk, lo + 1, lo)))
+        count_geq = tl.where(c3 >= topk, c3,
+                    tl.where(c2 >= topk, c2,
+                    tl.where(c1 >= topk, c1, c0)))
+
+        ge_threshold = keys_16 >= threshold_16[:, None]
+
+        # Phase 2: tie-breaking.  Dead lanes hold key INT32_MIN, so
+        # ``count_geq`` never exceeds the live-lane count; with
+        # ``BLOCK_R <= topk`` the tie-break is provably unreachable and is
+        # folded away at compile time.  At wider tiles it is computed
+        # unconditionally: triton-ascend 3.6.0 miscompiles this inner binary
+        # search when it sits behind a runtime scalar guard -- the
+        # never-executed branch body corrupts ``selected`` at the join
+        # (observed at BLOCK_R=128), so no runtime ``if`` may wrap it.
+        if BLOCK_R > topk:
+            in_bucket = keys_16 == threshold_16[:, None]
+            bucket_count = tl.sum(in_bucket.to(tl.int32), axis=1)
+            remaining = topk - (count_geq - bucket_count)
+            bucket_keys = tl.where(in_bucket, keys_i32, -2147483648)
+            lo32 = threshold_16 << 16
+            hi32 = (threshold_16 << 16) | 0xFFFF
+            for _ in tl.static_range(16):
+                mid = lo32 + ((hi32 - lo32 + 1) >> 1)
+                cnt = tl.sum((bucket_keys >= mid[:, None]).to(tl.int32), axis=1)
+                ge_rem = cnt >= remaining
+                lo32 = tl.where(ge_rem, mid, lo32)
+                hi32 = tl.where(ge_rem, hi32, mid - 1)
+            threshold_key = lo32
+            # ``live`` is load-bearing here: dead lanes hold score 0.0 (key 0),
+            # which compares greater than any negative threshold and would
+            # otherwise be counted and scattered into the selection.
+            greater = live & (keys_i32 > threshold_key[:, None])
+            tied = live & (keys_i32 == threshold_key[:, None])
+            count_greater = tl.sum(greater.to(tl.int32), axis=1)
+            needed = topk - count_greater
+            tied_rank = tl.cumsum(tied.to(tl.int32), axis=1) - 1
+            selected_tie = greater | (tied & (tied_rank < needed[:, None]))
+            need_tiebreak = count_geq > topk
+            selected = tl.where(need_tiebreak[:, None], selected_tie, ge_threshold)
+        else:
+            selected = ge_threshold
+
+        # Packing (2-D, deferred until after selection to reduce register
+        # pressure during the binary search).
+        all_pages = tl.load(
+            block_table_ptr
+            + request[:, None] * stride_table_row
+            + regions[None, :] // regions_per_page,
+            mask=live,
+            other=-1,
+        )
+        physical = all_pages * regions_per_page + regions[None, :] % regions_per_page
+        valid_tokens = tl.minimum(
+            tl.maximum(q_position[:, None] + 1 - regions[None, :] * region_size, 0),
+            region_size,
+        )
+        packed = physical | (valid_tokens << PREFILL_REGION_VALID_SHIFT)
+        packed = tl.where(all_pages >= 0, packed, -1)
+
+        # Scatter store (2-D)
+        positions = tl.cumsum(selected.to(tl.int32), axis=1) - 1
+        tl.store(
+            out_ptr + sub_rows[:, None] * stride_out_row + positions,
+            packed,
+            mask=selected & (positions < topk),
+         )
+
+
+@triton.jit
+def _find_threshold_kernel(
+    logits_ptr,
+    lengths_ptr,
+    threshold_key_ptr,
+    needed_ptr,
+    total_rows,
+    seq_regions,
+    stride_logits_row,
+    topk: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+) -> None:
+    """Find the exact top-k threshold key for one row, tiling over regions.
+
+    Companion to :func:`_select_pack_kernel`.  Used when ``seq_regions`` is too
+    large for the fused :func:`_region_topk_pack_kernel` (whose single-tile
+    design would exceed the NPU compiler's fusion limits above ``BLOCK_R=4096``).
+
+    Outputs two scalars per row:
+    * ``threshold_key`` – the ordered int32 key of the ``topk``-th entry.
+      Entries whose key is strictly greater are always selected.
+    * ``needed`` – how many entries with key == ``threshold_key`` to take
+      (by ascending region id).  Zero when there is no tie at the cut.
     """
     row = tl.program_id(0)
+    if row >= total_rows:
+        return
+
     visible = tl.load(lengths_ptr + row).to(tl.int32)
     visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
-    q_position = tl.load(q_positions_ptr + row).to(tl.int32)
-    request = tl.load(request_ptr + row).to(tl.int32)
+
+    regions = tl.arange(0, BLOCK_R)
+
+    # --- Phase 1: binary search on upper 16 bits of the ordered key ----------
+    lo = -32768
+    hi = 32767
+    for _ in tl.static_range(16):
+        mid = (lo + hi + 1) >> 1
+        count_geq = 0
+        for base in tl.range(0, seq_regions, BLOCK_R):
+            regs = base + regions
+            live = regs < visible
+            scores = tl.load(
+                logits_ptr + row * stride_logits_row + regs, mask=live, other=0.0
+            )
+            bits = scores.to(tl.int32, bitcast=True)
+            keys_i32 = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+            keys_16 = tl.where(live, keys_i32 >> 16, -2147483648)
+            count_geq += tl.sum((keys_16 >= mid).to(tl.int32))
+        if count_geq >= topk:
+            lo = mid
+        else:
+            hi = mid - 1
+
+    threshold_16 = lo
+
+    # --- Count entries >= threshold_16 and == threshold_16 -------------------
+    count_geq = 0
+    count_eq = 0
+    for base in tl.range(0, seq_regions, BLOCK_R):
+        regs = base + regions
+        live = regs < visible
+        scores = tl.load(
+            logits_ptr + row * stride_logits_row + regs, mask=live, other=0.0
+        )
+        bits = scores.to(tl.int32, bitcast=True)
+        keys_i32 = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+        keys_16 = tl.where(live, keys_i32 >> 16, -2147483648)
+        count_geq += tl.sum((keys_16 >= threshold_16).to(tl.int32))
+        count_eq += tl.sum((keys_16 == threshold_16).to(tl.int32))
+
+    # --- Phase 2: tie-breaking on lower 16 bits (only when needed) -----------
+    if count_geq > topk:
+        remaining = topk - (count_geq - count_eq)
+
+        lo32 = threshold_16 << 16
+        hi32 = (threshold_16 << 16) | 0xFFFF
+        for _ in tl.static_range(16):
+            mid = lo32 + ((hi32 - lo32 + 1) >> 1)
+            cnt = 0
+            for base in tl.range(0, seq_regions, BLOCK_R):
+                regs = base + regions
+                live = regs < visible
+                scores = tl.load(
+                    logits_ptr + row * stride_logits_row + regs, mask=live, other=0.0
+                )
+                bits = scores.to(tl.int32, bitcast=True)
+                keys_i32 = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+                keys_16 = tl.where(live, keys_i32 >> 16, -2147483648)
+                in_bucket = keys_16 == threshold_16
+                bucket_keys = tl.where(in_bucket, keys_i32, -2147483648)
+                cnt += tl.sum((bucket_keys >= mid).to(tl.int32))
+            if cnt >= remaining:
+                lo32 = mid
+            else:
+                hi32 = mid - 1
+        threshold_key = lo32
+
+        count_greater = 0
+        for base in tl.range(0, seq_regions, BLOCK_R):
+            regs = base + regions
+            live = regs < visible
+            scores = tl.load(
+                logits_ptr + row * stride_logits_row + regs, mask=live, other=0.0
+            )
+            bits = scores.to(tl.int32, bitcast=True)
+            keys_i32 = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+            count_greater += tl.sum((live & (keys_i32 > threshold_key)).to(tl.int32))
+
+        needed_val = topk - count_greater
+    else:
+        if threshold_16 == -32768:
+            threshold_key = -2147483648
+        else:
+            threshold_key = (threshold_16 << 16) - 1
+        needed_val = 0
+
+    tl.store(threshold_key_ptr + row, threshold_key)
+    tl.store(needed_ptr + row, needed_val)
+
+
+@triton.jit
+def _find_threshold_kernel_histogram(
+    logits_ptr,
+    lengths_ptr,
+    threshold_key_ptr,
+    needed_ptr,
+    total_rows,
+    seq_regions,
+    stride_logits_row,
+    topk: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+) -> None:
+    """Find the exact top-k threshold key for one row using tl.histogram.
+
+    Optimized: loads all scores into registers ONCE and converts to ordered
+    int32 keys ONCE, then performs four 256-bucket radix passes via
+    :func:`tl.histogram` entirely on register data -- no re-reading from HBM
+    and no inner tiling loop.  All non-histogram overhead (key conversion,
+    byte extraction, matching, parking) is computed once on the register tile.
+
+    Outputs the same two scalars per row as :func:`_find_threshold_kernel_bin_search`:
+    * ``threshold_key`` -- the ordered int32 key of the ``topk``-th entry.
+    * ``needed`` -- how many entries with key == ``threshold_key`` to take.
+    """
+    row = tl.program_id(0)
+    if row >= total_rows:
+        return
+
+    visible = tl.load(lengths_ptr + row).to(tl.int32)
+    visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+
+    regions = tl.arange(0, BLOCK_R)
+    live = regions < visible
+
+    # --- Load all scores ONCE and convert to ordered int32 keys ONCE ---
+    scores = tl.load(
+        logits_ptr + row * stride_logits_row + regions,
+        mask=live,
+        other=0.0,
+    )
+    bits = scores.to(tl.int32, bitcast=True)
+    keys = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+
+    # --- 4-pass radix histogram, MSB first, 256 buckets per pass ---
+    bucket_ids = tl.arange(0, 256)
+
+    threshold = visible * 0
+    remaining = visible * 0 + topk
+
+    for radix_pass in tl.static_range(4):
+        shift = 24 - 8 * radix_pass
+        byte_vals = ((keys >> shift) & 0xFF).to(tl.int32)
+
+        if radix_pass == 0:
+            matches = live
+        else:
+            high = shift + 8
+            matches = live & ((keys >> high) == (threshold >> high))
+
+        buckets = tl.where(matches, byte_vals, 0)
+        counts = tl.histogram(buckets, 256)
+        parked = tl.sum((~matches).to(tl.int32))
+        histogram = counts - tl.where(bucket_ids == 0, parked, 0)
+
+        total_count = tl.sum(histogram)
+        above = total_count - tl.cumsum(histogram, axis=0)
+        chosen = tl.min(tl.where(above < remaining, bucket_ids, 256))
+        remaining -= tl.sum(tl.where(bucket_ids > chosen, histogram, 0))
+        threshold |= chosen << shift
+
+    # --- Match bin_search output convention for the count_geq <= topk case ---
+    keys_16 = tl.where(live, keys >> 16, -2147483648)
+    threshold_16 = tl.maximum(-32768, tl.minimum(32767, threshold >> 16))
+    count_geq_16 = tl.sum((keys_16 >= threshold_16).to(tl.int32))
+
+    if count_geq_16 > topk:
+        threshold_key = threshold
+        count_greater = tl.sum((live & (keys > threshold_key)).to(tl.int32))
+        needed_val = topk - count_greater
+    else:
+        if threshold_16 == -32768:
+            threshold_key = -2147483648
+        else:
+            threshold_key = (threshold_16 << 16) - 1
+        needed_val = 0
+
+    tl.store(threshold_key_ptr + row, threshold_key)
+    tl.store(needed_ptr + row, needed_val)
+
+@triton.jit
+def _find_threshold_kernel_bin_search(
+    logits_ptr,
+    lengths_ptr,
+    threshold_key_ptr,
+    needed_ptr,
+    total_rows,
+    seq_regions,
+    stride_logits_row,
+    topk: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+) -> None:
+    """Find the exact top-k threshold key for one row via load-once binary search.
+
+    Loads the entire row into registers once, converts to ordered int32 keys
+    once, then performs all binary-search iterations as pure register
+    comparisons -- no re-reading from HBM.  This replaces the four 256-bucket
+    radix-histogram passes (which compiled to a 256-wide comparison matrix
+    per pass on the NPU vector engine) with ~30 single-comparison iterations,
+    cutting vector-compute work by ~30x.
+
+    Outputs the same two scalars per row as :func:`_find_threshold_kernel`:
+    * ``threshold_key`` -- the ordered int32 key of the ``topk``-th entry.
+    * ``needed`` -- how many entries with key == ``threshold_key`` to take.
+    """
+    row = tl.program_id(0)
+    if row >= total_rows:
+        return
+
+    visible = tl.load(lengths_ptr + row).to(tl.int32)
+    visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+
+    regions = tl.arange(0, BLOCK_R)
+    live = regions < visible
+
+    # --- Load all scores ONCE and convert to ordered keys ONCE -------------
+    scores = tl.load(
+        logits_ptr + row * stride_logits_row + regions,
+        mask=live,
+        other=0.0,
+    )
+    bits = scores.to(tl.int32, bitcast=True)
+    keys_i32 = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+    # Dead lanes get INT32_MIN so they sort below every live key.
+    keys_16 = tl.where(live, keys_i32 >> 16, -2147483648)
+
+    # --- Phase 1: binary search on upper 16 bits (16 iterations) -----------
+    lo = -32768
+    hi = 32767
+    for _ in tl.static_range(16):
+        mid = (lo + hi + 1) >> 1
+        count_geq = tl.sum((keys_16 >= mid).to(tl.int32))
+        if count_geq >= topk:
+            lo = mid
+        else:
+            hi = mid - 1
+
+    threshold_16 = lo
+
+    # --- Count entries >= threshold_16 and == threshold_16 -----------------
+    ge_threshold_16 = keys_16 >= threshold_16
+    count_geq = tl.sum(ge_threshold_16.to(tl.int32))
+    count_eq = tl.sum((keys_16 == threshold_16).to(tl.int32))
+
+    # --- Phase 2: tie-breaking on lower 16 bits (only when needed) ---------
+    if count_geq > topk:
+        remaining = topk - (count_geq - count_eq)
+
+        in_bucket = keys_16 == threshold_16
+        bucket_keys = tl.where(in_bucket, keys_i32, -2147483648)
+
+        lo32 = threshold_16 << 16
+        hi32 = (threshold_16 << 16) | 0xFFFF
+        for _ in tl.static_range(16):
+            mid = lo32 + ((hi32 - lo32 + 1) >> 1)
+            cnt = tl.sum((bucket_keys >= mid).to(tl.int32))
+            if cnt >= remaining:
+                lo32 = mid
+            else:
+                hi32 = mid - 1
+        threshold_key = lo32
+
+        count_greater = tl.sum((live & (keys_i32 > threshold_key)).to(tl.int32))
+        needed_val = topk - count_greater
+    else:
+        if threshold_16 == -32768:
+            threshold_key = -2147483648
+        else:
+            threshold_key = (threshold_16 << 16) - 1
+        needed_val = 0
+
+    tl.store(threshold_key_ptr + row, threshold_key)
+    tl.store(needed_ptr + row, needed_val)
+
+@triton.jit
+def _region_topk_ids_v2_kernel(
+    logits_ptr,
+    lengths_ptr,
+    out_ptr,
+    total_rows,
+    seq_regions,
+    stride_logits_row,
+    stride_out_row,
+    topk: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+) -> None:
+    """Fused threshold-search + selection for top-k region ids using tl.histogram.
+
+    One row per program.  Loads scores once, converts to ordered int32 keys
+    once, then performs four 256-bucket radix passes via :func:`tl.histogram`
+    entirely on register data to find the exact top-k threshold.  Selection
+    and scatter follow in the same pass with no intermediate global-memory
+    buffers.
+    """
+    row = tl.program_id(0)
+    if row >= total_rows:
+        return
 
     slots = tl.arange(0, BLOCK_TOPK)
     tl.store(out_ptr + row * stride_out_row + slots, -1, mask=slots < topk)
-    if visible <= 0:
-        return
 
-    budget = tl.minimum(topk, visible)
-    threshold, remaining = _radix_topk_threshold(
-        logits_ptr, row, stride_logits_row, visible, budget, seq_regions, BLOCK_R=BLOCK_R
+    visible = tl.load(lengths_ptr + row).to(tl.int32)
+    visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+
+    regions = tl.arange(0, BLOCK_R)
+    live = regions < visible
+
+    # --- Load all scores ONCE and convert to ordered int32 keys ONCE ---
+    scores = tl.load(
+        logits_ptr + row * stride_logits_row + regions,
+        mask=live,
+        other=0.0,
+    )
+    bits = scores.to(tl.int32, bitcast=True)
+    keys = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+
+    # --- 4-pass radix histogram, MSB first, 256 buckets per pass ---
+    # Non-matching entries are parked in bucket 0 and subtracted, because
+    # tl.histogram on NPU wraps negative sentinels (-1 → bucket 255).
+    bucket_ids = tl.arange(0, 256)
+
+    threshold = visible * 0
+    remaining = visible * 0 + topk
+    matches = live
+
+    for radix_pass in tl.static_range(4):
+        shift = 24 - 8 * radix_pass
+        byte_vals = (keys >> shift) & 0xFF
+
+        buckets = tl.where(matches, byte_vals, 0)
+        counts = tl.histogram(buckets, 256)
+        parked = tl.sum((~matches).to(tl.int32))
+        histogram = counts - tl.where(bucket_ids == 0, parked, 0)
+
+        total_count = tl.sum(histogram)
+        above = total_count - tl.cumsum(histogram, axis=0)
+        chosen = tl.min(tl.where(above < remaining, bucket_ids, 256))
+        remaining -= tl.sum(tl.where(bucket_ids > chosen, histogram, 0))
+        threshold |= chosen << shift
+
+        matches = matches & ((keys >> shift) == (threshold >> shift))
+
+    # --- Selection using the exact 32-bit threshold ---
+    greater = live & (keys > threshold)
+    tied = live & (keys == threshold)
+
+    tied_cumsum = tl.cumsum(tied.to(tl.int32), axis=0)
+    selected = greater | (tied & (tied_cumsum <= remaining))
+
+    positions = tl.cumsum(selected.to(tl.int32), axis=0) - 1
+    tl.store(
+        out_ptr + row * stride_out_row + positions,
+        regions,
+        mask=selected & (positions < topk),
     )
 
-    # Emit in ascending region order. The CuTe selector emits in radix-bucket order, but
-    # that order is not part of the contract -- consumers compare sets -- and ascending
-    # is both cheaper here and what the standalone metadata converter produces.
-    cursor = 0
-    ties_taken = 0
-    for base in tl.range(0, seq_regions, BLOCK_R):
-        regions = base + tl.arange(0, BLOCK_R)
-        live = regions < visible
-        scores = tl.load(
-            logits_ptr + row * stride_logits_row + regions, mask=live, other=0.0
-        )
-        keys = _ordered_float_key(scores)
-        greater = live & (keys > threshold)
-        tied = live & (keys == threshold)
-        tied_rank = ties_taken + tl.cumsum(tied.to(tl.int32), axis=0) - 1
-        selected = greater | (tied & (tied_rank < remaining))
+@triton.jit
+def _select_pack_kernel(
+    logits_ptr,
+    lengths_ptr,
+    q_positions_ptr,
+    block_table_ptr,
+    request_ptr,
+    threshold_key_ptr,
+    needed_ptr,
+    out_ptr,
+    total_rows,
+    seq_regions,
+    stride_logits_row,
+    stride_table_row,
+    stride_out_row,
+    topk: tl.constexpr,
+    region_size: tl.constexpr,
+    regions_per_page: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SUB_ROWS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+) -> None:
+    """Select and pack regions using a pre-computed threshold, tiling over regions.
 
-        positions = cursor + tl.cumsum(selected.to(tl.int32), axis=0) - 1
-        safe_regions = tl.where(selected, regions, 0)
-        pages = tl.load(
-            block_table_ptr
-            + request * stride_table_row
-            + safe_regions // regions_per_page,
-            mask=selected,
-            other=0,
-        )
-        physical = pages * regions_per_page + safe_regions % regions_per_page
-        valid_tokens = tl.minimum(
-            tl.maximum(q_position + 1 - safe_regions * region_size, 0), region_size
-        )
-        packed = physical | (valid_tokens << PREFILL_REGION_VALID_SHIFT)
-        # An unmapped page is a legal block-table state, not an error. It has to become a
-        # ``-1`` slot rather than an address computed from a negative page, which would
-        # read from before the cache.
-        packed = tl.where(pages >= 0, packed, -1)
-        tl.store(
-            out_ptr + row * stride_out_row + positions,
-            packed,
-            mask=selected & (positions < topk),
-        )
-        cursor += tl.sum(selected.to(tl.int32))
-        ties_taken += tl.sum(tied.to(tl.int32))
+    Reads the per-row ``threshold_key`` and ``needed`` from the buffers produced
+    by :func:`_find_threshold_kernel`, then scatters the selected entries into
+    the packed output in ascending region-id order.
+
+    A running ``output_offset`` (per row) tracks the scatter position across
+    region tiles, and a running ``tied_seen`` tracks the tied-entry rank so the
+    correct prefix of the tied group is taken.
+    """
+    pid = tl.program_id(0)
+
+    # --- Initialise output rows to -1 ---------------------------------------
+    all_rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    all_row_ok = all_rows < total_rows
+    all_slots = tl.arange(0, BLOCK_TOPK)
+    tl.store(
+        out_ptr + all_rows[:, None] * stride_out_row + all_slots[None, :],
+        -1,
+        mask=all_row_ok[:, None] & (all_slots[None, :] < topk),
+    )
+
+    NUM_SUBS: tl.constexpr = BLOCK_ROWS // SUB_ROWS
+
+    for sub_id in tl.range(0, NUM_SUBS, num_stages=2):
+        sub_rows = pid * BLOCK_ROWS + sub_id * SUB_ROWS + tl.arange(0, SUB_ROWS)
+        sub_ok = sub_rows < total_rows
+
+        visible = tl.load(lengths_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+        visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+        q_position = tl.load(q_positions_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+        request = tl.load(request_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+        threshold_key = tl.load(threshold_key_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+        needed = tl.load(needed_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+
+        output_offset = tl.zeros((SUB_ROWS,), dtype=tl.int32)
+        tied_seen = tl.zeros((SUB_ROWS,), dtype=tl.int32)
+
+        for base_r in tl.range(0, seq_regions, BLOCK_R):
+            regions = base_r + tl.arange(0, BLOCK_R)
+            live = sub_ok[:, None] & (regions[None, :] < visible[:, None])
+
+            scores = tl.load(
+                logits_ptr + sub_rows[:, None] * stride_logits_row + regions[None, :],
+                mask=live,
+                other=0.0,
+            )
+            bits = scores.to(tl.int32, bitcast=True)
+            keys_i32 = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+
+            greater = (keys_i32 > threshold_key[:, None]) & live
+            tied = (keys_i32 == threshold_key[:, None]) & live
+
+            local_tied_rank = tl.cumsum(tied.to(tl.int32), axis=1) - 1
+            global_tied_rank = tied_seen[:, None] + local_tied_rank
+            take_tie = tied & (global_tied_rank < needed[:, None])
+            selected = greater | take_tie
+
+            # Packing
+            all_pages = tl.load(
+                block_table_ptr
+                + request[:, None] * stride_table_row
+                + regions[None, :] // regions_per_page,
+                mask=live,
+                other=-1,
+            )
+            physical = all_pages * regions_per_page + regions[None, :] % regions_per_page
+            valid_tokens = tl.minimum(
+                tl.maximum(q_position[:, None] + 1 - regions[None, :] * region_size, 0),
+                region_size,
+            )
+            packed = physical | (valid_tokens << PREFILL_REGION_VALID_SHIFT)
+            packed = tl.where(all_pages >= 0, packed, -1)
+
+            # Scatter store (2-D, with cross-tile running offset)
+            local_positions = tl.cumsum(selected.to(tl.int32), axis=1) - 1
+            global_positions = output_offset[:, None] + local_positions
+            tl.store(
+                out_ptr + sub_rows[:, None] * stride_out_row + global_positions,
+                packed,
+                mask=selected & (global_positions < topk),
+            )
+
+            tied_seen += tl.sum(tied.to(tl.int32), axis=1)
+            output_offset += tl.sum(selected.to(tl.int32), axis=1)
+
+
+@triton.jit
+def _select_ids_kernel(
+    logits_ptr,
+    lengths_ptr,
+    threshold_key_ptr,
+    needed_ptr,
+    out_ptr,
+    total_rows,
+    seq_regions,
+    stride_logits_row,
+    stride_out_row,
+    topk: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SUB_ROWS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+) -> None:
+    """Select logical region ids using a pre-computed threshold, tiling over regions.
+
+    Companion to :func:`_find_threshold_kernel_histogram`.  Reads the per-row
+    ``threshold_key`` and ``needed`` and scatters the selected region ids into
+    the output in ascending region-id order, exactly like the fused
+    :func:`_region_topk_ids_kernel` but without the binary search.
+    """
+    pid = tl.program_id(0)
+
+    all_rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    all_row_ok = all_rows < total_rows
+    all_slots = tl.arange(0, BLOCK_TOPK)
+    tl.store(
+        out_ptr + all_rows[:, None] * stride_out_row + all_slots[None, :],
+        -1,
+        mask=all_row_ok[:, None] & (all_slots[None, :] < topk),
+    )
+
+    NUM_SUBS: tl.constexpr = BLOCK_ROWS // SUB_ROWS
+
+    for sub_id in tl.range(0, NUM_SUBS, num_stages=2):
+        sub_rows = pid * BLOCK_ROWS + sub_id * SUB_ROWS + tl.arange(0, SUB_ROWS)
+        sub_ok = sub_rows < total_rows
+
+        visible = tl.load(lengths_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+        visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+        threshold_key = tl.load(threshold_key_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+        needed = tl.load(needed_ptr + sub_rows, mask=sub_ok, other=0).to(tl.int32)
+
+        output_offset = tl.zeros((SUB_ROWS,), dtype=tl.int32)
+        tied_seen = tl.zeros((SUB_ROWS,), dtype=tl.int32)
+
+        for base_r in tl.range(0, seq_regions, BLOCK_R):
+            regions = base_r + tl.arange(0, BLOCK_R)
+            live = sub_ok[:, None] & (regions[None, :] < visible[:, None])
+
+            scores = tl.load(
+                logits_ptr + sub_rows[:, None] * stride_logits_row + regions[None, :],
+                mask=live,
+                other=0.0,
+            )
+            bits = scores.to(tl.int32, bitcast=True)
+            keys_i32 = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+
+            greater = (keys_i32 > threshold_key[:, None]) & live
+            tied = (keys_i32 == threshold_key[:, None]) & live
+
+            local_tied_rank = tl.cumsum(tied.to(tl.int32), axis=1) - 1
+            global_tied_rank = tied_seen[:, None] + local_tied_rank
+            take_tie = tied & (global_tied_rank < needed[:, None])
+            selected = greater | take_tie
+
+            local_positions = tl.cumsum(selected.to(tl.int32), axis=1) - 1
+            global_positions = output_offset[:, None] + local_positions
+            tl.store(
+                out_ptr + sub_rows[:, None] * stride_out_row + global_positions,
+                regions,
+                mask=selected & (global_positions < topk),
+            )
+
+            tied_seen += tl.sum(tied.to(tl.int32), axis=1)
+            output_offset += tl.sum(selected.to(tl.int32), axis=1)
 
 
 @triton.jit
@@ -1097,10 +1755,12 @@ def _region_topk_ids_kernel(
     logits_ptr,
     lengths_ptr,
     out_ptr,
+    total_rows,
     seq_regions,
     stride_logits_row,
     stride_out_row,
     topk: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ) -> None:
@@ -1110,43 +1770,82 @@ def _region_topk_ids_kernel(
     Prefill and decode pack the identical selection into two different words, and the
     decode word needs the logical region id, which the prefill word does not carry -- so
     decode metadata cannot be derived from prefill metadata, only from the raw ids.
+
+    NPU optimisation: one program processes ``BLOCK_ROWS`` rows via a per-row loop.
+    Uses the same two-phase 16-bit binary search as :func:`_region_topk_pack_kernel`.
     """
-    row = tl.program_id(0)
-    visible = tl.load(lengths_ptr + row).to(tl.int32)
-    visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+    pid = tl.program_id(0)
 
-    slots = tl.arange(0, BLOCK_TOPK)
-    tl.store(out_ptr + row * stride_out_row + slots, -1, mask=slots < topk)
-    if visible <= 0:
-        return
-
-    budget = tl.minimum(topk, visible)
-    threshold, remaining = _radix_topk_threshold(
-        logits_ptr, row, stride_logits_row, visible, budget, seq_regions, BLOCK_R=BLOCK_R
+    all_rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    all_row_ok = all_rows < total_rows
+    all_slots = tl.arange(0, BLOCK_TOPK)
+    tl.store(
+        out_ptr + all_rows[:, None] * stride_out_row + all_slots[None, :],
+        -1,
+        mask=all_row_ok[:, None] & (all_slots[None, :] < topk),
     )
 
-    cursor = 0
-    ties_taken = 0
-    for base in tl.range(0, seq_regions, BLOCK_R):
-        regions = base + tl.arange(0, BLOCK_R)
-        live = regions < visible
+    regions = tl.arange(0, BLOCK_R)
+
+    for i in tl.range(0, BLOCK_ROWS):
+        row = pid * BLOCK_ROWS + i
+        row_ok = row < total_rows
+
+        visible = tl.load(lengths_ptr + row, mask=row_ok, other=0).to(tl.int32)
+        visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+
+        live = row_ok & (regions < visible)
         scores = tl.load(
             logits_ptr + row * stride_logits_row + regions, mask=live, other=0.0
         )
-        keys = _ordered_float_key(scores)
-        greater = live & (keys > threshold)
-        tied = live & (keys == threshold)
-        tied_rank = ties_taken + tl.cumsum(tied.to(tl.int32), axis=0) - 1
+
+        bits = scores.to(tl.int32, bitcast=True)
+        keys_i32 = tl.where(scores < 0.0, bits ^ 0x7FFFFFFF, bits & 0x7FFFFFFF)
+        keys_16 = (keys_i32 >> 16).to(tl.int32)
+        lo = tl.full([], -32768, dtype=tl.int32)
+        hi = tl.full([], 32767, dtype=tl.int32)
+        for _ in tl.static_range(16):
+            mid = (lo + hi + 1) >> 1
+            count_geq = tl.sum((live & (keys_16 >= mid)).to(tl.int32))
+            if count_geq >= topk:
+                lo = mid
+            else:
+                hi = mid - 1
+        threshold_16 = lo
+        greater = live & (keys_16 > threshold_16)
+        count_greater = tl.sum(greater.to(tl.int32))
+        remaining = topk - count_greater
+        in_bucket = live & (keys_16 == threshold_16)
+        bucket_count = tl.sum(in_bucket.to(tl.int32))
+        if remaining >= bucket_count:
+            greater = greater | in_bucket
+            tied = tl.zeros_like(greater)
+        else:
+            lo32 = threshold_16 << 16
+            hi32 = (threshold_16 << 16) | 0xFFFF
+            for _ in tl.static_range(16):
+                mid = lo32 + ((hi32 - lo32 + 1) >> 1)
+                count_geq = tl.sum(
+                    (in_bucket & (keys_i32 >= mid)).to(tl.int32)
+                )
+                if count_geq >= remaining:
+                    lo32 = mid
+                else:
+                    hi32 = mid - 1
+            threshold_key = lo32
+            greater = live & (keys_i32 > threshold_key)
+            tied = live & (keys_i32 == threshold_key)
+
+        remaining = topk - tl.sum(greater.to(tl.int32))
+        tied_rank = tl.cumsum(tied.to(tl.int32), axis=0) - 1
         selected = greater | (tied & (tied_rank < remaining))
 
-        positions = cursor + tl.cumsum(selected.to(tl.int32), axis=0) - 1
+        positions = tl.cumsum(selected.to(tl.int32), axis=0) - 1
         tl.store(
             out_ptr + row * stride_out_row + positions,
             regions,
             mask=selected & (positions < topk),
         )
-        cursor += tl.sum(selected.to(tl.int32))
-        ties_taken += tl.sum(tied.to(tl.int32))
 
 
 def region_topk_ids(
@@ -1172,18 +1871,118 @@ def region_topk_ids(
         raise ValueError(f"selector expects float32 scores, got {logits.dtype}")
 
     rows, seq_regions = logits.shape
-    out = torch.empty((rows, int(topk)), device=logits.device, dtype=torch.int32)
-    _region_topk_ids_kernel[(rows,)](
-        logits,
-        lengths,
-        out,
-        seq_regions,
-        logits.stride(0),
-        out.stride(0),
-        topk=int(topk),
-        BLOCK_R=min(block_r, 256),
-        BLOCK_TOPK=triton.next_power_of_2(int(topk)),
-    )
+    topk = int(topk)
+
+    out = torch.empty((rows, topk), device=logits.device, dtype=torch.int32)
+    BLOCK_TOPK = triton.next_power_of_2(max(topk, 1))
+    pow2_regions = triton.next_power_of_2(seq_regions)
+
+    if pow2_regions > 8192:
+        # --- Tiled two-kernel path (for very large seq_regions > 8192) --------
+        # The load-once kernels cap BLOCK_R at 8192, so regions >= 8192
+        # would be silently truncated.  Use the tiled binary-search threshold
+        # kernel + tiled selection kernel instead, both looping over region
+        # sub-tiles and supporting arbitrary width.
+        threshold_key = torch.empty((rows,), device=logits.device, dtype=torch.int32)
+        needed = torch.empty((rows,), device=logits.device, dtype=torch.int32)
+        _find_threshold_kernel[(rows,)](
+            logits,
+            lengths,
+            threshold_key,
+            needed,
+            rows,
+            seq_regions,
+            logits.stride(0),
+            topk=topk,
+            BLOCK_R=4096,
+        )
+
+        _MAX_INIT_TILE = 32768
+        max_block_rows = max(1, _MAX_INIT_TILE // BLOCK_TOPK)
+        base_rows = max(1, triton.next_power_of_2(triton.cdiv(rows, 64)))
+        BLOCK_ROWS = min(128, base_rows, max_block_rows)
+        BLOCK_R = 4096
+        SUB_ROWS = min(BLOCK_ROWS, max(1, 4096 // BLOCK_R))
+
+        grid = (triton.cdiv(rows, BLOCK_ROWS),)
+        _select_ids_kernel[grid](
+            logits,
+            lengths,
+            threshold_key,
+            needed,
+            out,
+            rows,
+            seq_regions,
+            logits.stride(0),
+            out.stride(0),
+            topk=topk,
+            BLOCK_ROWS=BLOCK_ROWS,
+            SUB_ROWS=SUB_ROWS,
+            BLOCK_R=BLOCK_R,
+            BLOCK_TOPK=BLOCK_TOPK,
+        )
+    elif pow2_regions > 4096:
+        # --- Load-once binary-search path (4096 < seq_regions <= 8192) --------
+        # The load-once bin_search kernel uses signed comparison on keys_16,
+        # correctly handling mixed-sign scores (unlike the histogram kernel
+        # whose unsigned byte ordering breaks for negative scores).
+        # BLOCK_R covers the full row, so no truncation.
+        threshold_key = torch.empty((rows,), device=logits.device, dtype=torch.int32)
+        needed = torch.empty((rows,), device=logits.device, dtype=torch.int32)
+        _find_threshold_kernel_bin_search[(rows,)](
+            logits,
+            lengths,
+            threshold_key,
+            needed,
+            rows,
+            seq_regions,
+            logits.stride(0),
+            topk=topk,
+            BLOCK_R=min(pow2_regions, 8192),
+        )
+
+        _MAX_INIT_TILE = 32768
+        max_block_rows = max(1, _MAX_INIT_TILE // BLOCK_TOPK)
+        base_rows = max(1, triton.next_power_of_2(triton.cdiv(rows, 64)))
+        BLOCK_ROWS = min(128, base_rows, max_block_rows)
+        BLOCK_R = 4096
+        SUB_ROWS = min(BLOCK_ROWS, max(1, 4096 // BLOCK_R))
+
+        grid = (triton.cdiv(rows, BLOCK_ROWS),)
+        _select_ids_kernel[grid](
+            logits,
+            lengths,
+            threshold_key,
+            needed,
+            out,
+            rows,
+            seq_regions,
+            logits.stride(0),
+            out.stride(0),
+            topk=topk,
+            BLOCK_ROWS=BLOCK_ROWS,
+            SUB_ROWS=SUB_ROWS,
+            BLOCK_R=BLOCK_R,
+            BLOCK_TOPK=BLOCK_TOPK,
+        )
+    else:
+        BLOCK_R = pow2_regions
+        BLOCK_ROWS = 1
+
+        grid = (triton.cdiv(rows, BLOCK_ROWS),)
+        _region_topk_ids_kernel[grid](
+            logits,
+            lengths,
+            out,
+            rows,
+            seq_regions,
+            logits.stride(0),
+            out.stride(0),
+            topk=topk,
+            BLOCK_ROWS=BLOCK_ROWS,
+            BLOCK_R=BLOCK_R,
+            BLOCK_TOPK=BLOCK_TOPK,
+        )
     return out
 
 
@@ -1225,26 +2024,129 @@ def region_topk_pack(
         )
 
     rows, seq_regions = logits.shape
+    topk = int(topk)
     if request_indices is None:
         request_indices = torch.zeros((rows,), device=logits.device, dtype=torch.int32)
-    out = torch.empty((rows, int(topk)), device=logits.device, dtype=torch.int32)
-    _region_topk_pack_kernel[(rows,)](
-        logits,
-        lengths,
-        q_positions,
-        block_table,
-        request_indices,
-        out,
-        seq_regions,
-        logits.stride(0),
-        shared_table_stride(block_table),
-        out.stride(0),
-        topk=int(topk),
-        region_size=int(region_size),
-        regions_per_page=int(regions_per_page),
-        BLOCK_R=min(block_r, 256),
-        BLOCK_TOPK=triton.next_power_of_2(int(topk)),
-    )
+
+    out = torch.empty((rows, topk), device=logits.device, dtype=torch.int32)
+
+    BLOCK_TOPK = triton.next_power_of_2(max(topk, 1))
+
+    # The NPU BiSheng compiler has a fusion-complexity ceiling.  Two factors
+    # push the fused single-kernel past it: (1) BLOCK_R above 4 096 (the
+    # 2-D score tile becomes too wide), and (2) the initialisation store
+    # [BLOCK_ROWS, BLOCK_TOPK] exceeding ~32 K elements.  Cap both.
+    _MAX_FUSED_BLOCK_R = 4096
+    _MAX_INIT_TILE = 32768
+    max_block_rows = max(1, _MAX_INIT_TILE // BLOCK_TOPK)
+
+    pow2_regions = triton.next_power_of_2(seq_regions)
+
+    if pow2_regions <= _MAX_FUSED_BLOCK_R:
+        # --- Single-kernel fused path (original, for moderate seq_regions) ---
+        BLOCK_R = pow2_regions
+        base_rows = max(1, triton.next_power_of_2(triton.cdiv(rows, 64)))
+        BLOCK_ROWS = min(128, base_rows, max_block_rows)
+
+        # Single-row sub-tiles on purpose: wider ones are slower in practice
+        # (measured ~6.5x at BLOCK_R=2048) and, with the unconditional
+        # tie-break phase, hang the triton-ascend 3.6.0 compiler outright
+        # (SUB_ROWS=2 / BLOCK_R=2048 never finishes compiling).
+        SUB_ROWS = 1
+
+        grid = (triton.cdiv(rows, BLOCK_ROWS),)
+        _region_topk_pack_kernel[grid](
+            logits,
+            lengths,
+            q_positions,
+            block_table,
+            request_indices,
+            out,
+            rows,
+            seq_regions,
+            logits.stride(0),
+            shared_table_stride(block_table),
+            out.stride(0),
+            topk=topk,
+            region_size=region_size,
+            regions_per_page=regions_per_page,
+            BLOCK_ROWS=BLOCK_ROWS,
+            SUB_ROWS=SUB_ROWS,
+            BLOCK_R=BLOCK_R,
+            BLOCK_TOPK=BLOCK_TOPK,
+        )
+    else:
+        # --- Two-kernel tiled path (for large seq_regions) ------------------
+        # The fused kernel cannot tile over the region axis because the binary
+        # search, tie-break, and packing are all expressed on a single 2-D
+        # score tile.  Splitting the threshold search (one row at a time,
+        # loops over region sub-tiles) from the packing (2-D over rows, loops
+        # over the same sub-tiles) keeps each kernel inside the compiler's
+        # fusion budget while supporting arbitrarily wide seq_regions.
+        BLOCK_R = _MAX_FUSED_BLOCK_R
+
+        threshold_key = torch.empty((rows,), device=logits.device, dtype=torch.int32)
+        needed = torch.empty((rows,), device=logits.device, dtype=torch.int32)
+        if pow2_regions > 8192:
+            # Tiled threshold search for very large seq_regions: the load-once
+            # histogram kernel caps BLOCK_R at 8192, so use the tiled binary
+            # search kernel that loops over region sub-tiles instead.
+            _find_threshold_kernel[(rows,)](
+                logits,
+                lengths,
+                threshold_key,
+                needed,
+                rows,
+                seq_regions,
+                logits.stride(0),
+                topk=topk,
+                BLOCK_R=4096,
+            )
+        else:
+            # Load-once binary search, same as the ids dispatch at this width:
+            # its signed comparisons order mixed-sign scores correctly, which
+            # the histogram kernel's unsigned byte ordering does not (indexer
+            # weights are a bare linear projection, so negative scores occur).
+            _find_threshold_kernel_bin_search[(rows,)](
+                logits,
+                lengths,
+                threshold_key,
+                needed,
+                rows,
+                seq_regions,
+                logits.stride(0),
+                topk=topk,
+                BLOCK_R=pow2_regions,
+            )
+
+        base_rows = max(1, triton.next_power_of_2(triton.cdiv(rows, 64)))
+        BLOCK_ROWS = min(128, base_rows, max_block_rows)
+        _MAX_2D = 4096
+        SUB_ROWS = min(BLOCK_ROWS, max(1, _MAX_2D // BLOCK_R))
+
+        grid = (triton.cdiv(rows, BLOCK_ROWS),)
+        _select_pack_kernel[grid](
+            logits,
+            lengths,
+            q_positions,
+            block_table,
+            request_indices,
+            threshold_key,
+            needed,
+            out,
+            rows,
+            seq_regions,
+            logits.stride(0),
+            shared_table_stride(block_table),
+            out.stride(0),
+            topk=topk,
+            region_size=region_size,
+            regions_per_page=regions_per_page,
+            BLOCK_ROWS=BLOCK_ROWS,
+            SUB_ROWS=SUB_ROWS,
+            BLOCK_R=BLOCK_R,
+            BLOCK_TOPK=BLOCK_TOPK,
+        )
     return out
 
 # Preserve the first definition so later merged modules cannot silently
@@ -1306,6 +2208,54 @@ DECODE_PHYS_SHIFT = tl.constexpr(32)
 DECODE_SORT_SENTINEL = tl.constexpr(1 << 62)
 
 
+def topk_select_new(
+    logits: torch.Tensor, lengths: torch.Tensor, *, topk: int
+) -> torch.Tensor:
+    """Select logical region ids per row: batched ``torch.topk`` with causal truncation.
+
+    Replaces the per-row Python loop with a single ``torch.topk`` on the full 2-D
+    score matrix.  Causal truncation (``lengths``) is fused by writing SENTINEL to
+    positions beyond each row's visible window, so ``torch.topk`` never selects them.
+
+    Output order is ascending region id (matching the Triton selector's contract),
+    with ``-1`` padding kept at the tail.  ``torch.topk`` returns score-descending
+    order, so a stable sort by id restores the ascending-id convention that
+    ``_append_current_region_kernel`` expects (it inserts the current region at
+    ``history_counts``, which is correct only when history ids are ascending).
+    """
+    rows, cols = logits.shape
+    device = logits.device
+    topk = int(topk)
+
+    # Causal mask: col_idx < lengths[row] means visible.
+    col_idx = torch.arange(cols, device=device).unsqueeze(0)
+    visible_mask = col_idx < lengths.unsqueeze(1)
+
+    # SENTINEL for non-causal / invalid positions.
+    SENTINEL = -1e30
+    SENTINEL_THRESHOLD = -1e29
+    scores = logits.masked_fill(~visible_mask, SENTINEL)
+
+    # Batch top-k: single torch.topk on the full 2-D matrix.
+    # sorted=False because we sort by id below anyway, so the internal score
+    # ordering from topk is wasted work.
+    k = min(topk, cols)
+    values, indices = torch.topk(scores, k=k, dim=1, sorted=False)
+    valid = values > SENTINEL_THRESHOLD
+
+    # Build sort key directly: valid ids as-is, invalid -> INT_MAX so they
+    # sort to the tail, then one sort + one where to restore -1 sentinels.
+    INT_MAX = torch.iinfo(torch.int32).max
+    sort_input = torch.where(valid, indices.to(torch.int32), INT_MAX)
+    if k < topk:
+        pad = torch.full((rows, topk - k), INT_MAX, dtype=torch.int32, device=device)
+        sort_input = torch.cat([sort_input, pad], dim=1)
+    logical = torch.sort(sort_input, dim=1).values
+    logical = torch.where(logical < INT_MAX, logical, -1)
+
+    return logical
+
+
 @triton.jit
 def _append_current_region_kernel(
     history_ptr,
@@ -1314,57 +2264,112 @@ def _append_current_region_kernel(
     request_ptr,
     out_ptr,
     counts_ptr,
+    total_rows,
     stride_history_row,
     stride_table_row,
     stride_out_row,
     topk: tl.constexpr,
     region_size: tl.constexpr,
     regions_per_page: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ) -> None:
     """Widen prefill history metadata to ``topk + 1`` slots and append the current region.
+
+    Accepts **logical region ids** (not pre-packed words) from the selector, and performs
+    all packing -- both history ids and the current region -- inside this kernel.  This
+    consolidates the prefill metadata word construction in one place and lets the selector
+    (`_region_topk_ids_kernel` / `_select_ids_kernel`) run without loading the block table
+    or q_positions, reducing its register pressure and HBM traffic.
 
     The history is copied verbatim -- including its ``-1`` slots, which stay *in place*
     rather than being compacted, because prefill's ``region_counts`` is positional
     (``min(current_region, topk) + 1``) and not a count of live entries. The appended slot
     lands at exactly the index the selector stopped filling.
 
-    The two stores are kept **disjoint** (``slots != history_count``) rather than letting
-    the second overwrite the first. Writing the whole row and then patching one slot is a
-    cross-thread race: the row store is a vector store spread over lanes, the patch is a
-    scalar store from one lane, and nothing orders them. It loses roughly one row in a
-    thousand, so it survives a small gate and fails a large one. The upstream kernel
-    carries a comment about this exact hazard, which suggests it was found the same way.
+    NPU optimisation: the current-region value is **merged** into the history tile via
+    ``tl.where`` before a single vector store, eliminating the per-element exclusion
+    mask (``slots != history_counts``) that was the vector-engine bottleneck and the
+    vector/scalar store race that necessitated it.  ``BLOCK_K`` covers only ``topk``
+    slots (not ``topk + 1``), doubling ``BLOCK_ROWS`` and halving the grid size.  The
+    ``topk``-th slot is written by a separate scalar store whose address never overlaps
+    the 2-D store, so no race is possible.
     """
-    row = tl.program_id(0)
-    q_position = tl.load(q_positions_ptr + row).to(tl.int32)
-    request = tl.load(request_ptr + row).to(tl.int32)
-    current_region = tl.maximum(q_position // region_size, 0)
-    history_count = tl.minimum(current_region, topk)
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_ROWS
 
-    slots = tl.arange(0, BLOCK_K)
-    history = tl.load(
-        history_ptr + row * stride_history_row + slots, mask=slots < topk, other=-1
-    )
-    tl.store(
-        out_ptr + row * stride_out_row + slots,
-        history,
-        mask=(slots < topk + 1) & (slots != history_count),
-    )
+    rows = row_start + tl.arange(0, BLOCK_ROWS)
+    row_ok = rows < total_rows
 
-    page = tl.load(
-        block_table_ptr + request * stride_table_row + current_region // regions_per_page
+    q_positions = tl.load(q_positions_ptr + rows, mask=row_ok, other=0).to(tl.int32)
+    requests = tl.load(request_ptr + rows, mask=row_ok, other=0).to(tl.int32)
+    current_regions = tl.maximum(q_positions // region_size, 0)
+    history_counts = tl.minimum(current_regions, topk)
+
+    # Compute the current-region packed value (scalar per row) before the merge
+    # so it can be fused into the history tile.
+    pages = tl.load(
+        block_table_ptr
+        + requests * stride_table_row
+        + current_regions // regions_per_page,
+        mask=row_ok,
+        other=-1,
     )
-    physical = page * regions_per_page + current_region % regions_per_page
+    physical = pages * regions_per_page + current_regions % regions_per_page
     valid_tokens = tl.minimum(
-        tl.maximum(q_position + 1 - current_region * region_size, 0), region_size
+        tl.maximum(q_positions + 1 - current_regions * region_size, 0), region_size
     )
     packed = physical | (valid_tokens << PREFILL_REGION_VALID_SHIFT)
-    tl.store(
-        out_ptr + row * stride_out_row + history_count,
-        tl.where(page >= 0, packed, -1),
+    current_val = tl.where(pages >= 0, packed, -1)
+
+    # Load history **logical region ids** for slots 0..topk-1 and pack them into
+    # prefill metadata words (phys_region | valid_tokens << 24).  Padding ids (-1)
+    # and unmapped pages both become -1 slots.
+    slots = tl.arange(0, BLOCK_K)
+    region_ids = tl.load(
+        history_ptr + rows[:, None] * stride_history_row + slots[None, :],
+        mask=row_ok[:, None] & (slots[None, :] < topk),
+        other=-1,
     )
-    tl.store(counts_ptr + row, history_count + 1)
+    valid_id = region_ids >= 0
+    safe_ids = tl.where(valid_id, region_ids, 0)
+    hist_pages = tl.load(
+        block_table_ptr
+        + requests[:, None] * stride_table_row
+        + safe_ids // regions_per_page,
+        mask=row_ok[:, None] & (slots[None, :] < topk),
+        other=-1,
+    )
+    hist_physical = hist_pages * regions_per_page + safe_ids % regions_per_page
+    hist_valid_tokens = tl.minimum(
+        tl.maximum(q_positions[:, None] + 1 - safe_ids * region_size, 0),
+        region_size,
+    )
+    history = hist_physical | (hist_valid_tokens << PREFILL_REGION_VALID_SHIFT)
+    history = tl.where((hist_pages >= 0) & valid_id, history, -1)
+
+    # Merge the current-region value at the history_counts slot, producing a
+    # single tile for one vector store.
+    merged = tl.where(
+        slots[None, :] == history_counts[:, None],
+        current_val[:, None],
+        history,
+    )
+    tl.store(
+        out_ptr + rows[:, None] * stride_out_row + slots[None, :],
+        merged,
+        mask=row_ok[:, None] & (slots[None, :] < topk),
+    )
+
+    # Handle the topk-th slot: current_val when history_counts == topk, else -1.
+    # This scalar store targets a disjoint address from the 2-D store above
+    # (which only covers slots 0..topk-1), so no race is possible.
+    tl.store(
+        out_ptr + rows * stride_out_row + topk,
+        tl.where(history_counts == topk, current_val, -1),
+        mask=row_ok,
+    )
+    tl.store(counts_ptr + rows, history_counts + 1, mask=row_ok)
 
 
 @triton.jit
@@ -1375,34 +2380,62 @@ def _decode_pack_kernel(
     request_ptr,
     out_ptr,
     counts_ptr,
+    total_rows,
     stride_ids_row,
     stride_table_row,
     stride_out_row,
     topk: tl.constexpr,
     region_size: tl.constexpr,
     regions_per_page: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_SORT: tl.constexpr,
 ) -> None:
     """Pack selected logical regions into the int64 decode word.
 
-    One row fits in one tile, so the compaction is a sort rather than a scatter: invalid
-    slots are mapped to a sentinel above every real word, and sorting by the packed value
-    both drops them to the tail and produces the physical-major order the upstream
-    converter emits. The current region is then written at the surviving count -- after the
-    sort, so it stays last, which is also where the reference puts it.
+    Invalid slots are mapped to a sentinel above every real word.  Compaction
+    places valid entries first (sorted ascending), then the current region,
+    then zero padding.
+
+    Two ranking strategies, selected at launch time by ``USE_SORT``:
+
+    * ``USE_SORT=False`` (small ``BLOCK_K``): comparison-matrix rank on a 2-D
+      tile.  Valid packed words are unique, so a single 3-D pass counting
+      strictly-smaller elements gives a unique rank.  Sentinel ties are broken
+      by a cheap 1-D cumsum -- no second O(K^2) pass.
+
+    * ``USE_SORT=True`` (large ``BLOCK_K``): ``tl.sort(.., dim=1)`` on the 2-D
+      tile, which avoids the 3-D tensor size limit of the NPU backend.
+
+    In both cases the current region is merged into the output tensor before a
+    single vector store, avoiding any vector/scalar store race.
+
+    NPU optimisation: one program processes ``BLOCK_ROWS`` rows simultaneously
+    via 2-D vectorisation.
     """
-    row = tl.program_id(0)
-    request = tl.load(request_ptr + row).to(tl.int32)
-    kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int32)
-    valid_regions = (kv_seqlen + region_size - 1) // region_size
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_ROWS
+
+    rows = row_start + tl.arange(0, BLOCK_ROWS)
+    row_ok = rows < total_rows
+
+    requests = tl.load(request_ptr + rows, mask=row_ok, other=0).to(tl.int32)
+    kv_seqlens = tl.load(seqlens_ptr + requests, mask=row_ok, other=0).to(tl.int32)
+    valid_regions = (kv_seqlens + region_size - 1) // region_size
 
     slots = tl.arange(0, BLOCK_K)
-    ids = tl.load(ids_ptr + row * stride_ids_row + slots, mask=slots < topk, other=-1)
+    ids = tl.load(
+        ids_ptr + rows[:, None] * stride_ids_row + slots[None, :],
+        mask=row_ok[:, None] & (slots[None, :] < topk),
+        other=-1,
+    )
 
-    live = (slots < topk) & (ids >= 0) & (ids < valid_regions)
+    live = row_ok[:, None] & (slots[None, :] < topk) & (ids >= 0) & (ids < valid_regions[:, None])
     safe_ids = tl.where(live, ids, 0)
     pages = tl.load(
-        block_table_ptr + request * stride_table_row + safe_ids // regions_per_page,
+        block_table_ptr
+        + requests[:, None] * stride_table_row
+        + safe_ids // regions_per_page,
         mask=live,
         other=-1,
     )
@@ -1412,26 +2445,22 @@ def _decode_pack_kernel(
     packed = (safe_ids * region_size).to(tl.int64) | (
         physical.to(tl.int64) << DECODE_PHYS_SHIFT
     )
-    # Compaction without tl.sort: sorting the int64 words needs ~6.4 Mbit of
-    # unified buffer at BLOCK_K = 512, which the A5 does not have. The selector
-    # already emits ids in ascending region order and the decode attention kernel
-    # consumes slots order-independently, so a cumsum scatter is equivalent.
-    count = tl.sum(live.to(tl.int32))
-    tl.store(
-        out_ptr + row * stride_out_row + slots,
-        0,
-        mask=slots < topk + 1,
-    )
-    positions = tl.cumsum(live.to(tl.int32), axis=0) - 1
-    tl.store(
-        out_ptr + row * stride_out_row + positions,
-        packed,
-        mask=live,
-    )
+    # Give each sentinel a unique high-32-bit value so the ranking produces
+    # unique ranks without needing a cumsum-based tie-break pass.
+    sentinel_hi = ((DECODE_SORT_SENTINEL >> DECODE_PHYS_SHIFT) + slots).to(tl.int32)
+    sentinel_packed = sentinel_hi.to(tl.int64) << DECODE_PHYS_SHIFT
+    packed = tl.where(live, packed, sentinel_packed[None, :])
 
-    current_region = tl.maximum((kv_seqlen - 1) // region_size, 0)
+    count = tl.sum(live.to(tl.int32), axis=1)
+
+    # Current-region info (computed before the store so it can be merged
+    # into the output tensor, avoiding a separate scalar store that could
+    # race with the vector store).
+    current_region = tl.maximum((kv_seqlens - 1) // region_size, 0)
     current_page = tl.load(
-        block_table_ptr + request * stride_table_row + current_region // regions_per_page
+        block_table_ptr + requests * stride_table_row + current_region // regions_per_page,
+        mask=row_ok,
+        other=-1,
     )
     current_live = (current_region < valid_regions) & (current_page >= 0)
     current_physical = (
@@ -1440,13 +2469,85 @@ def _decode_pack_kernel(
     current_packed = (current_region * region_size).to(tl.int64) | (
         current_physical.to(tl.int64) << DECODE_PHYS_SHIFT
     )
-    # Written unconditionally so the slot is defined even when the current region is
-    # unmapped, in which case it becomes ordinary zero padding.
+    current_val = tl.where(current_live, current_packed, 0)
+
+    if USE_SORT:
+        packed_hi = (packed >> DECODE_PHYS_SHIFT).to(tl.int32)
+        local_rows = tl.arange(0, BLOCK_ROWS)
+        xbase = row_start * stride_ids_row
+        tl.store(
+            ids_ptr + xbase + slots[None, :] * BLOCK_ROWS + local_rows[:, None],
+            packed_hi,
+            mask=row_ok[:, None],
+        )
+        # Four independent rank accumulators break the sequential
+        # dependency chain of a single ``rank +=`` — the four
+        # comparison-and-add sub-chains execute with more ILP, and the
+        # loop runs BLOCK_K/4 iterations instead of BLOCK_K.
+        rank0 = tl.zeros((BLOCK_ROWS, BLOCK_K), dtype=tl.int32)
+        rank1 = tl.zeros((BLOCK_ROWS, BLOCK_K), dtype=tl.int32)
+        rank2 = tl.zeros((BLOCK_ROWS, BLOCK_K), dtype=tl.int32)
+        rank3 = tl.zeros((BLOCK_ROWS, BLOCK_K), dtype=tl.int32)
+        for j_start in tl.range(0, BLOCK_K, 4, num_stages=4):
+            c0 = tl.load(ids_ptr + xbase + (j_start) * BLOCK_ROWS + local_rows, mask=row_ok, other=2147483648)
+            c1 = tl.load(ids_ptr + xbase + (j_start + 1) * BLOCK_ROWS + local_rows, mask=row_ok, other=2147483648)
+            c2 = tl.load(ids_ptr + xbase + (j_start + 2) * BLOCK_ROWS + local_rows, mask=row_ok, other=2147483648)
+            c3 = tl.load(ids_ptr + xbase + (j_start + 3) * BLOCK_ROWS + local_rows, mask=row_ok, other=2147483648)
+            rank0 += (c0[:, None] < packed_hi).to(tl.int32)
+            rank1 += (c1[:, None] < packed_hi).to(tl.int32)
+            rank2 += (c2[:, None] < packed_hi).to(tl.int32)
+            rank3 += (c3[:, None] < packed_hi).to(tl.int32)
+        rank = (rank0 + rank1) + (rank2 + rank3)
+        # Sentinel values are already unique (see packed construction above),
+        # so every element has a unique rank — no tie-breaking needed.
+
+        out_val = tl.where(rank < count[:, None], packed, 0)
+        out_val = tl.where(rank == count[:, None], current_val[:, None], out_val)
+        tl.store(
+            out_ptr + rows[:, None] * stride_out_row + rank,
+            out_val,
+            mask=row_ok[:, None]
+            & (slots[None, :] < topk + 1)
+            & (rank < topk + 1),
+        )
+    else:
+        # Comparison-matrix rank (single 3-D pass, int32 comparisons).
+        # Each valid packed word carries a unique *physical* id in the high
+        # 32 bits (because the block table is a permutation and
+        # regions_per_page distinguishes regions within a page).  Sentinels
+        # carry unique high-bits values (1 << 30 + slot) which exceed every
+        # real physical id.  So an int32 comparison on the high word alone
+        # gives the same ordering as the full int64 comparison -- at roughly
+        # half the vector-engine cost on the NPU.
+        packed_hi = (packed >> DECODE_PHYS_SHIFT).to(tl.int32)
+        rank = tl.sum(
+            (packed_hi[:, None, :] < packed_hi[:, :, None]).to(tl.int32), axis=2
+        )
+        # Sentinel values are already unique, so rank is unique — no
+        # cumsum tie-break needed.
+
+        # Scatter to rank positions: rank < count -> sorted value,
+        # rank == count -> current region, rank > count -> 0.
+        out_val = tl.where(rank < count[:, None], packed, 0)
+        out_val = tl.where(rank == count[:, None], current_val[:, None], out_val)
+        tl.store(
+            out_ptr + rows[:, None] * stride_out_row + rank,
+            out_val,
+            mask=row_ok[:, None]
+            & (slots[None, :] < topk + 1)
+            & (rank < topk + 1),
+        )
+
+    # When BLOCK_K == topk the scatter/sort above only covers positions
+    # 0..topk-1.  Store the topk-th position separately: current region
+    # if all topk slots are valid (count == topk), else zero.
     tl.store(
-        out_ptr + row * stride_out_row + count,
-        tl.where(current_live, current_packed, 0),
+        out_ptr + rows * stride_out_row + topk,
+        tl.where(count == topk, current_val, 0),
+        mask=row_ok,
     )
-    tl.store(counts_ptr + row, count + current_live.to(tl.int32))
+
+    tl.store(counts_ptr + rows, count + current_live.to(tl.int32), mask=row_ok)
 
 
 def prefill_sparse_meta(
@@ -1481,39 +2582,45 @@ def prefill_sparse_meta(
     region being force-included and it competing for a slot.
     """
     rows = int(logits.shape[0])
+    topk = int(topk)
     if request_indices is None:
         request_indices = torch.zeros((rows,), device=logits.device, dtype=torch.int32)
     history_lengths = torch.div(
         q_positions.to(torch.int32), region_size, rounding_mode="floor"
     ).contiguous()
 
-    history = region_topk_pack(
-        logits,
-        history_lengths,
-        q_positions,
-        block_table,
-        request_indices,
-        topk=topk,
-        region_size=region_size,
-        regions_per_page=regions_per_page,
-    )
+    history = topk_select_new(logits, history_lengths, topk=topk)
 
-    packed = torch.empty((rows, int(topk) + 1), device=logits.device, dtype=torch.int32)
+    packed = torch.empty((rows, topk + 1), device=logits.device, dtype=torch.int32)
     counts = torch.empty((rows,), device=logits.device, dtype=torch.int32)
-    _append_current_region_kernel[(rows,)](
+    block_k = topk #triton.next_power_of_2(topk)
+    # The merge-based kernel eliminates the per-element exclusion mask, so
+    # the tile can be larger than the old 16 384-element ceiling.  However
+    # the NPU UB is ~216 KB; the compiler materialises the 2-D boolean
+    # masks as int32 buffers, so keep the tile product at 8 192 to stay
+    # well within budget.
+    _append_max_tile = 8192
+    block_rows = min(
+        128,
+        max(2, triton.next_power_of_2(triton.cdiv(rows, 64))),
+        max(2, _append_max_tile // block_k),
+    )
+    _append_current_region_kernel[(triton.cdiv(rows, block_rows),)](
         history,
         q_positions,
         block_table,
         request_indices,
         packed,
         counts,
+        rows,
         history.stride(0),
         shared_table_stride(block_table),
         packed.stride(0),
-        topk=int(topk),
-        region_size=int(region_size),
-        regions_per_page=int(regions_per_page),
-        BLOCK_K=triton.next_power_of_2(int(topk) + 1),
+        topk=topk,
+        region_size=region_size,
+        regions_per_page=regions_per_page,
+        BLOCK_ROWS=block_rows,
+        BLOCK_K=block_k,
     )
     return packed, counts
 
@@ -1549,6 +2656,7 @@ def decode_sparse_meta(
     """
     rows, _ = logits.shape
     num_reqs = int(kv_seqlens.shape[0])
+    topk = int(topk)
     if rows % num_reqs:
         raise ValueError(f"{rows} score rows do not divide into {num_reqs} requests")
 
@@ -1558,30 +2666,41 @@ def decode_sparse_meta(
             .repeat(rows // num_reqs)
             .contiguous()
         )
-    # Decode's query position is the last token, so the history is everything strictly
-    # before the current region.
+    req_idx = request_indices.to(torch.long)
+
     history_lengths = torch.div(
         (kv_seqlens.to(torch.int32) - 1).clamp_min(0), region_size, rounding_mode="floor"
-    )[request_indices.to(torch.long)].contiguous()
+    )[req_idx].contiguous()
 
     ids = region_topk_ids(logits, history_lengths, topk=topk)
 
-    packed = torch.empty((rows, int(topk) + 1), device=logits.device, dtype=torch.int64)
+    packed = torch.empty((rows, topk + 1), device=logits.device, dtype=torch.int64)
     counts = torch.empty((rows,), device=logits.device, dtype=torch.int32)
-    _decode_pack_kernel[(rows,)](
+    block_k = triton.next_power_of_2(topk)
+    use_sort = block_k > 256
+    if use_sort:
+        block_rows = min(128, max(2, triton.next_power_of_2(triton.cdiv(rows, 64))))
+        block_rows = min(block_rows, max(1, 65536 // block_k))
+    else:
+        block_rows = min(128, max(2, triton.next_power_of_2(triton.cdiv(rows, 64))))
+        block_rows = min(block_rows, max(1, 1048576 // (block_k * block_k)))
+    _decode_pack_kernel[(triton.cdiv(rows, block_rows),)](
         ids,
         kv_seqlens,
         block_table,
         request_indices,
         packed,
         counts,
+        rows,
         ids.stride(0),
         shared_table_stride(block_table),
         packed.stride(0),
-        topk=int(topk),
-        region_size=int(region_size),
-        regions_per_page=int(regions_per_page),
-        BLOCK_K=triton.next_power_of_2(int(topk) + 1),
+        topk=topk,
+        region_size=region_size,
+        regions_per_page=regions_per_page,
+        BLOCK_ROWS=block_rows,
+        BLOCK_K=block_k,
+        USE_SORT=use_sort,
     )
     return packed, counts
 
