@@ -1030,16 +1030,19 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
     ) -> None:
         """Sparse attention for an MTP verify batch (K+1 rows per request).
 
-        Follows the prefill-style causal selection proven equivalent by the
-        reference flow: each verify row is scored against the paged summary,
-        its candidate regions are bounded by its own absolute position
-        (``prefill_sparse_meta`` derives the visible-region count from
-        ``q_position // region_size`` and force-appends the row's current
-        region), and the exact attention runs through
-        ``sparse_attention_prefill``, whose per-region ``valid`` counts mask
-        intra-region tokens past each row's position. Everything is
-        device-driven on static per-bucket shapes, so uniform verify batches
-        stay ACL-graph capturable.
+        Follows the reference flow's flattened-decode design (its
+        ``_flatten_decode_q_le4_metadata`` path): every verify row becomes a
+        single-token decode request, runs its own indexer top-k selection,
+        and the exact attention goes through ``sparse_attention_decode``.
+        Each row's ``kv_seqlen`` is its own absolute position + 1, so the
+        decode kernel's per-slot visible length
+        ``clamp(kv_seqlen - start_token, 0, region_size)`` reproduces the
+        per-row causal mask the prefill kernel used to express through
+        per-region ``valid`` counts, while ``decode_sparse_meta`` keeps the
+        row's current region out of top-k competition and force-appends it
+        -- the same contract the single-token decode path guarantees.
+        Everything is device-driven on static per-bucket shapes, so uniform
+        verify batches stay ACL-graph capturable.
         """
         d = md.decode
         n = md.num_decodes
@@ -1065,25 +1068,31 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             out=logits,
             summaries_per_page=int(summary_cache.summaries_per_page),
         )
-        q_positions = positions[:total].to(torch.int32)
-        if groups > 1:
-            q_positions = q_positions.repeat(groups).contiguous()
-            token_to_req = token_to_req.repeat(groups).contiguous()
-        packed, counts = prefill_sparse_meta(
+        # Flatten the verify rows to single-token decode requests: row r of
+        # request i carries its own context end, i.e. kv_seqlen = position +
+        # 1. The decode kernel then bounds each selected region by
+        # clamp(kv_seqlen - start_token, 0, region_size), which is the
+        # per-row causal mask.
+        row_kv_seqlens = positions[:total].to(torch.int32) + 1
+        # Per-row block-table rows, gathered on device so the flatten stays
+        # graph-capturable; this mirrors the reference's metadata-flatten
+        # kernel expanding per-request rows to per-token rows.
+        row_block_table = d.block_table[:n][token_to_req.to(torch.long)]
+        packed, counts = decode_sparse_meta(
             logits,
-            q_positions,
-            d.block_table[:n],
-            token_to_req,
+            row_kv_seqlens,
+            row_block_table,
             topk=self.topk_regions,
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
         )
-        out, _ = sparse_attention_prefill(
+        out, _ = sparse_attention_decode(
             query,
             key_flat,
             value_flat,
             packed,
             counts,
+            row_kv_seqlens,
             num_kv_groups=groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
