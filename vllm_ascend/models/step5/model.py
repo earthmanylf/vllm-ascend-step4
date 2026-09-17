@@ -808,7 +808,7 @@ class AscendStep5FusedMoEBlock(Step5MoE):
         enable_sp_moe = (
             parallel_config.enable_expert_parallel
             and self.tp_size > 1
-            and not envs.VLLM_ASCEND_DISABLE_STEP4_MOE_SP
+            and (vllm_config.additional_config or {}).get("enable_flashcomm1", False)
         )
 
         # reduce_results=False: AscendMoERunner owns the shared-expert TP
@@ -1155,7 +1155,7 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
             vllm_config.parallel_config.enable_expert_parallel
             and self.tp_group.world_size > 1
             and self.use_moe
-            and not envs.VLLM_ASCEND_DISABLE_STEP4_MOE_SP
+            and (vllm_config.additional_config or {}).get("enable_flashcomm1", False)
         )
         self.use_attention_o_proj_reduce_scatter = self.use_sequence_parallel_moe
         if self.use_sequence_parallel_moe:
