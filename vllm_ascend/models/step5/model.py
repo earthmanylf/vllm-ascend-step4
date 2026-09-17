@@ -655,6 +655,12 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
                 * gate.unsqueeze(-1).sigmoid()
             ).view(num_tokens, -1)
         if reduce_scatter_output:
+            # Sequence-parallel o_proj: reduce-scatter needs rows divisible
+            # by TP; pad the tail rows (they ride along as zeros and are
+            # sliced off when the shard is all-gathered again).
+            sp_pad = (-attn_output.shape[0]) % self.tp_size
+            if sp_pad:
+                attn_output = torch.nn.functional.pad(attn_output, (0, 0, 0, sp_pad))
             output_tensor, _ = self.o_proj(
                 attn_output, reduce_scatter_results=True, reduce_scatter_dim=0
             )
@@ -795,8 +801,14 @@ class AscendStep5FusedMoEBlock(Step5MoE):
             self.tp_size,
             get_dp_group().world_size,
         )
-        effective_sequence_parallel = (
-            vllm_config.compilation_config.pass_config.enable_sp and self.tp_size > 1
+        # MoE sequence parallelism, DeepseekV32-style gating minus the DP
+        # requirement: any TP>1 expert-parallel deployment runs the
+        # AG-attn-RS-MoE(shard) loop instead of all-reducing attention
+        # outputs and feeding the MoE full sequences.
+        enable_sp_moe = (
+            parallel_config.enable_expert_parallel
+            and self.tp_size > 1
+            and not envs.VLLM_ASCEND_DISABLE_STEP4_MOE_SP
         )
 
         # reduce_results=False: AscendMoERunner owns the shared-expert TP
@@ -808,7 +820,7 @@ class AscendStep5FusedMoEBlock(Step5MoE):
             intermediate_size=share_expert_dim,
             hidden_act="silu",
             reduce_results=False,
-            is_sequence_parallel=effective_sequence_parallel,
+            is_sequence_parallel=enable_sp_moe,
             quant_config=quant_config
             if quant_config and quant_config.get_name() != "fp8"
             else None,
@@ -835,7 +847,7 @@ class AscendStep5FusedMoEBlock(Step5MoE):
             routed_scaling_factor=config.moe_router_scaling_factor,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
-            is_sequence_parallel=effective_sequence_parallel,
+            is_sequence_parallel=enable_sp_moe,
             router_logits_dtype=torch.float32,
         )
         # Ascend dispatch sizes the global physical expert space from this
@@ -978,6 +990,11 @@ class AscendStep5Attention(Step5Attention):
             )
             attn_output = output.view(*attn_output.shape)
         if reduce_scatter_output:
+            # Sequence-parallel o_proj: pad rows to a TP multiple before the
+            # reduce-scatter (same contract as the DSA layer above).
+            sp_pad = (-attn_output.shape[0]) % self.tp_size
+            if sp_pad:
+                attn_output = torch.nn.functional.pad(attn_output, (0, 0, 0, sp_pad))
             output, _ = self.o_proj(
                 attn_output,
                 reduce_scatter_results=True,
@@ -1131,8 +1148,22 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
             dtype=norm_dtype,
         )
         self.prefix = prefix
-        self.use_attention_o_proj_reduce_scatter = False
-
+        # DeepseekV32-style MoE sequence parallelism, gated on TP>1 + EP only
+        # (no DP requirement). Dense layers never join: their MLP keeps the
+        # un-reduced + fused-AR-norm path.
+        self.use_sequence_parallel_moe = (
+            vllm_config.parallel_config.enable_expert_parallel
+            and self.tp_group.world_size > 1
+            and self.use_moe
+            and not envs.VLLM_ASCEND_DISABLE_STEP4_MOE_SP
+        )
+        self.use_attention_o_proj_reduce_scatter = self.use_sequence_parallel_moe
+        if self.use_sequence_parallel_moe:
+            logger.info_once(
+                "Step4 MoE sequence parallelism enabled (TP=%d, EP): "
+                "AG-attn-RS-MoE(shard) decoder loop.",
+                self.tp_group.world_size,
+            )
 
     def _forward_ffn(
         self,
@@ -1165,19 +1196,12 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
         # then add the complete routed output. Reducing the sum instead would
         # count the routed contribution once per TP rank (measured 8x).
         if self.moe.experts.moe_config.is_sequence_parallel:
-            # Sequence-parallel outputs are token shards; all-gather like
-            # the upstream layer does for the (shared, routed) tuple.
-            if input_is_sequence_parallel:
-                assert residual is not None
-                assert orig_num_tokens is not None
-                gathered = tensor_model_parallel_all_gather(
-                    self._cast_for_residual(ffn_output) + residual, dim=0
-                )
-                return gathered[:orig_num_tokens]
-            gathered = tensor_model_parallel_all_gather(
-                self._cast_for_residual(ffn_output), dim=0
-            )
-            return gathered[: hidden_states.shape[0]]
+            # DeepseekV32 semantics: the MoE consumed the sequence shard and
+            # its un-reduced shard output flows straight to the next layer
+            # boundary; the residual add + norm happen there (fused kernel)
+            # and the all-gather restoring the full sequence runs before the
+            # next attention. No per-layer all-gather here.
+            return ffn_output
         return self._cast_for_residual(ffn_output)
 
     def forward_attention(
@@ -1185,17 +1209,25 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        reduce_scatter_output: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """self_attn + fused post-attention residual-add/RMSNorm/cast.
 
         Takes the normed hidden states (param-op dtype) and the running
         residual (residual dtype), returns the post-attention normed hidden
         states and the updated residual.
+
+        With ``reduce_scatter_output`` the attention output stays un-reduced
+        and is sequence-parallel chunked instead (o_proj reduce-scatter);
+        the residual is chunked to match so the fused norm runs on shards.
         """
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            reduce_scatter_output=reduce_scatter_output,
         )
+        if reduce_scatter_output and residual.shape[0] != hidden_states.shape[0]:
+            residual = sequence_parallel_chunk(residual)
         return fused_add_rms_norm_cast(
             hidden_states,
             residual,
@@ -1210,11 +1242,41 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        # The reduce-scatter path needs the sequence-parallel-chunked residual
-        # before the norm, which the fused kernel does not cover; keep the
-        # upstream sequence there. (This layer never enables it on Ascend.)
         if self.use_attention_o_proj_reduce_scatter and hidden_states.dim() == 2:
-            return super().forward(positions, hidden_states)
+            # DeepseekV32-style sequence-parallel loop: restore the full
+            # sequence for attention, reduce-scatter the o_proj output back
+            # into shards, norm on shards, run the MoE on the shard and hand
+            # the (un-reduced) shard + residual to the next boundary.
+            full_num_tokens = positions.shape[0]
+            # Shape inference, as in DeepseekV32DecoderLayer, plus the
+            # num_tokens < TP case where a shard and the full sequence are
+            # both 1 row: after any sequence-parallel layer the input must be
+            # treated as a shard. (The model loop tracks this state
+            # explicitly; this standalone path assumes it follows a
+            # sequence-parallel predecessor when full < TP.)
+            input_is_sequence_parallel = hidden_states.shape[0] != full_num_tokens or (
+                full_num_tokens < self.tp_group.world_size
+            )
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            if input_is_sequence_parallel:
+                # RMSNorm is per-token, so norm-on-shard then all-gather is
+                # equivalent to gathering first; gathering the *normed* shard
+                # keeps the residual in shard form.
+                hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+                hidden_states = hidden_states[:full_num_tokens]
+            hidden_states = self._cast_for_param_op(hidden_states)
+            hidden_states, residual = self.forward_attention(
+                positions,
+                hidden_states,
+                residual,
+                reduce_scatter_output=True,
+            )
+            ffn_output = self._forward_ffn(
+                hidden_states, input_is_sequence_parallel=True
+            )
+            ffn_output = self._cast_for_residual(ffn_output)
+            return ffn_output + residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self._cast_for_param_op(hidden_states)
@@ -1293,14 +1355,21 @@ class AscendStep5Model(Step5Model):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
         residual = self._cast_for_residual(hidden_states)
+        full_num_tokens = positions.shape[0]
 
         # The per-layer tail (cast the FFN output to the residual dtype and
         # add the residual) is deferred and fused with the *next* layer's
         # input RMSNorm + param-op cast in one kernel, so each layer
         # boundary costs a single fused launch instead of five.
         ffn_output: torch.Tensor | None = None
+        # Explicit shard-state tracking: shape alone cannot distinguish a
+        # shard from the full sequence when num_tokens < TP (both are 1 row
+        # for a single-token decode step), so the loop records whether the
+        # previous FFN left sequence-parallel shards.
+        ffn_is_shard = False
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            use_sp = layer.use_sequence_parallel_moe
             if ffn_output is None:
                 # First layer only: the input norm is not covered by the
                 # fused boundary kernel. For zero-centered norms use the
@@ -1318,6 +1387,9 @@ class AscendStep5Model(Step5Model):
                     hidden_states = layer.input_layernorm(residual)
                 hidden_states = layer._cast_for_param_op(hidden_states)
             else:
+                # On sequence-parallel boundaries both operands are already
+                # token shards (the fused kernel is per-token, so it runs on
+                # shards unchanged).
                 hidden_states, residual = fused_add_rms_norm_cast(
                     ffn_output,
                     residual,
@@ -1328,11 +1400,36 @@ class AscendStep5Model(Step5Model):
                     ),
                     fp32_residual=self.fp32_residual_connection,
                 )
+                if ffn_is_shard:
+                    # Restore the full sequence for attention: RMSNorm is
+                    # per-token, so the normed shards concatenate losslessly
+                    # (pad rows ride along and are sliced off here). Dense
+                    # layers after a sequence-parallel MoE layer need this
+                    # too -- attention (and the KV write) runs on the full
+                    # sequence regardless of the layer's own SP eligibility.
+                    hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+                    hidden_states = hidden_states[:full_num_tokens]
+                    if not use_sp:
+                        # Dense layers keep working in the full-sequence
+                        # domain, so their residual must be restored too --
+                        # otherwise the fused residual-add + norm sees an
+                        # 18-vs-3-row broadcast (silently wrong values).
+                        residual = tensor_model_parallel_all_gather(residual, dim=0)
+                        residual = residual[:full_num_tokens]
             hidden_states, residual = layer.forward_attention(
-                positions, hidden_states, residual
+                positions, hidden_states, residual, reduce_scatter_output=use_sp
             )
-            ffn_output = layer._forward_ffn(hidden_states)
+            ffn_output = layer._forward_ffn(
+                hidden_states, input_is_sequence_parallel=use_sp
+            )
+            ffn_is_shard = use_sp
         hidden_states = self._cast_for_residual(ffn_output) + residual
+        if ffn_is_shard:
+            # The last sequence-parallel MoE layer left token shards (with
+            # pad rows); restore the full sequence for the stage boundary /
+            # final norm.
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+            hidden_states = hidden_states[:full_num_tokens]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

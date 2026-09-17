@@ -78,6 +78,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Ascend 950, MXFP8 requantize on Ascend 950). Valid values: "0" or "1".
     # Not sensitive.
     "VLLM_ASCEND_ENABLE_STEP4_FP8": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_STEP4_FP8", "0"))),
+    # Whether to DISABLE Step4 MoE sequence parallelism. MoE SP (DeepseekV32
+    # semantics: all-gather before attention, reduce-scatter after o_proj,
+    # MoE executed on the sequence shard) is enabled by default whenever
+    # tensor_parallel_size > 1 and expert parallelism is on. Set to "1" to
+    # force the classic full-sequence MoE path (e.g. for A/B comparison or
+    # rollback). Valid values: "0" or "1". Not sensitive.
+    "VLLM_ASCEND_DISABLE_STEP4_MOE_SP": lambda: bool(int(os.getenv("VLLM_ASCEND_DISABLE_STEP4_MOE_SP", "0"))),
 }
 
 # end-env-vars-definition
