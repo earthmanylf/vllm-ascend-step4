@@ -6,6 +6,7 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend import ascend_config
+from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
 from vllm_ascend.distributed import parallel_state
 from vllm_ascend.ops.linear import (
     AscendMergedColumnParallelLinear,
@@ -307,6 +308,146 @@ class TestGetParallelOpShareExpert(unittest.TestCase):
         self.assertIsNone(custom_op)
         self.assertEqual(tp_rank, 0)
         self.assertEqual(tp_size, 1)
+
+
+class TestRowParallelLinearMmrsFusion(unittest.TestCase):
+    """Tests for the fused mm + reduce-scatter (npu_mm_reduce_scatter_base)
+    path in AscendRowParallelLinear.forward(reduce_scatter_results=True)."""
+
+    def setUp(self):
+        self.mock_group = MagicMock()
+        self.mock_group.world_size = 2
+        self.mock_group.rank_in_group = 0
+        backend = MagicMock()
+        backend.get_hccl_comm_name.return_value = "hcom-test"
+        self.mock_group.device_group._get_backend.return_value = backend
+
+        self._patches = [
+            patch("vllm_ascend.ops.linear_op.get_tp_group", return_value=self.mock_group),
+            patch("vllm.distributed.parallel_state.get_tp_group", return_value=self.mock_group),
+            patch("vllm.distributed.get_tp_group", return_value=self.mock_group),
+            # The fused kernel is only enabled on the STANDARD device adaptor
+            # family (A2/A3); pin the hardware profile so the tests do not
+            # depend on the machine running them.
+            patch(
+                "vllm_ascend.ops.linear.get_current_hardware_profile",
+                return_value=MagicMock(device_adaptor_family=DeviceAdaptorFamily.STANDARD),
+            ),
+            patch("vllm_ascend.ops.linear_op.mlp_tp_enable", return_value=False),
+            patch("vllm_ascend.ops.linear_op.oproj_tp_enable", return_value=False),
+            patch("vllm_ascend.ops.linear_op.enable_dsa_cp", return_value=False),
+            patch("vllm_ascend.ops.linear_op.is_moe_layer", return_value=False),
+            patch("vllm_ascend.ops.linear.get_current_vllm_config", return_value=MagicMock()),
+            patch("torch.distributed.get_rank", return_value=0),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def _make_linear(self, **kwargs):
+        kwargs.setdefault("input_size", 16)
+        kwargs.setdefault("output_size", 8)
+        kwargs.setdefault("bias", False)
+        kwargs.setdefault("params_dtype", torch.bfloat16)
+        kwargs.setdefault("prefix", "o_proj")
+        return AscendRowParallelLinear(**kwargs)
+
+    def _rs_forward(self, linear, rows=16):
+        input_tensor = torch.randn(rows, linear.input_size_per_partition, dtype=torch.bfloat16)
+        return linear(input_tensor, reduce_scatter_results=True, reduce_scatter_dim=0)
+
+    def test_static_eligibility(self):
+        self.assertTrue(self._make_linear()._mmrs_fusion_eligible())
+        self.assertFalse(self._make_linear(bias=True)._mmrs_fusion_eligible())
+        self.assertFalse(self._make_linear(reduce_results=False)._mmrs_fusion_eligible())
+        self.assertFalse(self._make_linear(input_is_parallel=False)._mmrs_fusion_eligible())
+        # fp32 is outside the fused kernel's dtype set.
+        self.assertFalse(self._make_linear(params_dtype=torch.float32)._mmrs_fusion_eligible())
+        linear = self._make_linear()
+        linear.tp_size = 16
+        self.assertFalse(linear._mmrs_fusion_eligible())
+
+    def test_ineligible_on_non_standard_device_family(self):
+        """A5 (FP8_OPTIMIZED) and 310P (COMPATIBILITY) must not fuse: the
+        kernel breaks other HCCL comms there (950DT, CANN 9.1.0)."""
+        linear = self._make_linear()
+        for family in (DeviceAdaptorFamily.FP8_OPTIMIZED, DeviceAdaptorFamily.COMPATIBILITY):
+            with patch(
+                "vllm_ascend.ops.linear.get_current_hardware_profile",
+                return_value=MagicMock(device_adaptor_family=family),
+            ):
+                self.assertFalse(linear._mmrs_fusion_eligible())
+
+    @patch("vllm_ascend.ops.linear.get_forward_context")
+    @patch("vllm_ascend.ops.linear.torch_npu.get_npu_format", return_value=2)
+    @patch("vllm_ascend.device.device_op.DeviceOperator")
+    def test_fused_path_taken_when_eligible(self, mock_device_op, _mock_fmt, mock_get_ctx):
+        mock_get_ctx.return_value = MagicMock(mmrs_fusion=True)
+        expected = torch.randn(8, 8, dtype=torch.bfloat16)
+        mock_device_op.npu_mm_reduce_scatter_base.return_value = expected
+
+        linear = self._make_linear()
+        output, bias = self._rs_forward(linear)
+
+        mock_device_op.npu_mm_reduce_scatter_base.assert_called_once()
+        args = mock_device_op.npu_mm_reduce_scatter_base.call_args.args
+        self.assertEqual(tuple(args[0].shape), (16, 8))  # (m, k) shard input
+        self.assertEqual(tuple(args[1].shape), (8, 8))  # ND (k, n) weight copy
+        self.assertEqual(args[2], "hcom-test")
+        self.assertEqual(args[3], 2)
+        self.assertIs(output, expected)
+        self.assertIsNone(bias)
+
+    @patch("vllm_ascend.ops.linear.get_forward_context")
+    @patch("vllm_ascend.device.device_op.DeviceOperator")
+    @patch("vllm.distributed.tensor_model_parallel_reduce_scatter")
+    def test_fallback_when_context_switch_off(self, mock_rs, mock_device_op, mock_get_ctx):
+        mock_get_ctx.return_value = MagicMock(mmrs_fusion=False)
+        partial = torch.randn(16, 8, dtype=torch.bfloat16)
+        shard = torch.randn(8, 8, dtype=torch.bfloat16)
+        mock_rs.return_value = shard
+
+        linear = self._make_linear()
+        with patch.object(linear.quant_method, "apply", return_value=partial):
+            output, _ = self._rs_forward(linear)
+
+        mock_device_op.npu_mm_reduce_scatter_base.assert_not_called()
+        mock_rs.assert_called_once_with(partial, 0)
+        self.assertIs(output, shard)
+
+    @patch("vllm_ascend.ops.linear.get_forward_context")
+    @patch("vllm_ascend.device.device_op.DeviceOperator")
+    @patch("vllm.distributed.tensor_model_parallel_reduce_scatter")
+    def test_fallback_when_rows_not_divisible(self, mock_rs, mock_device_op, mock_get_ctx):
+        mock_get_ctx.return_value = MagicMock(mmrs_fusion=True)
+        mock_rs.return_value = MagicMock()
+
+        linear = self._make_linear()
+        with patch.object(linear.quant_method, "apply", return_value=torch.randn(15, 8)):
+            self._rs_forward(linear, rows=15)
+
+        mock_device_op.npu_mm_reduce_scatter_base.assert_not_called()
+        mock_rs.assert_called_once()
+
+    @patch("vllm_ascend.ops.linear.get_forward_context")
+    @patch("vllm_ascend.ops.linear.torch_npu.get_npu_format", side_effect=RuntimeError("no npu"))
+    @patch("vllm_ascend.device.device_op.DeviceOperator")
+    @patch("vllm.distributed.tensor_model_parallel_reduce_scatter")
+    def test_init_failure_latches_fallback(self, mock_rs, mock_device_op, _mock_fmt, mock_get_ctx):
+        mock_get_ctx.return_value = MagicMock(mmrs_fusion=True)
+        mock_rs.return_value = MagicMock()
+
+        linear = self._make_linear()
+        with patch.object(linear.quant_method, "apply", return_value=torch.randn(16, 8)):
+            self._rs_forward(linear)
+            self._rs_forward(linear)
+
+        mock_device_op.npu_mm_reduce_scatter_base.assert_not_called()
+        self.assertTrue(linear._mmrs_unavailable)
+        self.assertEqual(mock_rs.call_count, 2)
 
 
 if __name__ == "__main__":
