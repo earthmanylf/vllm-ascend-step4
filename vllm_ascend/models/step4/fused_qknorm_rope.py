@@ -7,9 +7,11 @@ passthrough. No dependency on inference/kernel.py or _npu_adapt.apply();
 import and call ``fused_qknorm_rope`` directly.
 
 Numerical contract: this is an Ascend-specific SIMD implementation (vector
-tree reduction for RMSNorm, in-kernel libdevice sin/cos for RoPE). It is NOT
-bit-identical to the CUDA per-lane FMA/XOR-tree reference; it matches it
-within RMSNorm/RoPE tolerance (see check_precision.py).
+tree reduction for RMSNorm). RoPE rotation angles are read from the
+caller-provided cos/sin cache (per-layer rope_theta / rope_scaling are baked
+into that cache by the caller). It is NOT bit-identical to the CUDA per-lane
+FMA/XOR-tree reference; it matches it within RMSNorm/RoPE tolerance (see
+check_precision.py).
 
 Interface (same as the original):
     q, k, v = fused_qknorm_rope(qkv, q_weight, k_weight, cos, sin, positions,
@@ -24,14 +26,6 @@ import os
 import torch
 import triton
 import triton.language as tl
-
-try:
-    from triton.language.extra.cann import libdevice as _libdevice
-except ImportError:
-    try:
-        from triton.language.extra import libdevice as _libdevice
-    except ImportError:
-        _libdevice = tl.libdevice
 
 
 HEAD_DIM: int = 192
@@ -54,13 +48,15 @@ def _split_qkv_norm_rope_192_kernel(
     v_out_ptr,
     q_weight_ptr,
     k_weight_ptr,
-    inv_freq_ptr,
+    cos_ptr,
+    sin_ptr,
     positions_ptr,
     tokens,
     stride_qkv_token,
     stride_q_out_token,
     stride_k_out_token,
     stride_v_out_token,
+    stride_cos,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     ROTARY_PAIRS: tl.constexpr,
@@ -92,11 +88,16 @@ def _split_qkv_norm_rope_192_kernel(
     pairs = tl.arange(0, BLOCK_R)
     pair_mask = pairs < ROTARY_PAIRS
 
-    position = tl.load(positions_ptr + offs_t, mask=t_mask, other=0).to(tl.float32)
-    inv_freq = tl.load(inv_freq_ptr + pairs, mask=pair_mask, other=0.0).to(tl.float32)
-    angle = position[:, None] * inv_freq[None, :]
-    cos_value = _libdevice.cos(angle)
-    sin_value = _libdevice.sin(angle)
+    # RoPE angles come from the caller-provided cos/sin cache: the module
+    # builds it per layer with the correct rope_theta / rope_scaling, so the
+    # kernel must read it instead of recomputing frequencies from a
+    # hardcoded theta (previously theta=1e4 was baked in, which corrupted
+    # every layer configured with a different rope_theta, e.g. 1e7).
+    position = tl.load(positions_ptr + offs_t, mask=t_mask, other=0)
+    rope_row = position[:, None] * stride_cos + pairs[None, :]
+    rope_mask = t_mask[:, None] & pair_mask[None, :]
+    cos_value = tl.load(cos_ptr + rope_row, mask=rope_mask, other=0.0).to(tl.float32)
+    sin_value = tl.load(sin_ptr + rope_row, mask=rope_mask, other=0.0).to(tl.float32)
 
     idx0 = tl.broadcast_to(pairs[None, :], (BLOCK_M, BLOCK_R))
     idx1 = idx0 + ROTARY_PAIRS
@@ -164,21 +165,6 @@ def _split_qkv_norm_rope_192_kernel(
         tl.store(v_out_ptr + v_out_base + dims[None, :], v_value, mask=load_mask)
 
 
-_inv_freq_cache: dict[tuple[str, int], torch.Tensor] = {}
-
-
-def _build_inv_freq(device, rotary_pairs: int) -> torch.Tensor:
-    key = (str(device), rotary_pairs)
-    cached = _inv_freq_cache.get(key)
-    if cached is None:
-        span = 2 * rotary_pairs
-        theta = 10000.0
-        idx = torch.arange(0, span, 2, device=device, dtype=torch.float32)
-        cached = (1.0 / (theta ** (idx / span))).contiguous()
-        _inv_freq_cache[key] = cached
-    return cached
-
-
 def _fused_qknorm_rope_impl(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
@@ -196,7 +182,6 @@ def _fused_qknorm_rope_impl(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if head_dim != HEAD_DIM:
         raise ValueError(f"head_dim must be {HEAD_DIM}, got {head_dim}")
-    inv_freq = _build_inv_freq(qkv.device, rotary_pairs)
 
     tokens = qkv.shape[0]
     q_out = torch.empty((tokens, num_q_heads * HEAD_DIM), device=qkv.device, dtype=qkv.dtype)
@@ -213,13 +198,15 @@ def _fused_qknorm_rope_impl(
         v_out,
         q_weight,
         k_weight,
-        inv_freq,
+        cos,
+        sin,
         positions,
         tokens,
         qkv.stride(0),
         q_out.stride(0),
         k_out.stride(0),
         v_out.stride(0),
+        cos.stride(0),
         NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,
         ROTARY_PAIRS=rotary_pairs,
@@ -676,6 +663,16 @@ def _fused_indexer_qkz_kv_norm_rope_impl(
     subtract_mean_q: bool = False,
     subtract_mean_k: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # ``rotary_dim`` follows the module convention: the number of rotated
+    # dims at the head of each indexer head (sparse_indexer_rope_dim, e.g.
+    # 32). The kernel works in NeoX pairs: real = dims[:rotary_pairs],
+    # imag = dims[rotary_pairs:2*rotary_pairs], and indexes the cos/sin cache
+    # rows (width = rotary_pairs) by pair id. Passing the dim count through
+    # unchanged made the kernel treat 32 dims as 32 pairs -- imag landed on
+    # dims 32-63 and cache reads ran past the 16-wide row into the next
+    # position's angles. Convert dims -> pairs here.
+    rotary_pairs = rotary_dim // 2
+
     tokens = x_cat.shape[0]
     out_q = torch.empty((tokens, num_q_heads * head_dim), device=x_cat.device, dtype=x_cat.dtype)
     out_k = torch.empty((tokens, num_k_heads * head_dim), device=x_cat.device, dtype=x_cat.dtype)
@@ -722,13 +719,13 @@ def _fused_indexer_qkz_kv_norm_rope_impl(
         num_q_heads=num_q_heads,
         num_k_heads=num_k_heads,
         head_dim=head_dim,
-        rotary_dim=rotary_dim,
+        rotary_dim=rotary_pairs,
         SUBTRACT_MEAN_Q=subtract_mean_q,
         HAS_BIAS_Q=q_norm_bias is not None,
         SUBTRACT_MEAN_K=subtract_mean_k,
         HAS_BIAS_K=k_norm_bias is not None,
         BLOCK_D=triton.next_power_of_2(head_dim),
-        BLOCK_R=triton.next_power_of_2(rotary_dim),
+        BLOCK_R=triton.next_power_of_2(rotary_pairs),
         H_CHUNK_Q=(hc_q := _pick_head_chunk(num_q_heads, head_dim)),
         H_CHUNK_K=(hc_k := _pick_head_chunk(num_k_heads, head_dim)),
         N_FULL_Q=num_q_heads // hc_q,

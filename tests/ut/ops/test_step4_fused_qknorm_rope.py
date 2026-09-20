@@ -3,6 +3,11 @@
 Tests compare the fused kernel output against a pure-PyTorch reference that
 replicates the eager path: per-head RMSNorm (zero_centered) + NeoX RoPE.
 
+RoPE angles are supplied through a cos/sin cache built with a configurable
+theta. The theta=1e7 parametrization is a regression test for the bug where
+the kernel ignored the caller-provided cache and recomputed angles from a
+hardcoded theta=1e4 (every DSA layer uses rope_theta=1e7).
+
 Run on NPU:
     pytest -sv tests/ut/ops/test_step4_fused_qknorm_rope.py
 """
@@ -12,19 +17,31 @@ import torch
 
 HEAD_DIM = 192
 EPS = 1e-5
-THETA = 10000.0
+THETA_SLIDING = 10000.0
+THETA_DSA = 10000000.0
 
 
-def _build_inv_freq(rotary_pairs: int, device) -> torch.Tensor:
+def _build_cos_sin_cache(
+    max_pos: int, rotary_pairs: int, theta: float, device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a [max_pos, 2*rotary_pairs] cos_sin_cache and chunk it, matching
+    the production layout (vLLM RotaryEmbedding.cos_sin_cache.chunk(2, -1)),
+    so the kernel sees the same strided views as in the model."""
     span = 2 * rotary_pairs
     idx = torch.arange(0, span, 2, device=device, dtype=torch.float32)
-    return (1.0 / (THETA ** (idx / span))).contiguous()
+    inv_freq = 1.0 / (theta ** (idx / span))
+    pos = torch.arange(max_pos, device=device, dtype=torch.float32)
+    freqs = torch.outer(pos, inv_freq)  # [max_pos, rotary_pairs]
+    cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.bfloat16)
+    return cache.chunk(2, dim=-1)  # cos, sin: [max_pos, rotary_pairs] views
 
 
 def _reference_qknorm_rope(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
     positions: torch.Tensor,
     *,
     num_q_heads: int,
@@ -33,7 +50,8 @@ def _reference_qknorm_rope(
     eps: float,
     norm_weight_bias: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure-PyTorch reference: split → per-head RMSNorm → NeoX RoPE."""
+    """Pure-PyTorch reference: split → per-head RMSNorm → NeoX RoPE from the
+    given cos/sin cache (same tensors passed to the kernel)."""
     total_tokens = qkv.shape[0]
     q_dim = num_q_heads * HEAD_DIM
     kv_dim = num_kv_heads * HEAD_DIM
@@ -52,18 +70,15 @@ def _reference_qknorm_rope(
     k = rms_norm(k, k_weight)
 
     # --- NeoX RoPE (partial, only first rotary_dim dims) ---
-    inv_freq = _build_inv_freq(rotary_dim // 2, qkv.device)
-
     def apply_rope(x_flat: torch.Tensor) -> torch.Tensor:
         x = x_flat.view(total_tokens, -1, HEAD_DIM).float()
         half = rotary_dim // 2
         x1 = x[..., :half]
         x2 = x[..., half:rotary_dim]
-        angle = positions.float()[:, None, None] * inv_freq[None, None, :]
-        cos = torch.cos(angle)
-        sin = torch.sin(angle)
-        rotated1 = x1 * cos - x2 * sin
-        rotated2 = x1 * sin + x2 * cos
+        cos_t = cos[positions.long()].float()[:, None, :]  # [tokens, 1, half]
+        sin_t = sin[positions.long()].float()[:, None, :]
+        rotated1 = x1 * cos_t - x2 * sin_t
+        rotated2 = x1 * sin_t + x2 * cos_t
         x_out = x.clone()
         x_out[..., :half] = rotated1
         x_out[..., half:rotary_dim] = rotated2
@@ -88,6 +103,7 @@ def _import_kernel():
 # Tests
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("theta", [THETA_SLIDING, THETA_DSA])
 @pytest.mark.parametrize("num_tokens", [1, 8, 16, 32, 48])
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(8, 1), (16, 2), (32, 4)])
 @pytest.mark.parametrize("norm_weight_bias", [1.0, 0.0])
@@ -96,6 +112,7 @@ def test_fused_qknorm_rope_accuracy(
     num_q_heads,
     num_kv_heads,
     norm_weight_bias,
+    theta,
     _import_kernel,
 ):
     """Compare fused kernel output against PyTorch reference."""
@@ -106,6 +123,7 @@ def test_fused_qknorm_rope_accuracy(
 
     rotary_dim = 128
     rotary_pairs = rotary_dim // 2
+    max_pos = 4096
 
     torch.manual_seed(123)
     q_dim = num_q_heads * HEAD_DIM
@@ -113,15 +131,16 @@ def test_fused_qknorm_rope_accuracy(
     qkv = torch.randn(num_tokens, q_dim + 2 * kv_dim, device=device, dtype=torch.bfloat16)
     q_weight = torch.randn(HEAD_DIM, device=device, dtype=torch.bfloat16)
     k_weight = torch.randn(HEAD_DIM, device=device, dtype=torch.bfloat16)
-    positions = torch.randint(0, 4096, (num_tokens,), device=device, dtype=torch.int32)
-    cos = torch.randn(4096, rotary_dim, device=device, dtype=torch.bfloat16)
-    sin = torch.randn(4096, rotary_dim, device=device, dtype=torch.bfloat16)
+    positions = torch.randint(0, max_pos, (num_tokens,), device=device, dtype=torch.int32)
+    cos, sin = _build_cos_sin_cache(max_pos, rotary_pairs, theta, device)
 
     # Reference
     q_ref, k_ref, v_ref = _reference_qknorm_rope(
         qkv.clone(),
         q_weight,
         k_weight,
+        cos,
+        sin,
         positions,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -222,6 +241,7 @@ def test_fused_qknorm_rope_rope_only_region(_import_kernel):
     num_tokens, num_q_heads, num_kv_heads = 16, 8, 1
     rotary_dim = 128
     rotary_pairs = rotary_dim // 2
+    max_pos = 4096
     q_dim = num_q_heads * HEAD_DIM
     kv_dim = num_kv_heads * HEAD_DIM
 
@@ -230,13 +250,14 @@ def test_fused_qknorm_rope_rope_only_region(_import_kernel):
     q_weight = torch.randn(HEAD_DIM, device=device, dtype=torch.bfloat16)
     k_weight = torch.randn(HEAD_DIM, device=device, dtype=torch.bfloat16)
     positions = torch.arange(num_tokens, device=device, dtype=torch.int32)
-    cos = torch.randn(4096, rotary_dim, device=device, dtype=torch.bfloat16)
-    sin = torch.randn(4096, rotary_dim, device=device, dtype=torch.bfloat16)
+    cos, sin = _build_cos_sin_cache(max_pos, rotary_pairs, THETA_SLIDING, device)
 
     q_ref, k_ref, v_ref = _reference_qknorm_rope(
         qkv.clone(),
         q_weight,
         k_weight,
+        cos,
+        sin,
         positions,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -280,6 +301,7 @@ def test_fused_qknorm_rope_max_abs_error_report(_import_kernel):
     num_tokens, num_q_heads, num_kv_heads = 32, 16, 2
     rotary_dim = 128
     rotary_pairs = rotary_dim // 2
+    max_pos = 4096
     q_dim = num_q_heads * HEAD_DIM
     kv_dim = num_kv_heads * HEAD_DIM
 
@@ -287,14 +309,15 @@ def test_fused_qknorm_rope_max_abs_error_report(_import_kernel):
     qkv = torch.randn(num_tokens, q_dim + 2 * kv_dim, device=device, dtype=torch.bfloat16)
     q_weight = torch.randn(HEAD_DIM, device=device, dtype=torch.bfloat16)
     k_weight = torch.randn(HEAD_DIM, device=device, dtype=torch.bfloat16)
-    positions = torch.randint(0, 4096, (num_tokens,), device=device, dtype=torch.int32)
-    cos = torch.randn(4096, rotary_dim, device=device, dtype=torch.bfloat16)
-    sin = torch.randn(4096, rotary_dim, device=device, dtype=torch.bfloat16)
+    positions = torch.randint(0, max_pos, (num_tokens,), device=device, dtype=torch.int32)
+    cos, sin = _build_cos_sin_cache(max_pos, rotary_pairs, THETA_DSA, device)
 
     q_ref, k_ref, _ = _reference_qknorm_rope(
         qkv.clone(),
         q_weight,
         k_weight,
+        cos,
+        sin,
         positions,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
