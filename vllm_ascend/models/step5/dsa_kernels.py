@@ -2686,9 +2686,13 @@ details of that contract are worth stating up front because none is guessable:
 """
 
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as al
+import triton.extension.buffer.language as bl
 
 REGION_VALID_SHIFT = tl.constexpr(24)
 REGION_ID_MASK = tl.constexpr((1 << 24) - 1)
@@ -2893,6 +2897,180 @@ def _sparse_attn_prefill_kernel(
     )
 
 
+@triton.jit
+def _sparse_attn_prefill_l1_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    packed_ptr,
+    counts_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_k_token,
+    stride_k_group,
+    stride_v_token,
+    stride_v_group,
+    stride_packed_row,
+    stride_out_token,
+    stride_out_head,
+    stride_lse_token,
+    softmax_scale,
+    total_q,
+    topk: tl.constexpr,
+    heads_per_group: tl.constexpr,
+    head_dim: tl.constexpr,
+    region_size: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+) -> None:
+    """Same attention as ``_sparse_attn_prefill_kernel``, gathering K/V into L1.
+
+    Two things differ, and both matter about equally.
+
+    The per-region gather is replaced by ``sparse_gather_load_to_l1cache``, which lands
+    the selected regions in L1 in zN and merges runs of neighbouring region ids into one
+    MTE2 descriptor. That halves the GM read the compiler's own per-region staging costs
+    -- but only for a sorted region list, since a run is only visible when consecutive
+    slots hold consecutive ids. The metadata contract requires that order.
+
+    The QK mmad then has to emit ``scores`` as ``[BLOCK_H, T]``, not its transpose. The
+    tile is the zN of ``K[T, D]``, so the mmad that consumes it without any repacking is
+    ``K[T,D] @ Q^T[D,H]`` -- which yields ``[T, H]``, and that shape is expensive twice
+    over: fixpipe out of L0C bursts one output row at a time, so it issues T bursts of
+    H*4 = 64 B where the other orientation issues H bursts of T*4, and a 64 B row against
+    a 256 B vector register runs every elementwise softmax op at a quarter width. Both
+    costs scale with T, so a taller tile cannot amortise them. Transposing the result
+    afterwards fixes the vector side but not fixpipe. Transposing the *operand* fixes
+    both, and is free: the cube's L1 -> L0B load transposes on the way in.
+    """
+    query = tl.program_id(0)
+    group = tl.program_id(1)
+    row = group * total_q + query
+    count = tl.load(counts_ptr + row).to(tl.int32)
+
+    heads = tl.arange(0, BLOCK_H)
+    dims = tl.arange(0, BLOCK_D)
+    head_ok = heads < heads_per_group
+    tile_ok = head_ok[:, None]
+
+    queries = tl.load(
+        q_ptr
+        + query * stride_q_token
+        + (group * heads_per_group + heads)[:, None] * stride_q_head
+        + dims[None, :],
+        mask=tile_ok,
+        other=0.0,
+    )
+
+    running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    offsets_in_region = tl.arange(0, region_size)
+
+    upper = tl.minimum(count, topk)
+
+    D1: tl.constexpr = BLOCK_D // 16
+    T1: tl.constexpr = (BLOCK_R * region_size) // 16
+
+    for base in tl.range(0, upper, BLOCK_R):
+        keys_l1 = bl.alloc(
+            k_ptr.dtype.element_ty, [D1, T1, 16, 16], al.ascend_address_space.L1
+        )
+
+        slots = base + tl.arange(0, BLOCK_R)
+        slot_ok = slots < count
+        meta = tl.load(
+            packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
+        )
+        valid = meta >> REGION_VALID_SHIFT
+
+        al.sparse_gather_load_to_l1cache(
+            k_ptr + group * stride_k_group,
+            packed_ptr + row * stride_packed_row + base,
+            keys_l1,
+            block_r=BLOCK_R,
+            valid_region_count=count - base,
+            region_size=region_size,
+            dim_size=BLOCK_D,
+            stride_token=stride_k_token,
+            region_valid_shift=REGION_VALID_SHIFT,
+            region_id_mask=REGION_ID_MASK,
+        )
+
+        keys_tile = bl.to_tensor(keys_l1, writable=False, keep_address_space=True)
+
+        invalid_sign = ((valid - 1)[:, None] - offsets_in_region[None, :]) >> 31
+        token_bias = tl.reshape(
+            (invalid_sign << 23).to(tl.float32, bitcast=True),
+            (BLOCK_R * region_size,),
+        )
+
+        scores = al.dot(
+            queries,
+            keys_tile,
+            format_a="nd",
+            format_b="fractal",
+            format_c="nd",
+            transpose_b=True,
+        ) * softmax_scale
+        scores = scores + token_bias[None, :]
+
+        tile_max = tl.maximum(
+            running_max,
+            tl.max(scores, axis=1, propagate_nan=True),
+            propagate_nan=tl.PropagateNan.ALL,
+        )
+        empty = tile_max == NEGATIVE_INFINITY
+        shift = tl.where(empty, 0.0, tile_max)
+        rescale = tl.where(empty, 1.0, tl.exp(running_max - shift))
+
+        probabilities = tl.exp(scores - shift[:, None])
+        running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
+        values_l1 = bl.alloc(
+            v_ptr.dtype.element_ty, [D1, T1, 16, 16], al.ascend_address_space.L1
+        )
+        al.sparse_gather_load_to_l1cache(
+            v_ptr + group * stride_v_group,
+            packed_ptr + row * stride_packed_row + base,
+            values_l1,
+            block_r=BLOCK_R,
+            valid_region_count=count - base,
+            region_size=region_size,
+            dim_size=BLOCK_D,
+            stride_token=stride_v_token,
+            region_valid_shift=REGION_VALID_SHIFT,
+            region_id_mask=REGION_ID_MASK,
+        )
+        accumulator = accumulator * rescale[:, None] + al.dot(
+            probabilities.to(v_ptr.dtype.element_ty),
+            bl.to_tensor(values_l1, writable=False, keep_address_space=True),
+            format_a="nd",
+            format_b="fractal",
+            format_c="nd",
+        )
+        running_max = tile_max
+
+    selected = running_sum > 0
+    output = tl.where(selected[:, None], accumulator / running_sum[:, None], 0.0)
+    tl.store(
+        out_ptr
+        + query * stride_out_token
+        + (group * heads_per_group + heads)[:, None] * stride_out_head
+        + dims[None, :],
+        output.to(out_ptr.dtype.element_ty),
+        mask=tile_ok,
+    )
+    tl.store(
+        lse_ptr + query * stride_lse_token + group * heads_per_group + heads,
+        tl.where(selected, running_max + tl.log(running_sum), NEGATIVE_INFINITY),
+        mask=head_ok,
+    )
+
+
 def sparse_attention_prefill(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -2903,7 +3081,7 @@ def sparse_attention_prefill(
     num_kv_groups: int,
     region_size: int = 8,
     softmax_scale: float | None = None,
-    block_regions: int | None = 16,
+    block_regions: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse attention over per-query selected regions.
 
@@ -2916,9 +3094,9 @@ def sparse_attention_prefill(
             each slot ``phys_region | (valid_tokens << 24)``, ``-1`` padding the tail.
         region_counts: ``[num_kv_groups * total_q]`` int32, how many slots to read. This
             truncates *positionally* -- it does not re-select by score.
-        block_regions: Deprecated compatibility option. When provided, it is converted
-            to ``block_regions * region_size`` tokens. Do not set it together with a
-            non-default ``block_tokens`` value.
+        block_regions: Region slots one loop iteration covers, i.e. the tile height in
+            ``block_regions * region_size`` tokens. Left unset it is chosen per gather
+            path and per launch size; see the resolution below.
 
     Returns:
         ``(out, lse)`` shaped ``[total_q, num_heads, head_dim]`` and
@@ -2950,11 +3128,29 @@ def sparse_attention_prefill(
     topk = int(packed_regions.shape[1])
     scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
 
-    block_regions = min(topk, 16)
-
     out = torch.empty_like(query)
     lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
-    _sparse_attn_prefill_kernel[(total_q, num_kv_groups)](
+
+    gather = os.environ.get("SPARSE_ATTN_GATHER", "l1").lower()
+    if gather not in ("ub", "l1"):
+        raise ValueError(f"SPARSE_ATTN_GATHER must be 'ub' or 'l1', got {gather!r}")
+    on_l1 = gather == "l1"
+    kernel = _sparse_attn_prefill_l1_kernel if on_l1 else _sparse_attn_prefill_kernel
+
+    latency_bound = total_q * num_kv_groups < 2048
+    block_regions = min(topk, 16 if not on_l1 or latency_bound else 32)
+
+    override = os.environ.get("SPARSE_ATTN_BLOCK_R")
+    if override:
+        block_regions = min(topk, int(override))
+
+    if on_l1 and (head_dim % 16 or (block_regions * region_size) % 16):
+        raise ValueError(
+            f"l1 gather needs head_dim and block_regions*region_size to be multiples "
+            f"of 16, got {head_dim} and {block_regions * region_size}"
+        )
+
+    kernel[(total_q, num_kv_groups)](
         query,
         key_cache,
         value_cache,
@@ -2982,8 +3178,7 @@ def sparse_attention_prefill(
         BLOCK_D=head_dim,
         BLOCK_R=block_regions,
         enable_dynamic_cv_pipeline=False,
-        set_workspace_multibuffer=1,
-        enable_preload=False,
+        enable_preload=True,
     )
     return out, lse
 
