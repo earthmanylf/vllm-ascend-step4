@@ -3094,8 +3094,7 @@ def _sparse_attn_decode_kernel(
     heads = tl.arange(0, BLOCK_H)
     dims = tl.arange(0, BLOCK_D)
     head_ok = heads < heads_per_group
-    dim_ok = dims < head_dim
-    tile_ok = head_ok[:, None] & dim_ok[None, :]
+    tile_ok = head_ok[:, None]
 
     queries = tl.load(
         q_ptr
@@ -3112,43 +3111,80 @@ def _sparse_attn_decode_kernel(
 
     offsets_in_region = tl.arange(0, region_size)
     window_begin = split * slots_per_split
-    for base in tl.range(window_begin, window_begin + slots_per_split, BLOCK_R):
+    window_end = window_begin + slots_per_split
+    upper = tl.minimum(window_end, tl.minimum(count, topk))
+    for base in tl.range(window_begin, upper, BLOCK_R):
         slots = base + tl.arange(0, BLOCK_R)
-        slot_ok = (slots < count) & (slots < topk)
+        slot_ok = (slots < window_end) & (slots < count) & (slots < topk)
         meta = tl.load(
             packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
         )
-        physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
         start_token = meta & DECODE_LOW_MASK
-        valid = tl.minimum(tl.maximum(kv_seqlen - start_token, 0), region_size)
-        live = slot_ok & (valid > 0)
+        valid = tl.minimum(
+            tl.maximum(kv_seqlen - start_token, 0), region_size
+        ).to(tl.int32)
 
-        # ``physical`` is a sentinel-sized integer on dead slots, so it must be
-        # neutralised before it becomes an address -- masking the load is not enough,
-        # since the pointer arithmetic itself would overflow.
-        safe_physical = tl.where(live, physical, 0)
-        tokens = tl.reshape(
-            safe_physical[:, None] * region_size + offsets_in_region[None, :],
-            (BLOCK_R * region_size,),
+        keys = tl.zeros(
+            (BLOCK_R * region_size, BLOCK_D), dtype=k_ptr.dtype.element_ty
         )
-        token_ok = tl.reshape(
-            live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
-            (BLOCK_R * region_size,),
+        values = tl.zeros(
+            (BLOCK_R * region_size, BLOCK_D), dtype=v_ptr.dtype.element_ty
         )
+        for page_iter in tl.extra.cann.extension.parallel(0, BLOCK_R):
+            page_slot = base + page_iter
+            page_slot_ok = (page_slot < window_end) & (page_slot < count) & (page_slot < topk)
+            page_meta = tl.load(
+                packed_ptr + row * stride_packed_row + page_slot,
+                mask=page_slot_ok,
+                other=-1,
+            )
+            page_start_token = page_meta & DECODE_LOW_MASK
+            page_valid = tl.minimum(tl.maximum(kv_seqlen - page_start_token, 0), region_size)
+            page_live = page_slot_ok & (page_valid > 0)
+            page_physical = tl.where(
+                page_live, (page_meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK, 0
+            )
+            page_tokens = page_physical * region_size + offsets_in_region
+            page_token_ok = offsets_in_region < tl.where(page_live, page_valid, 0)
+            key_slice = tl.load(
+                k_ptr
+                + page_tokens[:, None] * stride_k_token
+                + group * stride_k_group
+                + dims[None, :],
+                mask=page_token_ok[:, None],
+                other=0.0,
+            )
+            keys = tl.extra.cann.extension.insert_slice(
+                keys,
+                key_slice,
+                offsets=(page_iter * region_size, 0),
+                sizes=(region_size, BLOCK_D),
+                strides=(1, 1),
+            )
 
-        keys = tl.load(
-            k_ptr + tokens[:, None] * stride_k_token + group * stride_k_group + dims[None, :],
-            mask=token_ok[:, None] & dim_ok[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_ptr + tokens[:, None] * stride_v_token + group * stride_v_group + dims[None, :],
-            mask=token_ok[:, None] & dim_ok[None, :],
-            other=0.0,
-        )
+            value_slice = tl.load(
+                v_ptr
+                + page_tokens[:, None] * stride_v_token
+                + group * stride_v_group
+                + dims[None, :],
+                mask=page_token_ok[:, None],
+                other=0.0,
+            )
+            values = tl.extra.cann.extension.insert_slice(
+                values,
+                value_slice,
+                offsets=(page_iter * region_size, 0),
+                sizes=(region_size, BLOCK_D),
+                strides=(1, 1),
+            )
 
         scores = tl.dot(queries, tl.trans(keys), out_dtype=tl.float32) * softmax_scale
-        scores = tl.where(token_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY)
+        invalid_sign = ((valid - 1)[:, None] - offsets_in_region[None, :]) >> 31
+        token_bias = tl.reshape(
+            (invalid_sign << 23).to(tl.float32, bitcast=True),
+            (BLOCK_R * region_size,),
+        )
+        scores = scores + token_bias[None, :]
 
         tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
         empty = tile_max == NEGATIVE_INFINITY
@@ -3157,6 +3193,7 @@ def _sparse_attn_decode_kernel(
 
         probabilities = tl.exp(scores - shift[:, None])
         running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
+
         accumulator = accumulator * rescale[:, None] + tl.dot(
             probabilities.to(values.dtype), values, out_dtype=tl.float32
         )
@@ -3199,7 +3236,9 @@ def _merge_split_states_kernel(
     stride_out_head,
     stride_lse_token,
     num_splits,
+    num_heads,
     head_dim: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ) -> None:
@@ -3213,48 +3252,68 @@ def _merge_split_states_kernel(
     ``lse = -inf`` rather than ``0/0``.
     """
     token = tl.program_id(0)
-    head = tl.program_id(1)
+    head_block = tl.program_id(1)
 
+    heads = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
     splits = tl.arange(0, BLOCK_S)
     dims = tl.arange(0, BLOCK_D)
+    head_ok = heads < num_heads
     split_ok = splits < num_splits
     dim_ok = dims < head_dim
 
     partial_lse = tl.load(
-        partial_lse_ptr + splits * stride_pl_split + token * stride_pl_token + head,
-        mask=split_ok,
+        partial_lse_ptr
+        + splits[:, None] * stride_pl_split
+        + token * stride_pl_token
+        + heads[None, :],
+        mask=split_ok[:, None] & head_ok[None, :],
         other=NEGATIVE_INFINITY,
     )
-    peak = tl.max(partial_lse)
+    peak = tl.max(partial_lse, axis=0)
     empty = peak == NEGATIVE_INFINITY
     shift = tl.where(empty, 0.0, peak)
-    weights = tl.where(split_ok, tl.exp(partial_lse - shift), 0.0)
-    total = tl.sum(weights)
+    weights = tl.where(
+        split_ok[:, None] & head_ok[None, :],
+        tl.exp(partial_lse - shift[None, :]),
+        0.0,
+    )
+    total = tl.sum(weights, axis=0)
 
     states = tl.load(
         partial_out_ptr
-        + splits[:, None] * stride_po_split
+        + splits[:, None, None] * stride_po_split
         + token * stride_po_token
-        + head * stride_po_head
-        + dims[None, :],
-        mask=split_ok[:, None] & dim_ok[None, :],
+        + heads[None, :, None] * stride_po_head
+        + dims[None, None, :],
+        mask=(
+            split_ok[:, None, None]
+            & head_ok[None, :, None]
+            & dim_ok[None, None, :]
+        ),
         other=0.0,
     ).to(tl.float32)
-    merged = tl.sum(states * weights[:, None], axis=0) / tl.maximum(total, 1.0e-20)
+    merged = tl.sum(states * weights[:, :, None], axis=0) / tl.maximum(
+        total[:, None], 1.0e-20
+    )
 
     tl.store(
-        out_ptr + token * stride_out_token + head * stride_out_head + dims,
+        out_ptr
+        + token * stride_out_token
+        + heads[:, None] * stride_out_head
+        + dims[None, :],
         merged.to(out_ptr.dtype.element_ty),
-        mask=dim_ok,
+        mask=head_ok[:, None] & dim_ok[None, :],
     )
     tl.store(
-        lse_ptr + token * stride_lse_token + head,
+        lse_ptr + token * stride_lse_token + heads,
         tl.where(empty, NEGATIVE_INFINITY, shift + tl.log(total)),
+        mask=head_ok,
     )
 
 
 def merge_split_states(
-    partial_out: torch.Tensor, partial_lse: torch.Tensor
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reduce ``[splits, tokens, heads, dim]`` partial states to ``[tokens, heads, dim]``.
 
@@ -3266,9 +3325,15 @@ def merge_split_states(
     uniform split and pays a little occupancy for a much simpler contract.
     """
     num_splits, tokens, num_heads, head_dim = partial_out.shape
+    if partial_lse.shape != (num_splits, tokens, num_heads):
+        raise ValueError(
+            "partial_lse shape mismatch: expected "
+            f"{(num_splits, tokens, num_heads)}, got {tuple(partial_lse.shape)}"
+        )
+    block_heads = 32 // triton.cdiv(triton.next_power_of_2(num_splits), 8)
     out = torch.empty((tokens, num_heads, head_dim), device=partial_out.device, dtype=partial_out.dtype)
     lse = torch.empty((tokens, num_heads), device=partial_out.device, dtype=torch.float32)
-    _merge_split_states_kernel[(tokens, num_heads)](
+    _merge_split_states_kernel[(tokens, triton.cdiv(num_heads, block_heads))](
         partial_out,
         partial_lse,
         out,
@@ -3282,9 +3347,11 @@ def merge_split_states(
         out.stride(1),
         lse.stride(0),
         num_splits,
+        num_heads,
         head_dim=head_dim,
+        BLOCK_H=block_heads,
         BLOCK_S=triton.next_power_of_2(num_splits),
-        BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_D=head_dim,
     )
     return out, lse
 
@@ -3301,7 +3368,7 @@ def sparse_attention_decode(
     region_size: int = 8,
     softmax_scale: float | None = None,
     num_splits: int = 1,
-    block_regions: int = 16,
+    block_regions: int | None = 16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse attention for one query token per request.
 
@@ -3317,6 +3384,14 @@ def sparse_attention_decode(
         num_splits: split the slot window this many ways and return partial states. With
             ``num_splits == 1`` the returned tensors are already the final result;
             otherwise pass them to :func:`merge_split_states`.
+        block_regions: Deprecated compatibility option. When provided, it is converted
+            to ``block_regions * region_size`` tokens. Do not set it together with a
+            non-default ``block_tokens`` value.
+        block_tokens: Number of selected KV tokens processed by one online-softmax
+            iteration. Set this directly (for example 16, 32, or 64) to cap the K/V and
+            score temporaries held in NPU UB. It must be a power of two and at least 16.
+            Fused K/V gather keeps both [block_tokens, head_dim] buffers live across QK;
+            reduce block_tokens if this exceeds the device's UB capacity.
 
     Returns:
         ``num_splits == 1``: ``(out [num_reqs, num_heads, head_dim], lse [num_reqs, num_heads])``.
@@ -3325,6 +3400,8 @@ def sparse_attention_decode(
     As in prefill, the selected regions must be distinct. The upstream decode reference is
     stricter about this than the prefill one: it concatenates the gathered spans with no
     dedup at all, so a duplicated region would be counted twice in the softmax.
+    K/V token and group strides are honored, so a group-major cache may be supplied
+    as a transposed [tokens, groups, dim] view without copying (dim must be contiguous).
     """
     num_reqs, num_heads, head_dim = query.shape
     if num_heads % num_kv_groups:
@@ -3341,8 +3418,9 @@ def sparse_attention_decode(
     heads_per_group = num_heads // num_kv_groups
     topk = int(packed_regions.shape[1])
     scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
-    # Every split walks the same number of slots so the window bound is a constexpr; the
-    # tail split simply finds every slot masked out.
+    if num_splits <= 0:
+        raise ValueError(f"num_splits must be positive, got {num_splits}")
+
     slots_per_split = -(-topk // num_splits)
 
     out = torch.empty((num_splits, num_reqs, num_heads, head_dim), device=query.device, dtype=query.dtype)
@@ -3376,14 +3454,15 @@ def sparse_attention_decode(
         region_size=region_size,
         slots_per_split=slots_per_split,
         BLOCK_H=max(16, triton.next_power_of_2(heads_per_group)),
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        BLOCK_R=min(block_regions, triton.next_power_of_2(slots_per_split)),
-        num_stages=1,
+        BLOCK_D=head_dim,
+        BLOCK_R=block_regions,
+        enable_dynamic_cv_pipeline=False,
+        set_workspace_multibuffer=1,
+        enable_preload=False,
     )
     if num_splits == 1:
         return out[0], lse[0]
     return out, lse
-
 assert (
     DECODE_PHYS_SHIFT.value == _MERGED_DECODE_PHYS_SHIFT.value == 32
 ), "merged DSA modules disagree on DECODE_PHYS_SHIFT"
