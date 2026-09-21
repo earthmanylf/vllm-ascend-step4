@@ -51,20 +51,20 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 
+from vllm_ascend.models.step5.block_sparse_attention import (
+    step4_block_sparse_attention_decode,
+    step4_block_sparse_attention_prefill,
+)
 from vllm_ascend.models.step5.dsa_kernels import (
     decode_sparse_meta,
     indexer_logits_paged,
     prefill_sparse_meta,
-    sparse_attention_decode,
-    sparse_attention_prefill,
 )
 from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache
 from vllm_ascend.models.step5.summary_kernels import (
     build_decode_summary_layout_step3p5,
     csa_compact_decode_update,
     csa_compact_prefill_update,
-    csa_deferred_flush,
-    csa_verify_stage_update,
 )
 
 logger = init_logger(__name__)
@@ -1001,7 +1001,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
         )
-        out, _ = sparse_attention_decode(
+        out, _ = step4_block_sparse_attention_decode(
             query,
             key_flat,
             value_flat,
@@ -1010,8 +1010,9 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             seq_lens_i32,
             num_kv_groups=groups,
             region_size=self.region_size,
+            page_size=self.block_size,
             softmax_scale=self.scale,
-            block_regions=16,
+
         )
         output[:n] = out.to(output.dtype)
 
@@ -1086,7 +1087,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
         )
-        out, _ = sparse_attention_decode(
+        out, _ = step4_block_sparse_attention_decode(
             query,
             key_flat,
             value_flat,
@@ -1095,8 +1096,9 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             row_kv_seqlens,
             num_kv_groups=groups,
             region_size=self.region_size,
+            page_size=self.block_size,
             softmax_scale=self.scale,
-            block_regions=16,
+
         )
         output[:total] = out.to(output.dtype)
 
@@ -1219,7 +1221,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
         )
-        out, _ = sparse_attention_prefill(
+        out, _ = step4_block_sparse_attention_prefill(
             query,
             key_flat,
             value_flat,
@@ -1227,8 +1229,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             counts,
             num_kv_groups=groups,
             region_size=self.region_size,
+            page_size=self.block_size,
             softmax_scale=self.scale,
-            block_regions=2,
         )
         output[token_offset : token_offset + num_query_tokens] = out.to(output.dtype)
 
