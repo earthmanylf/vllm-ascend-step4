@@ -46,10 +46,14 @@ class AscendStep4SparseSummaryCache(Step4SparseSummaryCache):
     and the slot's numerator/denominator/max/staging state in one launch.
     """
 
-    def reset_blocks(self, block_ids: torch.Tensor | list[int]) -> None:
-        self.reset_scheduler_blocks(block_ids)
+    def reset_blocks(
+        self, block_ids: torch.Tensor | list[int], *, clear_mean: bool = True
+    ) -> None:
+        self.reset_scheduler_blocks(block_ids, clear_mean=clear_mean)
 
-    def reset_scheduler_blocks(self, block_ids: torch.Tensor | list[int]) -> None:
+    def reset_scheduler_blocks(
+        self, block_ids: torch.Tensor | list[int], *, clear_mean: bool = True
+    ) -> None:
         device = self.mean_cache.device
         if isinstance(block_ids, torch.Tensor):
             ids = block_ids
@@ -99,6 +103,7 @@ class AscendStep4SparseSummaryCache(Step4SparseSummaryCache):
             summaries_per_page=int(self.summaries_per_page),
             proxy_dim=int(self.proxy_dim),
             region_block_size=int(self.region_block_size),
+            clear_mean=clear_mean,
         )
 
     def warmup_scheduler_block_reset(self) -> None:
@@ -127,12 +132,20 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
         from vllm.distributed.kv_transfer import has_kv_transfer_group
 
         if has_kv_transfer_group():
-            raise RuntimeError(
-                "Step4 DSA sparse summary side storage is not compatible with "
-                "v1 KV transfer/offload yet. Disable kv_transfer_config for "
-                "Step4, or use a connector implementation that explicitly "
-                "transfers the summary sidecar."
+            from vllm.config import get_current_vllm_config
+            _cfg = get_current_vllm_config()
+            _is_decode_bench = (
+                _cfg.kv_transfer_config is not None
+                and _cfg.kv_transfer_config.kv_connector
+                in ("DecodeBenchConnector", "PreFilledDecodeBenchConnector")
             )
+            if not _is_decode_bench:
+                raise RuntimeError(
+                    "Step4 DSA sparse summary side storage is not compatible with "
+                    "v1 KV transfer/offload yet. Disable kv_transfer_config for "
+                    "Step4, or use a connector implementation that explicitly "
+                    "transfers the summary sidecar."
+                )
         self._ensure_shared_scratch_workspace(forward_context)
 
         owner_layer = forward_context.get(self._main_layer_name)
@@ -215,6 +228,32 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
         cache.blocks_per_scheduler_block = 1
         cache.warmup_scheduler_block_reset()
         self._budget_only_cache = cache
+        if has_kv_transfer_group() and _is_decode_bench:
+            import torch as _torch
+            _fill_mean = 0.015
+            try:
+                _kt_cfg = _cfg.kv_transfer_config
+                _fill_mean = float(
+                    _kt_cfg.get_from_extra_config("fill_mean", 0.015)
+                )
+            except Exception:
+                pass
+            with _torch.no_grad():
+                fp16_vals = _torch.full(
+                    cache.mean_cache.shape,
+                    _fill_mean,
+                    dtype=_torch.float16,
+                    device=cache.mean_cache.device,
+                ).to(_torch.float8_e4m3fn)
+                cache.mean_cache.view(_torch.uint8).copy_(
+                    fp16_vals.view(_torch.uint8)
+                )
+            logger.info_once(
+                "DecodeBenchConnector: filled summary mean_cache with "
+                "dummy fp8 values (mean=%.6f, shape=%s)",
+                _fill_mean,
+                tuple(cache.mean_cache.shape),
+            )
         logger.info_once(
             "Allocated Step4 sparse summary cache side storage: "
             "pages_per_layer=%d payload_bytes_per_page=%d "
