@@ -67,7 +67,7 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
         # group_id -> side-storage zero hooks, mirroring the upstream
-        # KVBlockZeroer collection (e.g. Step4 DSA summary sidecar reset).
+        # KVBlockZeroer collection (e.g. Step5 DSA summary sidecar reset).
         self._side_storage_zero_hooks: dict[int, list[Any]] = {}
 
     def _collect_side_storage_zero_hooks(
@@ -212,7 +212,7 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         """Zero the KV cache memory for the given block IDs.
 
         ``block_ids_by_group`` carries the scheduler's per-KV-group split;
-        side-storage layers (e.g. the Step4 DSA summary sidecar) are reset
+        side-storage layers (e.g. the Step5 DSA summary sidecar) are reset
         through their registered hooks with their owner group's share.
         """
         if block_ids and self._meta is not None:

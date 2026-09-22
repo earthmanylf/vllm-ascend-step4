@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ascend Step-4 MTP draft model.
 
-The upstream ``Step4MTP`` is CUDA-only (its ``__init__`` raises on
+The upstream ``Step5MTP`` is CUDA-only (its ``__init__`` raises on
 non-CUDA platforms and its predictor blocks build the CUDA
-``Step4DecoderLayer``).  This fork keeps the upstream wire format and
+``Step5DecoderLayer``).  This fork keeps the upstream wire format and
 interfaces (``forward``/``compute_logits``/``get_top_tokens``/``load_weights``
 are all inherited untouched) and only re-creates the ``__init__`` paths so
-the draft transformer block runs through ``AscendStep4DecoderLayer`` --
+the draft transformer block runs through ``AscendStep5DecoderLayer`` --
 i.e. the platform Ascend attention backends plus the NPU MoE/rope fixes
 already proven on the target model.  The MTP layer is a dense sliding
 layer, so it lands on the platform sliding-window backend, not DSA.
@@ -25,24 +25,24 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.models.step4.mtp import (
-    SharedHead,
-    Step4MTP,
-    Step4MultiTokenPredictor,
-    Step4MultiTokenPredictorLayer,
+from vllm.models.step5.mtp import (
+    Step5MTPSharedHead,
+    Step5MTP,
+    Step5MultiTokenPredictor,
+    Step5MultiTokenPredictorLayer,
     _build_mtp_norm,
     _get_mtp_config,
     _get_mtp_vllm_config,
-    _get_step4_mtp_moe_blocks,
+    _get_step5_mtp_moe_blocks,
     _require_resolved_valid_vocab_size,
-    _set_step4_moe_protocol_metadata,
+    _set_step5_moe_protocol_metadata,
 )
 from vllm.model_executor.models.utils import maybe_prefix
 
-from vllm_ascend.models.step4.model import AscendStep4DecoderLayer
+from vllm_ascend.models.step5.model import AscendStep5DecoderLayer
 
 
-class AscendStep4MultiTokenPredictorLayer(Step4MultiTokenPredictorLayer):
+class AscendStep5MultiTokenPredictorLayer(Step5MultiTokenPredictorLayer):
     """Upstream predictor layer with the draft block swapped to Ascend."""
 
     def __init__(
@@ -51,7 +51,7 @@ class AscendStep4MultiTokenPredictorLayer(Step4MultiTokenPredictorLayer):
         prefix: str,
     ) -> None:
         # Bypass the parent __init__: it hardcodes the CUDA
-        # Step4DecoderLayer.  Everything else mirrors it verbatim so
+        # Step5DecoderLayer.  Everything else mirrors it verbatim so
         # module/parameter names stay checkpoint-compatible.
         nn.Module.__init__(self)
         # The parent's @support_torch_compile wrapper reads this attribute
@@ -67,16 +67,16 @@ class AscendStep4MultiTokenPredictorLayer(Step4MultiTokenPredictorLayer):
         self.eh_proj = nn.Linear(
             config.hidden_size * 2, config.hidden_size, bias=False
         )
-        self.shared_head = SharedHead(
+        self.shared_head = Step5MTPSharedHead(
             config=config, quant_config=quant_config, prefix=f"{prefix}.shared_head"
         )
-        self.mtp_block = AscendStep4DecoderLayer(
+        self.mtp_block = AscendStep5DecoderLayer(
             mtp_vllm_config,
             prefix=f"{prefix}.mtp_block",
         )
 
 
-class AscendStep4MultiTokenPredictor(Step4MultiTokenPredictor):
+class AscendStep5MultiTokenPredictor(Step5MultiTokenPredictor):
     """Upstream predictor whose layers use the Ascend draft blocks."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -90,13 +90,13 @@ class AscendStep4MultiTokenPredictor(Step4MultiTokenPredictor):
         self.num_mtp_layers = config.num_nextn_predict_layers
         if self.num_mtp_layers <= 0:
             raise ValueError(
-                "Step4 MTP requires num_nextn_predict_layers > 0, got "
+                "Step5 MTP requires num_nextn_predict_layers > 0, got "
                 f"{self.num_mtp_layers}."
             )
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
-                str(idx): AscendStep4MultiTokenPredictorLayer(
+                str(idx): AscendStep5MultiTokenPredictorLayer(
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.layers.{idx}",
                 )
@@ -115,11 +115,11 @@ class AscendStep4MultiTokenPredictor(Step4MultiTokenPredictor):
         )
 
 
-class AscendStep4MTP(Step4MTP):
-    """Step4MTP for Ascend: same wire format, Ascend draft decoder layer."""
+class AscendStep5MTP(Step5MTP):
+    """Step5MTP for Ascend: same wire format, Ascend draft decoder layer."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # Bypass Step4MTP.__init__ (raises on non-CUDA platforms); the body
+        # Bypass Step5MTP.__init__ (raises on non-CUDA platforms); the body
         # below replicates it with the Ascend predictor.
         nn.Module.__init__(self)
         self.config = _get_mtp_config(vllm_config)
@@ -127,15 +127,15 @@ class AscendStep4MTP(Step4MTP):
         _require_resolved_valid_vocab_size(
             _get_mtp_vllm_config(vllm_config).model_config
         )
-        self.model = AscendStep4MultiTokenPredictor(
+        self.model = AscendStep5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        moe_blocks = _get_step4_mtp_moe_blocks(self.model)
+        moe_blocks = _get_step5_mtp_moe_blocks(self.model)
         # Expose the actual draft topology so dense MTP forwards do not
         # inherit the target model's DP collectives.
         self.is_dense_mtp = not moe_blocks
         self.moe_layers = [moe.experts for moe in moe_blocks]
-        _set_step4_moe_protocol_metadata(
+        _set_step5_moe_protocol_metadata(
             self,
             moe_blocks[0] if moe_blocks else None,
         )

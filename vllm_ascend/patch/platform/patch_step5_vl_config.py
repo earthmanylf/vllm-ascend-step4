@@ -17,23 +17,23 @@
 from typing import Any
 
 from vllm.transformers_utils.config import _CONFIG_REGISTRY
-from vllm.transformers_utils.configs.step4 import Step4Config
+from vllm.transformers_utils.configs.step5 import Step5Config
 
 
-class Step4VLConfig(Step4Config):
-    """Config for Step4 vision-language wrapper checkpoints (``model_type="step4_vl"``).
+class Step5VLConfig(Step5Config):
+    """Config for Step5 vision-language wrapper checkpoints (``model_type="step5_vl"``).
 
     The published wrapper config nests the text backbone parameters under
-    ``text_config`` while vLLM's Step4 implementation expects the flat
-    ``Step4Config`` layout, so the nested mapping is flattened with
+    ``text_config`` while vLLM's Step5 implementation expects the flat
+    ``Step5Config`` layout, so the nested mapping is flattened with
     ``text_config`` taking precedence over wrapper-level fields. Wrapper-only
     fields (``vision_config`` etc.) survive as plain attributes and do not
     affect the text inference path. After flattening, the instance reports
-    ``model_type == "step4"`` and ``architectures == ["Step4ForCausalLM"]``,
-    making it equivalent to the flat Step4 checkpoints.
+    ``model_type == "step5"`` and ``architectures == ["Step5ForCausalLM"]``,
+    making it equivalent to the flat Step5 checkpoints.
     """
 
-    model_type = "step4_vl"
+    model_type = "step5_vl"
 
     def __init__(self, text_config: dict[str, Any] | None = None, **kwargs: Any) -> None:
         if isinstance(text_config, dict):
@@ -41,8 +41,8 @@ class Step4VLConfig(Step4Config):
         super().__init__(**kwargs)
 
 
-# `step4_vl` is not registered in vLLM's `model_type` lookup table, so loading
-# a Step4 VL wrapper checkpoint fails to resolve the config. Insert the class
+# `step5_vl` is not registered in vLLM's `model_type` lookup table, so loading
+# a Step5 VL wrapper checkpoint fails to resolve the config. Insert the class
 # directly: the registry is a `LazyConfigDict` whose values may be either a
 # module attribute name or the class itself.
-_CONFIG_REGISTRY["step4_vl"] = Step4VLConfig
+_CONFIG_REGISTRY["step5_vl"] = Step5VLConfig

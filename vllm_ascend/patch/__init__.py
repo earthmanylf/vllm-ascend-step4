@@ -186,27 +186,27 @@
 #       model types or resolves MLA from the config contents instead of a
 #       model_type whitelist.
 #
-# ** 7b. File: platform/patch_step4_vl_config.py**
+# ** 7b. File: platform/patch_step5_vl_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.transformers_utils.config._CONFIG_REGISTRY`
 #    Why:
-#       Step4 vision-language wrapper checkpoints (`Step-4-new-2609-*`) ship a
-#       nested config with `model_type="step4_vl"` that is not in vLLM's
+#       Step5 vision-language wrapper checkpoints (`Step-4-new-2609-*`) ship a
+#       nested config with `model_type="step5_vl"` that is not in vLLM's
 #       `model_type` lookup table, so `AutoConfig` cannot resolve it and
 #       `ModelConfig` creation fails before the server starts.
 #    How：
-#       Register `Step4VLConfig` (a `Step4Config` subclass) under `step4_vl`.
+#       Register `Step5VLConfig` (a `Step5Config` subclass) under `step5_vl`.
 #       Its `__init__` flattens the nested `text_config` mapping into the top
 #       level with `text_config` taking precedence, so the parsed instance is
-#       equivalent to the flat Step4 checkpoints (`model_type == "step4"`,
-#       `architectures == ["Step4ForCausalLM"]`) and routes to the already
-#       registered Step4 model implementation. Wrapper-only fields such as
+#       equivalent to the flat Step5 checkpoints (`model_type == "step5"`,
+#       `architectures == ["Step5ForCausalLM"]`) and routes to the already
+#       registered Step5 model implementation. Wrapper-only fields such as
 #       `vision_config` are kept as plain attributes.
 #    Related PR (if no, explain why):
 #       No, downstream-only wrapper config published with the checkpoints.
 #    Future Plan:
-#       Remove this patch once the supported vLLM version registers `step4_vl`
-#       itself or the checkpoints ship the flat Step4 config layout.
+#       Remove this patch once the supported vLLM version registers `step5_vl`
+#       itself or the checkpoints ship the flat Step5 config layout.
 #
 # ** 8. File: platform/patch_kv_cache_coordinator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -895,7 +895,7 @@
 #       Replace with a new bind_kv_cache.
 #       Skip the raise.
 #       Keep the upstream tail that binds KVCacheSideStorageLayer side
-#       storage (e.g. the Step4 DSA sparse summary sidecar).
+#       storage (e.g. the Step5 DSA sparse summary sidecar).
 #    Related PR (if no, explain why):
 #       It need discuss.
 #    Future Plan:

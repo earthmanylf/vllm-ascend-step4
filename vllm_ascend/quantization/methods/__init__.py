@@ -68,7 +68,7 @@ from .w8a8 import (
     AscendW8A8MXFP8DSDynamicLinearMethod,
     AscendW8A8MXFP8DynamicLinearMethod,
     AscendW8A8PDMixLinearMethod,
-    Step4Fp8BlockFusedMoEMethod,
+    Step5Fp8BlockFusedMoEMethod,
     resolve_block_scales,
 )
 from .wna16 import AscendW4A16FusedMoEMethod, AscendW4A16MXFP4FusedMoEMethod, AscendW8A16LinearMethod
@@ -127,5 +127,5 @@ __all__ = [
     "AscendW4A8MXFPDSDynamicFusedMoEMethod",
     "AscendFp8BlockLinearMethod",
     "AscendFp8BlockFusedMoEMethod",
-    "Step4Fp8BlockFusedMoEMethod",
+    "Step5Fp8BlockFusedMoEMethod",
 ]

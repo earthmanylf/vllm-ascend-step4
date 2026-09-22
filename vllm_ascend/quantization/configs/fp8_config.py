@@ -144,14 +144,14 @@ class AscendDeepseekV4FP8Config(DeepseekV4FP8Config):
         return None
 
 
-class Step4Fp8BlockConfig(AscendFp8Config):
-    """``AscendFp8Config`` routing FusedMoE layers to the Step4 fp8 scheme.
+class Step5Fp8BlockConfig(AscendFp8Config):
+    """``AscendFp8Config`` routing FusedMoE layers to the Step5 fp8 scheme.
 
-    Step4 keeps its checkpoint's fp8 e4m3 weights and 128x128 block scales
-    untouched and executes them with the kernels vendored from the step4-hf
-    reference (see ``Step4Fp8BlockFusedMoEMethod``) instead of resolving to
+    Step5 keeps its checkpoint's fp8 e4m3 weights and 128x128 block scales
+    untouched and executes them with the kernels vendored from the step5-hf
+    reference (see ``Step5Fp8BlockFusedMoEMethod``) instead of resolving to
     bf16 or requantizing to MXFP8. Dense linear layers keep the inherited
-    behaviour; the Step4 model only hands this config to ``FusedMoEFactory``
+    behaviour; the Step5 model only hands this config to ``FusedMoEFactory``
     when the ``VLLM_ASCEND_ENABLE_STEP4_FP8`` env var is set.
     """
 
@@ -165,8 +165,8 @@ class Step4Fp8BlockConfig(AscendFp8Config):
 
         if is_fused_moe_layer(layer):
             self._verify_block_quantization()
-            scheme_class = get_scheme_class(FP8_METHOD, "step4_moe")
-            assert scheme_class is not None, f"No scheme registered for {FP8_METHOD}/step4_moe"
+            scheme_class = get_scheme_class(FP8_METHOD, "step5_moe")
+            assert scheme_class is not None, f"No scheme registered for {FP8_METHOD}/step5_moe"
             return AscendFusedMoEMethod(
                 scheme_class(self.weight_block_size, layer.moe_config),
                 layer.moe_config,

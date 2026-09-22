@@ -250,7 +250,7 @@ def _fused_qknorm_rope_fake(
 from vllm.utils.torch_utils import direct_register_custom_op
 
 direct_register_custom_op(
-    op_name="ascend_step4_fused_qknorm_rope",
+    op_name="ascend_step5_fused_qknorm_rope",
     op_func=_fused_qknorm_rope_impl,
     mutates_args=[],
     fake_impl=_fused_qknorm_rope_fake,
@@ -272,7 +272,7 @@ def fused_qknorm_rope(
     eps: float = EPS,
     norm_weight_bias: float = NORM_WEIGHT_BIAS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.ascend_step4_fused_qknorm_rope(
+    return torch.ops.vllm.ascend_step5_fused_qknorm_rope(
         qkv,
         q_weight,
         k_weight,
@@ -764,7 +764,7 @@ def _fused_indexer_qkz_kv_norm_rope_fake(
 
 
 direct_register_custom_op(
-    op_name="ascend_step4_fused_indexer_norm_rope",
+    op_name="ascend_step5_fused_indexer_norm_rope",
     op_func=_fused_indexer_qkz_kv_norm_rope_impl,
     mutates_args=[],
     fake_impl=_fused_indexer_qkz_kv_norm_rope_fake,
@@ -791,7 +791,7 @@ def fused_indexer_qkz_kv_norm_rope(
     subtract_mean_q: bool = False,
     subtract_mean_k: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.ascend_step4_fused_indexer_norm_rope(
+    return torch.ops.vllm.ascend_step5_fused_indexer_norm_rope(
         x_cat,
         q_norm_weight,
         k_norm_weight,

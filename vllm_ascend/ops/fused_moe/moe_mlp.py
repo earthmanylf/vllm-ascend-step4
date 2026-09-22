@@ -676,7 +676,7 @@ def fp8_block_apply_mlp(
 
     Consumes the dispatcher's expert-sorted ``hidden_states`` with the
     per-expert ``group_list`` intervals. Two execution paths, chosen by the
-    weight layout ``Step4Fp8BlockFusedMoEMethod.process_weights_after_loading``
+    weight layout ``Step5Fp8BlockFusedMoEMethod.process_weights_after_loading``
     left on the tensors:
 
     * aclnn fast path (K-major weights, needs the packaged custom op): the
@@ -686,17 +686,17 @@ def fp8_block_apply_mlp(
       projection, with the vendored ``act_quant`` producing the activation
       scales. Fully device-side (no host round-trips), so it is capturable
       by NPU graphs.
-    * triton fallback (checkpoint layout): per expert, the vendored step4-hf
+    * triton fallback (checkpoint layout): per expert, the vendored step5-hf
       kernel pair -- dynamic per-128-group e4m3 activation quantization plus
       the block-scaled fp8 GEMM (scales folded after the fp32 dot). Host
       counts per expert, so it is not NPU-graph capturable (eager fallback).
 
     ``swiglustep`` applies the fp32 clamps with a single rounding back to
-    bf16; the limit is fixed at 7.0 (the only value the Step4 model accepts).
+    bf16; the limit is fixed at 7.0 (the only value the Step5 model accepts).
     """
-    # Lazy import: the kernels live under models/step4 and must not cycle
+    # Lazy import: the kernels live under models/step5 and must not cycle
     # the quantization package at module import time.
-    from vllm_ascend.models.step4.fp8_kernels import act_quant
+    from vllm_ascend.models.step5.fp8_kernels import act_quant
 
     num_experts, packed_intermediate, _ = w1.shape
     intermediate = packed_intermediate // 2
@@ -804,7 +804,7 @@ def _fp8_block_apply_mlp_triton(
     act_quant,
 ) -> tuple[torch.Tensor, None]:
     """Per-expert block-fp8 expert MLP through the vendored triton kernels."""
-    from vllm_ascend.models.step4.fp8_kernels import fp8_gemm
+    from vllm_ascend.models.step5.fp8_kernels import fp8_gemm
 
     out = torch.zeros(x_bf.shape[0], w2.shape[1], dtype=torch.bfloat16, device=x_bf.device)
     start = 0

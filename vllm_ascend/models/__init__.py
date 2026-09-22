@@ -7,12 +7,12 @@ def register_model():
         "vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM",
     )
     ModelRegistry.register_model(
-        "Step4ForCausalLM",
-        "vllm_ascend.models.step4:AscendStep4ForCausalLM",
+        "Step5ForCausalLM",
+        "vllm_ascend.models.step5:AscendStep5ForCausalLM",
     )
     ModelRegistry.register_model(
-        "Step4MTP",
-        "vllm_ascend.models.step4.mtp:AscendStep4MTP",
+        "Step5MTP",
+        "vllm_ascend.models.step5.mtp:AscendStep5MTP",
     )
     # Keep the release-branch text architecture as a compatibility alias for
     # checkpoints whose config predates vLLM's KimiLinear rename.

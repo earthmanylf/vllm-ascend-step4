@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Step4 fused residual-add + RMSNorm + param-dtype cast for Ascend.
+"""Step5 fused residual-add + RMSNorm + param-dtype cast for Ascend.
 
-Fuses the post-attention sequence in ``Step4DecoderLayer.forward``:
+Fuses the post-attention sequence in ``Step5DecoderLayer.forward``:
 
     hidden_states = self._cast_for_residual(hidden_states)
     hidden_states += residual
@@ -12,7 +12,7 @@ Fuses the post-attention sequence in ``Step4DecoderLayer.forward``:
 into a single Triton kernel that emits the RMSNorm output in the param-op
 dtype and the updated residual in the residual dtype (fp32 when
 ``fp32_residual_connection`` is enabled). The norm math matches
-``Step4RMSNorm``: fp32 internal compute, scale = weight (+1 when the
+``Step5RMSNorm``: fp32 internal compute, scale = weight (+1 when the
 checkpoint stores zero-centered weights). Row partitioning across vector
 cores follows ``vllm_ascend.ops.triton.rms_norm``.
 """

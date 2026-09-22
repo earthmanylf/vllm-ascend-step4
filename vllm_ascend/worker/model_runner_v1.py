@@ -967,7 +967,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def _on_request_state_removed(self, req_id: str, req_state: Any | None) -> None:
         # Mirror the upstream hook: drop the finished request's KV side
-        # storage (Step4 CSA active-slot state). The preemption path calls
+        # storage (Step5 CSA active-slot state). The preemption path calls
         # _release_request_kv_cache_side_storage directly; without this the
         # finish path would leak one staged region per finished request
         # until the active-slot pool is exhausted.

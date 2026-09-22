@@ -379,7 +379,7 @@ def _aclnn_block_fp8_available() -> bool:
     per-token-per-128-group activation scales), which torch_npu's
     npu_grouped_matmul wrapper cannot reach (it routes fp8 to the V4 entry
     and rejects it). Needs a build with COMPILE_CUSTOM_KERNELS=1; when the
-    op is absent the Step4 fp8 path falls back to the vendored triton
+    op is absent the Step5 fp8 path falls back to the vendored triton
     kernels.
     """
     from vllm_ascend.ops.grouped_matmul_v5 import block_fp8_gmm_available
@@ -399,15 +399,15 @@ def _to_kmajor(weight: torch.Tensor, scale_inv: torch.Tensor) -> tuple[torch.Ten
     return weight.transpose(1, 2).contiguous(), scale_inv.transpose(1, 2).contiguous()
 
 
-@register_scheme(FP8_METHOD, "step4_moe")
-class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
-    """Step4 routed experts executing the native fp8 block quantization.
+@register_scheme(FP8_METHOD, "step5_moe")
+class Step5Fp8BlockFusedMoEMethod(AscendMoEScheme):
+    """Step5 routed experts executing the native fp8 block quantization.
 
     Unlike :class:`AscendFp8BlockFusedMoEMethod`, weights stay
     ``float8_e4m3fn`` with their fp32 ``weight_scale_inv`` block scales
     exactly as checkpointed -- no bf16 resolution and no MXFP8 requantize.
-    ``apply`` runs each expert with the kernels vendored from the step4-hf
-    reference (``vllm_ascend/models/step4/fp8_kernels.py``): dynamic
+    ``apply`` runs each expert with the kernels vendored from the step5-hf
+    reference (``vllm_ascend/models/step5/fp8_kernels.py``): dynamic
     per-128-group e4m3 activation quantization plus the block-scaled fp8
     GEMM, clamped SwiGLU between the two projections, and a top-k
     slot-order fp32 weighted combine.
@@ -420,12 +420,12 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
 
     quant_type: QuantType = QuantType.NONE
 
-    # The only clamp limit Step4 ships (validated by the model's MoE block).
+    # The only clamp limit Step5 ships (validated by the model's MoE block).
     SWIGLU_LIMIT = 7.0
 
     # Keep the router's fp32 topk_weights: AscendRoutedExperts._select_experts
     # skips its hidden-dtype cast for schemes opting in here. npu_moe_gating_top_k
-    # already produced the weights in fp32 (Step4 feeds it fp32 logits and the
+    # already produced the weights in fp32 (Step5 feeds it fp32 logits and the
     # op's output dtype follows its input); the cast to bf16 would be a one-way
     # precision loss on the routed combine.
     keep_fp32_topk_weights = True
@@ -433,7 +433,7 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
     def __init__(self, weight_block_size: tuple[int, int], moe_config) -> None:
         self.block_n, self.block_k = weight_block_size
         if (self.block_n, self.block_k) != (128, 128):
-            raise ValueError(f"Step4 fp8 experts require 128x128 weight blocks, got {(self.block_n, self.block_k)}.")
+            raise ValueError(f"Step5 fp8 experts require 128x128 weight blocks, got {(self.block_n, self.block_k)}.")
         # Hints the upstream loader to narrow ``*_weight_scale_inv`` per
         # expert shard, exactly like AscendFp8BlockFusedMoEMethod.
         self.group_size = self.block_k
@@ -493,7 +493,7 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
         self.use_aclnn_gmm = _aclnn_block_fp8_available()
         if self.use_aclnn_gmm:
             logger.info_once(
-                "Step4 fp8 experts: aclnnGroupedMatmulV5 block-fp8 G-B path enabled (K-major weight layout)."
+                "Step5 fp8 experts: aclnnGroupedMatmulV5 block-fp8 G-B path enabled (K-major weight layout)."
             )
             for weight_name, scale_name in (
                 ("w13_weight", "w13_weight_scale_inv"),
@@ -518,9 +518,9 @@ class Step4Fp8BlockFusedMoEMethod(AscendMoEScheme):
         # dispatcher pair adapts to the active comm method (ALLGATHER sorts
         # locally and unpermutes, MC2 ships tokens across ranks), and the
         # FP8_BLOCK quant branch routes the middle stage to the vendored
-        # step4-hf block-fp8 kernels (see fp8_block_apply_mlp).
+        # step5-hf block-fp8 kernels (see fp8_block_apply_mlp).
         #
-        # topk_weights come straight from npu_moe_gating_top_k: Step4's fp32
+        # topk_weights come straight from npu_moe_gating_top_k: Step5's fp32
         # gate feeds fp32 logits into the op (whose output dtype follows its
         # input) and keep_fp32_topk_weights opts out of the framework's
         # hidden-dtype cast in _select_experts, so the weights arrive in fp32.

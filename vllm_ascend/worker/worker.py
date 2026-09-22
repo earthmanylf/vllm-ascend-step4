@@ -577,7 +577,7 @@ class NPUWorker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             # Pre-allocate the fixed-size KV side-storage scratch (e.g. the
-            # Step4 DSA summary workspace) at max capacity so it is counted
+            # Step5 DSA summary workspace) at max capacity so it is counted
             # in the non-KV baseline before KV blocks are sized.
             prepare_kv_cache_side_storage_for_memory_profiling(
                 self.vllm_config.compilation_config.static_forward_context,
@@ -841,7 +841,7 @@ class NPUWorker(WorkerBase):
             self._warm_up_atb()
 
         # Startup dummy runs and graph capture leave stale state in KV side
-        # storage (e.g. the Step4 DSA summary sidecar); restore the empty
+        # storage (e.g. the Step5 DSA summary sidecar); restore the empty
         # state in place without changing captured addresses (upstream
         # gpu_worker does the same after warmup).
         num_side_storages, num_scratch_buffers = (
@@ -1057,7 +1057,7 @@ class NPUWorker(WorkerBase):
         # set, so its worker-side consumer must use the same condition. Keep the
         # narrower Eagle3 condition for MRV1, where zeroing was introduced only
         # for the multi-step speculative-decode reuse issue, and add the
-        # side-storage condition: layers like the Step4 DSA summary sidecar
+        # side-storage condition: layers like the Step5 DSA summary sidecar
         # require freshly allocated blocks to be reset through their hooks.
         has_side_storage = any(
             isinstance(layer, KVCacheSideStorageLayer)

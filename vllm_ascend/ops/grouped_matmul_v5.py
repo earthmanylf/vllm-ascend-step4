@@ -7,10 +7,10 @@ scales + FLOAT32 per-token-per-128-group activation scales) is reached via
 the custom op ``_C_ascend.grouped_matmul_block_fp8`` (csrc/torch_binding.cpp,
 built with COMPILE_CUSTOM_KERNELS=1).
 
-Verified on Ascend 950DT / CANN 9.1.0: numerics match the vendored step4-hf
+Verified on Ascend 950DT / CANN 9.1.0: numerics match the vendored step5-hf
 Triton ``fp8_gemm`` (same rel_l2 vs the fp32 dequant reference; identical
 bf16 rounding), and the device kernel is 1.2-2.2x faster than the Triton one
-at Step4 expert shapes (msprof task-time trace).
+at Step5 expert shapes (msprof task-time trace).
 """
 
 import functools
@@ -28,7 +28,7 @@ def block_fp8_gmm_available() -> bool:
     """Whether the packaged custom-op lib registers the V5 block-fp8 GMM.
 
     Requires a build with COMPILE_CUSTOM_KERNELS=1; when the op is absent
-    callers should fall back to the vendored step4-hf triton kernels.
+    callers should fall back to the vendored step5-hf triton kernels.
     """
     try:
         _ensure_op_loaded()

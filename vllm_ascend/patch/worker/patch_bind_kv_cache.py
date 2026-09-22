@@ -51,7 +51,7 @@ def bind_kv_cache(
         forward_context[layer_name].kv_cache = kv_cache
 
     # Some model-specific state is physically aligned with an owner KV cache
-    # but intentionally omitted from the generic KV specs (e.g. the Step4 DSA
+    # but intentionally omitted from the generic KV specs (e.g. the Step5 DSA
     # sparse summary sidecar). Bind it only after every regular KV cache is
     # available. Mirrors the tail of the upstream bind_kv_cache.
     seen_layers: set[int] = set()

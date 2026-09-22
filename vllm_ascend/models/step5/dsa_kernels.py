@@ -1,6 +1,6 @@
 """Generated Step-4 minimal inference kernel.py; do not edit by hand.
 
-Regenerate with ``python3 -m dsa_parity.build_step4_minimal_release``.
+Regenerate with ``python3 -m dsa_parity.build_step5_minimal_release``.
 Numerical bodies come from the source manifest below.  Only merged-module
 imports/metadata and the experimental Triton sliding-attention branch are
 rewritten; sliding attention is the validated PyTorch SDPA implementation.
@@ -8,7 +8,7 @@ rewritten; sliding attention is the validated PyTorch SDPA implementation.
 
 from __future__ import annotations
 
-# Source manifest (step4-minimal-inference-release-v1):
+# Source manifest (step5-minimal-inference-release-v1):
 #   inference/dsa_kernels.py  sha256=7fa17fc7886bc20eaa9a2cb34c623b11ff152389442f43314199e3c8bcccd449
 #   inference/dsa_meta.py  sha256=484ff7c6de71966cdc80d32ad58b091b49d730d3752f9b90b42f2e19d1df9e9f
 #   inference/sparse_attn.py  sha256=22f733eb5fa0069dc11b688a2d3d3acd42125a4c379a660fef9454f783b49c2f
@@ -3530,7 +3530,7 @@ def build_rope_cache(
             drives the pair ``(d, d + rotary_span // 2)``. The kernels take that halved
             width as their ``rotary_dim``, which is easy to misread as the span itself.
         scaling: the ``rope_scaling`` block, or ``None``. Only ``llama3`` is implemented,
-            because it is the only type step4's config asks for; an unrecognised type
+            because it is the only type step5's config asks for; an unrecognised type
             raises rather than silently falling back to unscaled, which would look like a
             long-context quality regression rather than a bug.
     """
@@ -3666,7 +3666,7 @@ class DSALayerCache:
         self.value[span] = value
 
 
-class Step4SparseIndexer:
+class Step5SparseIndexer:
     """The indexer's projections and scoring, borrowing its parameters from the attention.
 
     Not an ``nn.Module``: the checkpoint stores the indexer weights directly under
@@ -3881,10 +3881,10 @@ import triton.language as tl
 
 # fp8_e4m3fn has 4 exponent bits and 3 mantissa bits, with range [-448, 448].
 # The activation quantizer maps each block's range into that envelope by
-# dividing by ``max(amax, 1e-10) / 448``.  This is the Optimus/NV Step4
+# dividing by ``max(amax, 1e-10) / 448``.  This is the Optimus/NV Step5
 # ``per_token_group_quant_fp8`` default.  DeepSeek's standalone reference uses
 # 1e-4, but that larger floor zeros low-amplitude blocks that the deployed
-# Step4 path preserves.
+# Step5 path preserves.
 FP8_E4M3_MAX: float = 448.0
 FP8_AMAX_FLOOR: float = 1e-10
 
@@ -4487,7 +4487,7 @@ __all__ = [
     "build_rope_cache",
     "DSAGeometry",
     "DSALayerCache",
-    "Step4SparseIndexer",
+    "Step5SparseIndexer",
     "update_summaries_prefill",
     "update_summaries_decode",
     "act_quant",

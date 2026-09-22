@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ascend Step-4 model fork.
 
-Sliding-window layers reuse the upstream dense ``Step4Attention`` unchanged
+Sliding-window layers reuse the upstream dense ``Step5Attention`` unchanged
 (sparse_config=None, model_has_dsa_layers=False) and run on the
 platform-default Ascend attention backend, which supports sliding windows.
 
-Full-attention (DSA) layers use ``AscendStep4DSAAttention``, a
-minimax_m3-style custom attention module whose impl runs the step4-hf
+Full-attention (DSA) layers use ``AscendStep5DSAAttention``, a
+minimax_m3-style custom attention module whose impl runs the step5-hf
 reference triton kernels through triton-ascend: region summaries are
 self-managed per layer while K/V live in the standard paged KV pool.
 
@@ -59,50 +59,51 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm.models.step4.kernels import (
-    Step4SparseConfig,
-    checkpoint_has_step4_sparse_config,
-    get_step4_sparse_config,
+from vllm.models.step5.kernels import (
+    Step5SparseConfig,
+    checkpoint_has_step5_sparse_config,
+    get_step5_sparse_config,
 )
-from vllm.models.step4.layernorm import OptimusLayerNorm
-from vllm.models.step4.model import (
-    FP32ReplicatedLinear,
-    FusedMoEBlock,
-    RMSNormFactory,
-    Step4Attention,
-    Step4DecoderLayer,
-    Step4ForCausalLM,
-    Step4FusedQKVIndexerLinear,
-    Step4MLP,
-    Step4Model,
-    Step4SparseIndexerIndexTPLinear,
-    _get_step4_moe_layer_indices,
-    _is_step4_full_attention_layer,
-    _pad_size_for_groupwise_quant,
+from vllm.models.step5.layernorm import (
+    Step5IndexerLayerNorm,
+    get_step5_norm_dtype,
+    make_step5_rms_norm,
+)
+from vllm.models.step5.model import (
+    Step5Attention,
+    Step5DecoderLayer,
+    Step5ForCausalLM,
+    Step5FP32RouterLinear,
+    Step5FusedQKVIndexerLinear,
+    Step5MLP,
+    Step5MoE,
+    Step5Model,
+    Step5SparseIndexerIndexTPLinear,
+    _get_step5_layer_types,
+    _get_step5_moe_layer_indices,
+    _is_step5_full_attention_layer,
     _per_layer_value,
     _require_resolved_valid_vocab_size,
-    _set_step4_moe_protocol_metadata,
-    _step4_moe_reduce_policy,
-    _step_layer_types,
-    _validate_step4_dsa_parallel_geometry,
-    get_norm_dtype,
+    _set_step5_moe_protocol_metadata,
+    _step5_moe_reduce_policy,
+    _validate_step5_dsa_parallel_geometry,
 )
 
 import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
 from vllm_ascend import envs
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.models.step4.dsa_attention import (
-    AscendStep4DSABackend,
-    AscendStep4DSAImpl,
+from vllm_ascend.models.step5.dsa_attention import (
+    AscendStep5DSABackend,
+    AscendStep5DSAImpl,
 )
 
-from vllm_ascend.models.step4.fused_add_rms_norm import fused_add_rms_norm_cast
-from vllm_ascend.models.step4.fused_qknorm_rope import (
+from vllm_ascend.models.step5.fused_add_rms_norm import fused_add_rms_norm_cast
+from vllm_ascend.models.step5.fused_qknorm_rope import (
     fused_indexer_qkz_kv_norm_rope,
     fused_qknorm_rope,
 )
-from vllm_ascend.models.step4.summary_cache import AscendStep4SparseSummaryCacheLayer
-from vllm_ascend.quantization.configs.fp8_config import AscendFp8Config, Step4Fp8BlockConfig
+from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCacheLayer
+from vllm_ascend.quantization.configs.fp8_config import AscendFp8Config, Step5Fp8BlockConfig
 
 logger = init_logger(__name__)
 
@@ -116,13 +117,13 @@ def _kv_cache_torch_dtype(cache_config, vllm_config) -> torch.dtype:
         return torch.float16
     if cache_dtype in ("float", "fp32", "float32"):
         return torch.float32
-    raise ValueError(f"Unsupported step4-ascend KV cache dtype: {cache_dtype}")
+    raise ValueError(f"Unsupported step5-ascend KV cache dtype: {cache_dtype}")
 
 
-def _step4_fp8_expert_layout(config: Any) -> tuple[set[int], int]:
+def _step5_fp8_expert_layout(config: Any) -> tuple[set[int], int]:
     """Return (bf16 expert layer indices, quant block size).
 
-    A Step4 checkpoint either declares ``quantization_config.fp8`` with
+    A Step5 checkpoint either declares ``quantization_config.fp8`` with
     128x128 weight blocks -- in which case every MoE layer is fp8 except
     those under ``modules_to_not_convert`` -- or declares nothing, in which
     case every expert is bf16.
@@ -133,13 +134,13 @@ def _step4_fp8_expert_layout(config: Any) -> tuple[set[int], int]:
     quant_method = quant_config.get("quant_method")
     if quant_method not in ("fp8", "compressed-tensors"):
         raise ValueError(
-            f"Step4 Ascend fp8 experts support quant_method=fp8, got "
+            f"Step5 Ascend fp8 experts support quant_method=fp8, got "
             f"{quant_method!r}."
         )
     block = quant_config.get("weight_block_size") or [128, 128]
     if list(block) != [128, 128]:
         raise ValueError(
-            "Step4 Ascend fp8 experts require 128x128 weight blocks, got "
+            "Step5 Ascend fp8 experts require 128x128 weight blocks, got "
             f"{list(block)}."
         )
     bf16_layers: set[int] = set()
@@ -150,7 +151,7 @@ def _step4_fp8_expert_layout(config: Any) -> tuple[set[int], int]:
     return bf16_layers, 128
 
 
-class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
+class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
     """Step-4 DSA layer on Ascend: reference triton kernels, paged K/V pool."""
 
     def __init__(
@@ -176,7 +177,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         partial_rotary_factor: float = 1.0,
         zero_centered: bool = True,
         vllm_config: VllmConfig | None = None,
-        sparse_config: Step4SparseConfig | None = None,
+        sparse_config: Step5SparseConfig | None = None,
         norm_dtype: torch.dtype | None = None,
     ):
         super().__init__()
@@ -186,7 +187,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         del sliding_window, swa_num_attention_heads
         if qkv_bias:
             raise ValueError(
-                "Step4 DSA layers fuse qkv with the sparse indexer into one "
+                "Step5 DSA layers fuse qkv with the sparse indexer into one "
                 "bias-free GEMM, but attention_bias is enabled."
             )
         self.hidden_size = hidden_size
@@ -228,7 +229,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             )
         )
         if norm_dtype is None:
-            norm_dtype = get_norm_dtype(vllm_config.model_config.hf_config)
+            norm_dtype = get_step5_norm_dtype(vllm_config.model_config.hf_config)
         linear_quant_config = (
             quant_config
             if quant_config is None or quant_config.get_name() != "fp8"
@@ -238,13 +239,13 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         # --- upstream DSA geometry validation -------------------------------
         if self.num_kv_heads != 1:
             raise ValueError(
-                f"Step4 DSA requires exactly one local KV head, got {self.num_kv_heads}"
+                f"Step5 DSA requires exactly one local KV head, got {self.num_kv_heads}"
             )
         if self.head_dim not in (128, 192):
             raise ValueError(
-                f"Step4 DSA head_dim must be 128/192, got {self.head_dim}"
+                f"Step5 DSA head_dim must be 128/192, got {self.head_dim}"
             )
-        _validate_step4_dsa_parallel_geometry(
+        _validate_step5_dsa_parallel_geometry(
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
             indexer_num_heads=int(sparse_config.sparse_indexer_num_heads),
@@ -255,7 +256,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         # --- projections -----------------------------------------------------
         proxy_dim = int(sparse_config.proxy_dim)
         self.sparse_config = sparse_config
-        self.qkv_indexer_proj = Step4FusedQKVIndexerLinear(
+        self.qkv_indexer_proj = Step5FusedQKVIndexerLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
@@ -275,7 +276,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             prefix=f"{prefix}.qkv_indexer_proj",
         )
         self.params_dtype = self.qkv_indexer_proj.params_dtype
-        self.sparse_indexer_w = Step4SparseIndexerIndexTPLinear(
+        self.sparse_indexer_w = Step5SparseIndexerIndexTPLinear(
             hidden_size,
             int(sparse_config.sparse_indexer_num_heads),
             params_dtype=self.params_dtype,
@@ -310,13 +311,13 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             rope_parameters=rope_parameters,
             dtype=self.params_dtype,
         )
-        self.q_norm = RMSNormFactory(
+        self.q_norm = make_step5_rms_norm(
             self.head_dim,
             eps=rms_norm_eps,
             zero_centered=zero_centered,
             dtype=norm_dtype,
         )
-        self.k_norm = RMSNormFactory(
+        self.k_norm = make_step5_rms_norm(
             self.head_dim,
             eps=rms_norm_eps,
             zero_centered=zero_centered,
@@ -336,12 +337,12 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             rope_parameters=sparse_params,
             dtype=self.params_dtype,
         )
-        self.sparse_indexer_q_norm = RMSNormFactory(
+        self.sparse_indexer_q_norm = make_step5_rms_norm(
             proxy_dim,
             eps=rms_norm_eps,
             zero_centered=zero_centered,
         )
-        self.sparse_indexer_k_norm = OptimusLayerNorm(
+        self.sparse_indexer_k_norm = Step5IndexerLayerNorm(
             proxy_dim,
             eps=rms_norm_eps,
         )
@@ -373,8 +374,8 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             cache_config.cache_dtype if cache_config is not None else "auto"
         )
         self.kv_cache_torch_dtype = _kv_cache_torch_dtype(cache_config, vllm_config)
-        self.attn_backend = AscendStep4DSABackend
-        # Mirror the upstream CUDA wiring (vllm.models.step4.model): the MTP
+        self.attn_backend = AscendStep5DSABackend
+        # Mirror the upstream CUDA wiring (vllm.models.step5.model): the MTP
         # speculative token count is handed to the DSA impl so verify batches
         # (K+1 rows per request) take the staged/deferred-flush summary path.
         num_speculative_tokens = 0
@@ -383,7 +384,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             num_speculative_tokens = int(
                 getattr(spec_config, "num_speculative_tokens", 0) or 0
             )
-        self.impl = AscendStep4DSAImpl(
+        self.impl = AscendStep5DSAImpl(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -427,7 +428,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         # the KV block count, and its lifetime/zeroing/COW follow the owner
         # KV blocks through the generic side-storage hooks.
         self.kv_cache_requires_zeroing = True
-        self.sparse_summary_cache = AscendStep4SparseSummaryCacheLayer(
+        self.sparse_summary_cache = AscendStep5SparseSummaryCacheLayer(
             prefix=f"{prefix}.attn.sparse_summary_cache",
             target_impl=self.impl,
             sparse_config=sparse_config,
@@ -449,7 +450,7 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_prefix_recompute_tokens = 0
 
 
-    def get_attn_backend(self) -> type[AscendStep4DSABackend]:
+    def get_attn_backend(self) -> type[AscendStep5DSABackend]:
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
@@ -662,8 +663,8 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         return output_tensor
 
 
-class AscendStep4FusedMoEBlock(FusedMoEBlock):
-    """Step4 MoE block wired to the vllm-ascend fused MoE path.
+class AscendStep5FusedMoEBlock(Step5MoE):
+    """Step5 MoE block wired to the vllm-ascend fused MoE path.
 
     Two changes vs the upstream block (mirroring the MiniMax-M3 integration):
 
@@ -723,16 +724,17 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
                 f"the number of experts {config.moe_num_experts}."
             )
 
-        self.gate = FP32ReplicatedLinear(
+        self.gate = Step5FP32RouterLinear(
             config.hidden_size,
             config.moe_num_experts,
             bias=False,
             quant_config=None,
+            params_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
         self.use_moe_router_bias = config.use_moe_router_bias
         if not self.use_moe_router_bias:
-            raise ValueError("Step4 MoE currently requires use_moe_router_bias=true.")
+            raise ValueError("Step5 MoE currently requires use_moe_router_bias=true.")
         self.routed_scaling_factor = config.moe_router_scaling_factor
         self.router_bias = nn.Parameter(
             torch.zeros(config.moe_num_experts, dtype=torch.float32),
@@ -741,7 +743,7 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
         self.need_fp32_gate = config.need_fp32_gate
         if not self.need_fp32_gate:
             raise ValueError(
-                "Step4 MoE requires need_fp32_gate=true for stable router logits."
+                "Step5 MoE requires need_fp32_gate=true for stable router logits."
             )
 
         activation = "silu"
@@ -755,45 +757,41 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
             swiglu_limit = float(swiglu_limit)
             if swiglu_limit != 7.0:
                 raise ValueError(
-                    "Step4 fused MoE supports only swiglu_limit=7.0, got "
+                    "Step5 fused MoE supports only swiglu_limit=7.0, got "
                     f"{swiglu_limit}."
                 )
             activation = "swiglustep"
 
-        # Optional Step4-native fp8 expert execution, gated by the
+        # Optional Step5-native fp8 expert execution, gated by the
         # ``VLLM_ASCEND_ENABLE_STEP4_FP8`` env var (default off): the routed
         # experts keep the checkpoint's fp8 e4m3 weights and 128x128 block
-        # scales and run them with the kernels vendored from the step4-hf
-        # reference (Step4Fp8BlockFusedMoEMethod), instead of the default
+        # scales and run them with the kernels vendored from the step5-hf
+        # reference (Step5Fp8BlockFusedMoEMethod), instead of the default
         # AscendFp8BlockFusedMoEMethod path that resolves to bf16 or
         # requantizes to MXFP8. Layers the checkpoint left in bf16
         # (modules_to_not_convert) stay unquantized either way.
         moe_quant_config = quant_config
-        enable_step4_fp8 = bool(envs.VLLM_ASCEND_ENABLE_STEP4_FP8)
-        if enable_step4_fp8 and isinstance(quant_config, AscendFp8Config):
-            bf16_expert_layers, _ = _step4_fp8_expert_layout(config)
+        enable_step5_fp8 = bool(envs.VLLM_ASCEND_ENABLE_STEP4_FP8)
+        if enable_step5_fp8 and isinstance(quant_config, AscendFp8Config):
+            bf16_expert_layers, _ = _step5_fp8_expert_layout(config)
             if self.layer_idx in bf16_expert_layers:
                 moe_quant_config = None
             else:
-                # Shallow copy re-bound to the Step4 config so the
+                # Shallow copy re-bound to the Step5 config so the
                 # framework's fp8-block parsing is preserved while the MoE
                 # route changes.
-                step4_config = copy.copy(quant_config)
-                step4_config.__class__ = Step4Fp8BlockConfig
-                moe_quant_config = step4_config
+                step5_config = copy.copy(quant_config)
+                step5_config.__class__ = Step5Fp8BlockConfig
+                moe_quant_config = step5_config
                 logger.info(
-                    "Layer %s: enable_step4_fp8 is set; routed experts run "
-                    "the native fp8 block kernels (Step4Fp8BlockFusedMoEMethod).",
+                    "Layer %s: enable_step5_fp8 is set; routed experts run "
+                    "the native fp8 block kernels (Step5Fp8BlockFusedMoEMethod).",
                     self.layer_idx,
                 )
 
-        share_expert_dim = _pad_size_for_groupwise_quant(
-            config.share_expert_dim, quant_config
-        )
-        moe_intermediate_size = _pad_size_for_groupwise_quant(
-            config.moe_intermediate_size, quant_config
-        )
-        self.fuse_all_reduce, reduce_results = _step4_moe_reduce_policy(
+        share_expert_dim = config.share_expert_dim
+        moe_intermediate_size = config.moe_intermediate_size
+        self.fuse_all_reduce, reduce_results = _step5_moe_reduce_policy(
             self.tp_size,
             get_dp_group().world_size,
         )
@@ -804,7 +802,7 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
         # reduce_results=False: AscendMoERunner owns the shared-expert TP
         # reduction (fused into the token combine for MC2/All2All, or a
         # separate shared-only all-reduce otherwise).
-        self.share_expert = Step4MLP(
+        self.share_expert = Step5MLP(
             config=config,
             hidden_size=self.hidden_size,
             intermediate_size=share_expert_dim,
@@ -871,8 +869,8 @@ class AscendStep4FusedMoEBlock(FusedMoEBlock):
         return self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
 
-class AscendStep4Attention(Step4Attention):
-    """Upstream Step4Attention with fused QKNorm+RoPE for Ascend.
+class AscendStep5Attention(Step5Attention):
+    """Upstream Step5Attention with fused QKNorm+RoPE for Ascend.
 
     Sliding-window layers land here. The upstream forward decomposes RMSNorm
     and RoPE into ~34 eager aclnn ops because the Optimus/CuTeDSL fused
@@ -888,8 +886,8 @@ class AscendStep4Attention(Step4Attention):
             and getattr(self, "use_rope", False)
             and self.head_dim == 192
             and not getattr(self, "use_dsa_backend", False)
-            and not getattr(self, "use_optimus_qknorm_cache", False)
-            and not getattr(self, "use_optimus_qknorm", False)
+            and not getattr(self, "use_step5_fused_qknorm_cache", False)
+            and not getattr(self, "use_step5_fused_qknorm", False)
         )
         if self.use_fused_qknorm_rope:
             self._fused_rotary_pairs = self.rotary_dim // 2
@@ -966,10 +964,10 @@ class AscendStep4Attention(Step4Attention):
             extra_dims, _ = self.g_proj(hidden_states)
 
         if extra_dims is not None:
-            attn_output = torch.ops.vllm.step4_materialize_gate_input(
+            attn_output = torch.ops.vllm.step5_materialize_gate_input(
                 attn_output
             )
-            extra_dims = torch.ops.vllm.step4_materialize_gate_input(
+            extra_dims = torch.ops.vllm.step5_materialize_gate_input(
                 extra_dims
             )
 
@@ -992,11 +990,11 @@ class AscendStep4Attention(Step4Attention):
         return output
 
 
-class AscendStep4DecoderLayer(Step4DecoderLayer):
+class AscendStep5DecoderLayer(Step5DecoderLayer):
     """Upstream decoder layer with the attention swapped per layer type.
 
     DSA (full-attention) layers get the Ascend DSA module; sliding layers get
-    the upstream dense Step4Attention on the platform-default backend (the
+    the upstream dense Step5Attention on the platform-default backend (the
     construction the proven VLLM_STEP4_SPARSE=0 path used).
     """
 
@@ -1025,13 +1023,13 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
             cache_config = copy.copy(cache_config)
             cache_config.sliding_window = None
 
-        sparse_config = get_step4_sparse_config(config)
+        sparse_config = get_step5_sparse_config(config)
         checkpoint_has_dsa_layers = (
-            checkpoint_has_step4_sparse_config(config) and sparse_config is not None
+            checkpoint_has_step5_sparse_config(config) and sparse_config is not None
         )
         use_dsa_for_layer = (
             sparse_config is not None
-            and _is_step4_full_attention_layer(config, layer_idx, sparse_config)
+            and _is_step5_full_attention_layer(config, layer_idx, sparse_config)
         )
         del checkpoint_has_dsa_layers  # dense layers must not opt into DSA wiring
         # Dense-fallback switch for A5 bring-up debugging: VLLM_STEP4_SPARSE=0
@@ -1040,8 +1038,8 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
             os.environ.get("VLLM_STEP4_SPARSE", "1") != "0"
         )
 
-        norm_dtype = get_norm_dtype(config)
-        layer_types = _step_layer_types(config)
+        norm_dtype = get_step5_norm_dtype(config)
+        layer_types = _get_step5_layer_types(config)
         partial_rotary_factors = getattr(config, "partial_rotary_factors", [])
         partial_rotary_factor = float(
             _per_layer_value(
@@ -1085,12 +1083,12 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
             norm_dtype=norm_dtype,
         )
         if use_dsa_for_layer:
-            self.self_attn = AscendStep4DSAAttention(
+            self.self_attn = AscendStep5DSAAttention(
                 sparse_config=sparse_config,
                 **attn_kwargs,
             )
         else:
-            self.self_attn = AscendStep4Attention(
+            self.self_attn = AscendStep5Attention(
                 sparse_config=None,
                 model_has_dsa_layers=False,
                 **attn_kwargs,
@@ -1103,15 +1101,15 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
             and get_dp_group().world_size == 1
         )
 
-        moe_layers_idx = _get_step4_moe_layer_indices(config)
+        moe_layers_idx = _get_step5_moe_layer_indices(config)
         if layer_idx in moe_layers_idx:
-            self.moe = AscendStep4FusedMoEBlock(
+            self.moe = AscendStep5FusedMoEBlock(
                 vllm_config,
                 prefix=f"{prefix}.moe",
             )
             self.use_moe = True
         else:
-            self.mlp = Step4MLP(
+            self.mlp = Step5MLP(
                 config=config,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -1122,13 +1120,13 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
                 reduce_results=True,
                 prefix=f"{prefix}.mlp",
             )
-        self.input_layernorm = RMSNormFactory(
+        self.input_layernorm = make_step5_rms_norm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             zero_centered=config.zero_centered,
             dtype=norm_dtype,
         )
-        self.post_attention_layernorm = RMSNormFactory(
+        self.post_attention_layernorm = make_step5_rms_norm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             zero_centered=config.zero_centered,
@@ -1145,14 +1143,14 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
         residual: torch.Tensor | None = None,
         orig_num_tokens: int | None = None,
     ) -> torch.Tensor:
-        if not self.use_moe or not isinstance(self.moe, AscendStep4FusedMoEBlock):
+        if not self.use_moe or not isinstance(self.moe, AscendStep5FusedMoEBlock):
             return super()._forward_ffn(
                 hidden_states,
                 input_is_sequence_parallel=input_is_sequence_parallel,
                 residual=residual,
                 orig_num_tokens=orig_num_tokens,
             )
-        # AscendStep4FusedMoEBlock returns a single complete tensor: the
+        # AscendStep5FusedMoEBlock returns a single complete tensor: the
         # Ascend MoE combine kernel reduces the routed output across TP and
         # the runner reduces the shared-expert output to match, so no extra
         # all-reduce may be applied here (reducing the sum would count the
@@ -1233,7 +1231,7 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
 
 
 
-class AscendStep4Model(Step4Model):
+class AscendStep5Model(Step5Model):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
         # The @support_torch_compile wrapper on the upstream __init__ sets
@@ -1260,15 +1258,15 @@ class AscendStep4Model(Step4Model):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: AscendStep4DecoderLayer(
+            lambda prefix: AscendStep5DecoderLayer(
                 vllm_config,
                 prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
         )
         if get_pp_group().is_last_rank:
-            norm_dtype = get_norm_dtype(config)
-            self.norm = RMSNormFactory(
+            norm_dtype = get_step5_norm_dtype(config)
+            self.norm = make_step5_rms_norm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
                 zero_centered=config.zero_centered,
@@ -1348,7 +1346,7 @@ class AscendStep4Model(Step4Model):
         return hidden_states
 
 
-class AscendStep4ForCausalLM(Step4ForCausalLM):
+class AscendStep5ForCausalLM(Step5ForCausalLM):
     def __init__(
         self,
         *,
@@ -1362,7 +1360,7 @@ class AscendStep4ForCausalLM(Step4ForCausalLM):
         config = model_config.hf_config
         self.config = config
         self.fp32_residual_connection = config.fp32_residual_connection
-        self.model = AscendStep4Model(
+        self.model = AscendStep5Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:
@@ -1390,14 +1388,14 @@ class AscendStep4ForCausalLM(Step4ForCausalLM):
 
         # Set MoE hyperparameters
         self.moe_layers: list[Any] = []
-        example_layer: FusedMoEBlock | None = None
+        example_layer: Step5MoE | None = None
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            if hasattr(layer, "moe") and isinstance(layer.moe, FusedMoEBlock):
+            if hasattr(layer, "moe") and isinstance(layer.moe, Step5MoE):
                 example_layer = layer.moe
                 self.moe_layers.append(layer.moe.experts)
-        _set_step4_moe_protocol_metadata(self, example_layer)
+        _set_step5_moe_protocol_metadata(self, example_layer)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.fp32_residual_connection:

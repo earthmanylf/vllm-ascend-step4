@@ -31,7 +31,7 @@ import triton.language as tl
 
 # Reuse the upstream Triton layout builder unchanged: it is device-agnostic
 # (pure Triton + torch) and bit-exact with the reference computation.
-from vllm.models.step4.nvidia.ops.cute_dsl.indexer_ops.decode_summary_layout_step3p5 import (  # noqa: E501
+from vllm.models.step5.nvidia.ops.cute_dsl.indexer_ops.decode_summary_layout_step3p5 import (  # noqa: E501
     build_decode_summary_layout_step3p5,
 )
 
@@ -874,7 +874,7 @@ def _csa_verify_stage_kernel(
     positions at the same slots. Staging is last-write-wins per
     (region, offset), so a rewrite cleanly replaces a rejected token's
     contribution -- this is the Ascend equivalent of the upstream
-    ``Step4DSAMTPTransaction`` rollback, with the accepted-prefix state
+    ``Step5DSAMTPTransaction`` rollback, with the accepted-prefix state
     recovered by replay instead of by fp32 snapshots. Regions therefore only
     materialize into the fp8 page cache through the deferred flush below,
     once they are provably fully committed.

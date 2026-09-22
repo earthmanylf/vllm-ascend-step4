@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Step4 FP8 block-GEMM kernels for Ascend, vendored from the step4-hf
+"""Step5 FP8 block-GEMM kernels for Ascend, vendored from the step5-hf
 multi-hardware release (``inference/kernel.py``, which is Apache-2.0 and
 device-portable Triton). Only the operators the FP8 expert path needs are
 copied, unchanged:
@@ -11,7 +11,7 @@ copied, unchanged:
   present, plain bf16 ``F.linear`` otherwise (the not-converted layers).
 
 These exact kernels were verified to compile and run on Ascend950DT with
-triton-ascend 3.2.2 by the step4-hf reference run (2026-09-03). Tile sizes
+triton-ascend 3.2.2 by the step5-hf reference run (2026-09-03). Tile sizes
 are load-bearing for correctness: ``BLOCK_K`` must equal the quantization
 group (128) and ``BLOCK_N`` must divide the weight N-block (128) so one
 K-iteration consumes exactly one scale entry and one output tile sits inside

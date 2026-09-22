@@ -2,15 +2,15 @@
 """Ascend Step-4 sparse summary side storage.
 
 Structure mirrors the upstream CUDA implementation
-(``vllm.models.step4.sparse_summary_cache``): a per-layer
-``Step4SparseSummaryCacheLayer``-compatible module owns a page-backed fp8
+(``vllm.models.step5.sparse_summary_cache``): a per-layer
+``Step5SparseSummaryCacheLayer``-compatible module owns a page-backed fp8
 summary sidecar whose lifetime follows the owner KV blocks, plus the
 fixed-capacity CSA active-slot runtime state. The cache/layer classes are
 subclassed rather than forked; only the device-specific pieces are replaced:
 
 * block reset uses the Ascend Triton kernel (``csa_reset_blocks``) instead of
   the ``device.type == "cuda"`` branch / torch fallback of the upstream class;
-* the bound cache object is ``AscendStep4SparseSummaryCache``.
+* the bound cache object is ``AscendStep5SparseSummaryCache``.
 
 The KV-cache extra-budget accounting, memory-profiling protocol, zeroing
 hooks and COW copy hooks are the upstream, platform-agnostic ones.
@@ -23,20 +23,20 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
-from vllm.models.step4.sparse_summary_cache import (
-    Step4SparseSummaryCache,
-    Step4SparseSummaryCacheConfig,
-    Step4SparseSummaryCacheLayer,
-    step4_sparse_summary_cache_bytes_per_block,
+from vllm.models.step5.sparse_summary_cache import (
+    Step5SparseSummaryCache,
+    Step5SparseSummaryCacheConfig,
+    Step5SparseSummaryCacheLayer,
+    step5_sparse_summary_cache_bytes_per_block,
 )
 
-from vllm_ascend.models.step4.summary_kernels import csa_reset_blocks
+from vllm_ascend.models.step5.summary_kernels import csa_reset_blocks
 
 logger = init_logger(__name__)
 
 
-class AscendStep4SparseSummaryCache(Step4SparseSummaryCache):
-    """Step4SparseSummaryCache with the NPU Triton block-reset path.
+class AscendStep5SparseSummaryCache(Step5SparseSummaryCache):
+    """Step5SparseSummaryCache with the NPU Triton block-reset path.
 
     The upstream class gates the fused reset kernel behind
     ``device.type == "cuda"`` and falls back to a torch implementation that
@@ -70,12 +70,12 @@ class AscendStep4SparseSummaryCache(Step4SparseSummaryCache):
             offsets = torch.arange(ratio, device=device, dtype=torch.long)
             ids = (ids.view(-1, 1) * ratio + offsets.view(1, -1)).flatten()
         state = (
-            getattr(self, "_step4_csa_active_region_ids", None),
-            getattr(self, "_step4_csa_active_slot_by_region", None),
-            getattr(self, "_step4_csa_numerator_cache", None),
-            getattr(self, "_step4_csa_denominator_cache", None),
-            getattr(self, "_step4_csa_max_cache", None),
-            getattr(self, "_step4_csa_active_token_valid", None),
+            getattr(self, "_step5_csa_active_region_ids", None),
+            getattr(self, "_step5_csa_active_slot_by_region", None),
+            getattr(self, "_step5_csa_numerator_cache", None),
+            getattr(self, "_step5_csa_denominator_cache", None),
+            getattr(self, "_step5_csa_max_cache", None),
+            getattr(self, "_step5_csa_active_token_valid", None),
         )
         if not all(isinstance(value, torch.Tensor) for value in state):
             # Runtime state is initialized at bind; a reset that arrives
@@ -107,7 +107,7 @@ class AscendStep4SparseSummaryCache(Step4SparseSummaryCache):
         )
 
     def warmup_scheduler_block_reset(self) -> None:
-        active_region_ids = getattr(self, "_step4_csa_active_region_ids", None)
+        active_region_ids = getattr(self, "_step5_csa_active_region_ids", None)
         if isinstance(active_region_ids, torch.Tensor) and active_region_ids.numel() > 0:
             warmup_block = torch.zeros(
                 (1,), device=self.mean_cache.device, dtype=torch.long
@@ -115,8 +115,8 @@ class AscendStep4SparseSummaryCache(Step4SparseSummaryCache):
             self.reset_scheduler_blocks(warmup_block)
 
 
-class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
-    """Binds ``AscendStep4SparseSummaryCache`` instead of the upstream class."""
+class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
+    """Binds ``AscendStep5SparseSummaryCache`` instead of the upstream class."""
 
     def bind_kv_cache_side_storage(
         self,
@@ -141,9 +141,9 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
             )
             if not _is_decode_bench:
                 raise RuntimeError(
-                    "Step4 DSA sparse summary side storage is not compatible with "
+                    "Step5 DSA sparse summary side storage is not compatible with "
                     "v1 KV transfer/offload yet. Disable kv_transfer_config for "
-                    "Step4, or use a connector implementation that explicitly "
+                    "Step5, or use a connector implementation that explicitly "
                     "transfers the summary sidecar."
                 )
         self._ensure_shared_scratch_workspace(forward_context)
@@ -151,21 +151,21 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
         owner_layer = forward_context.get(self._main_layer_name)
         if owner_layer is None:
             raise RuntimeError(
-                "Step4 sparse summary cache owner layer is missing: "
+                "Step5 sparse summary cache owner layer is missing: "
                 f"{self._main_layer_name!r}."
             )
         owner_kv_cache = owner_layer.kv_cache
         if isinstance(owner_kv_cache, (list, tuple)):
             if len(owner_kv_cache) == 0:
                 raise RuntimeError(
-                    "Step4 sparse summary cache owner KV cache is empty."
+                    "Step5 sparse summary cache owner KV cache is empty."
                 )
             owner_k_cache = owner_kv_cache[0]
         else:
             owner_k_cache = owner_kv_cache
         if not isinstance(owner_k_cache, torch.Tensor) or owner_k_cache.ndim < 2:
             raise RuntimeError(
-                "Step4 sparse summary cache owner KV cache has invalid shape: "
+                "Step5 sparse summary cache owner KV cache has invalid shape: "
                 f"{type(owner_kv_cache)!r}."
             )
         # The summary sidecar lives in scheduler-block space: one page per
@@ -176,7 +176,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
         block_size = self._kv_cache_block_size
         if block_size is None:
             raise RuntimeError(
-                "Step4 sparse summary cache was bound before its KV spec was "
+                "Step5 sparse summary cache was bound before its KV spec was "
                 "created."
             )
         if isinstance(owner_kv_cache, (list, tuple)):
@@ -185,7 +185,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
             token_capacity = int(owner_k_cache.shape[1]) * int(owner_k_cache.shape[2])
         if token_capacity % block_size != 0:
             raise RuntimeError(
-                "Step4 sparse summary cache owner KV capacity does not divide "
+                "Step5 sparse summary cache owner KV capacity does not divide "
                 f"into scheduler blocks: tokens={token_capacity}, "
                 f"block_size={block_size}."
             )
@@ -195,7 +195,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
         num_proxy_kv_heads = int(
             getattr(self._target_impl, "summary_cache_num_proxy_kv_heads", 1) or 1
         )
-        payload_size_bytes = step4_sparse_summary_cache_bytes_per_block(
+        payload_size_bytes = step5_sparse_summary_cache_bytes_per_block(
             block_size=block_size,
             region_block_size=int(self._target_impl.sparse_region_block_size),
             proxy_dim=proxy_dim,
@@ -207,7 +207,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
             (int(payload_size_bytes) + int(block_size) - 1) // int(block_size)
         ) * int(block_size)
         reverse_map_bytes = (
-            Step4SparseSummaryCacheConfig.max_region_fragments_per_block(
+            Step5SparseSummaryCacheConfig.max_region_fragments_per_block(
                 block_size=block_size,
                 region_block_size=int(self._target_impl.sparse_region_block_size),
             )
@@ -224,7 +224,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
         self._bind_summary_cache(backing, summary_dtype=summary_dtype)
         cache = self._target_impl._summary_cache
         if cache is None:
-            raise RuntimeError("Step4 sparse summary cache side storage was not bound.")
+            raise RuntimeError("Step5 sparse summary cache side storage was not bound.")
         cache.blocks_per_scheduler_block = 1
         cache.warmup_scheduler_block_reset()
         self._budget_only_cache = cache
@@ -255,7 +255,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
                 tuple(cache.mean_cache.shape),
             )
         logger.info_once(
-            "Allocated Step4 sparse summary cache side storage: "
+            "Allocated Step5 sparse summary cache side storage: "
             "pages_per_layer=%d payload_bytes_per_page=%d "
             "allocated_bytes_per_page=%d budget_bytes_per_page=%d "
             "sample_layer_allocated=%.2f GiB device=%s",
@@ -276,23 +276,23 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
         block_size = self._kv_cache_block_size
         if block_size is None:
             raise RuntimeError(
-                "Step4 sparse summary cache was bound before its KV spec was created."
+                "Step5 sparse summary cache was bound before its KV spec was created."
             )
         if backing.dtype is not torch.uint8:
             raise RuntimeError(
-                "Step4 sparse summary cache backing tensor must be uint8, "
+                "Step5 sparse summary cache backing tensor must be uint8, "
                 f"got {backing.dtype}."
             )
         if not backing.is_contiguous():
             raise RuntimeError(
-                "Step4 sparse summary cache backing tensor must be contiguous, "
+                "Step5 sparse summary cache backing tensor must be contiguous, "
                 f"got stride={backing.stride()}."
             )
         proxy_dim = int(getattr(self._sparse_config, "proxy_dim", 0) or 0)
         num_proxy_kv_heads = int(
             getattr(self._target_impl, "summary_cache_num_proxy_kv_heads", 1) or 1
         )
-        config = Step4SparseSummaryCacheConfig(
+        config = Step5SparseSummaryCacheConfig(
             num_pages=int(backing.shape[0]),
             page_size=int(block_size),
             region_block_size=int(self._target_impl.sparse_region_block_size),
@@ -300,7 +300,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
             proxy_dim=proxy_dim,
         )
         summary_dtype = summary_dtype or torch.uint8
-        expected_bytes = step4_sparse_summary_cache_bytes_per_block(
+        expected_bytes = step5_sparse_summary_cache_bytes_per_block(
             block_size=config.page_size,
             region_block_size=config.region_block_size,
             proxy_dim=config.proxy_dim,
@@ -310,7 +310,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
         )
         if int(backing.shape[1]) < expected_bytes:
             raise RuntimeError(
-                "Step4 sparse summary cache backing tensor shape mismatch: "
+                "Step5 sparse summary cache backing tensor shape mismatch: "
                 f"expected at least bytes_per_page={expected_bytes}, "
                 f"got shape={tuple(backing.shape)}."
             )
@@ -321,7 +321,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
         )
         if int(backing.shape[1]) < sum_elems:
             raise RuntimeError(
-                "Step4 sparse mean cache backing is too small: "
+                "Step5 sparse mean cache backing is too small: "
                 f"need={sum_elems}, got={int(backing.shape[1])}"
             )
         mean_cache = backing[:, :sum_elems].view(config.sum_shape)
@@ -338,7 +338,7 @@ class AscendStep4SparseSummaryCacheLayer(Step4SparseSummaryCacheLayer):
             device=backing.device,
             dtype=torch.float32,
         )
-        summary_cache = AscendStep4SparseSummaryCache(
+        summary_cache = AscendStep5SparseSummaryCache(
             config=config,
             sum_cache=sum_cache,
             count_cache=count_cache,
