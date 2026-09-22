@@ -225,6 +225,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "k2q_csr"
         "sparse_attention_score"
         "mla_prolog_v3"
+        "step4_block_sparse_attention"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")

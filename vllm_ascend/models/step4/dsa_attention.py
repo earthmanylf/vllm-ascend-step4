@@ -21,6 +21,7 @@ rollback) is CUDA-only and not ported.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -58,6 +59,52 @@ from vllm_ascend.models.step4.summary_kernels import (
 )
 
 logger = init_logger(__name__)
+
+# Route sparse attention through the original Ascend C operator in TGD mode.
+# The existing selector emits physical region ids, so the flattened KV cache
+# can be passed directly without adding a second adapter layer.
+_USE_ASCENDC_DSA = os.environ.get("VLLM_STEP4_ASCENDC_DSA", "0") == "1"
+
+
+def _step4_ascendc_attn(
+    query: torch.Tensor,
+    key_flat: torch.Tensor,
+    value_flat: torch.Tensor,
+    packed: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    region_size: int,
+    scale: float,
+    kv_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Call the original step4_block_sparse_attention operator (TGD)."""
+    try:
+        from cann_ops_transformer_custom.ops import step4_block_sparse_attention
+    except ImportError:
+        from cann_ops_transformer.ops.step4_block_sparse_attention import (
+            step4_block_sparse_attention,
+        )
+
+    out, _ = step4_block_sparse_attention(
+        query,
+        key_flat,
+        value_flat,
+        packed,
+        counts,
+        num_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        kv_seqlens=kv_seqlens,
+        region_size=region_size,
+        page_size=128,
+        scale_value=scale,
+        layout_q="TND",
+        layout_kv="TGD",
+        num_splits=1,
+        return_softmax_lse=False,
+    )
+    return out
 
 _CSA_ALLOCATION_ERROR = (
     "Step4 DSA active-slot capacity is exhausted. Lower max_num_seqs or "
@@ -830,18 +877,32 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
         )
-        out, _ = sparse_attention_decode(
-            query,
-            key_flat,
-            value_flat,
-            packed,
-            counts,
-            seq_lens_i32,
-            num_kv_groups=groups,
-            region_size=self.region_size,
-            softmax_scale=self.scale,
-            block_regions=2,
-        )
+        if _USE_ASCENDC_DSA:
+            out = _step4_ascendc_attn(
+                query,
+                key_flat,
+                value_flat,
+                packed,
+                counts,
+                num_heads=query.shape[1],
+                num_kv_heads=groups,
+                region_size=self.region_size,
+                scale=self.scale,
+                kv_seqlens=seq_lens_i32,
+            )
+        else:
+            out, _ = sparse_attention_decode(
+                query,
+                key_flat,
+                value_flat,
+                packed,
+                counts,
+                seq_lens_i32,
+                num_kv_groups=groups,
+                region_size=self.region_size,
+                softmax_scale=self.scale,
+                block_regions=2,
+            )
         output[:n] = out.to(output.dtype)
 
     def _score_regions(
@@ -963,17 +1024,30 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
         )
-        out, _ = sparse_attention_prefill(
-            query,
-            key_flat,
-            value_flat,
-            packed,
-            counts,
-            num_kv_groups=groups,
-            region_size=self.region_size,
-            softmax_scale=self.scale,
-            block_regions=2,
-        )
+        if _USE_ASCENDC_DSA:
+            out = _step4_ascendc_attn(
+                query,
+                key_flat,
+                value_flat,
+                packed,
+                counts,
+                num_heads=query.shape[1],
+                num_kv_heads=groups,
+                region_size=self.region_size,
+                scale=self.scale,
+            )
+        else:
+            out, _ = sparse_attention_prefill(
+                query,
+                key_flat,
+                value_flat,
+                packed,
+                counts,
+                num_kv_groups=groups,
+                region_size=self.region_size,
+                softmax_scale=self.scale,
+                block_regions=2,
+            )
         output[token_offset : token_offset + num_query_tokens] = out.to(output.dtype)
 
     def forward(
