@@ -1096,7 +1096,7 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             num_kv_groups=groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            block_regions=2,
+            block_regions=16,
         )
         output[:total] = out.to(output.dtype)
 
