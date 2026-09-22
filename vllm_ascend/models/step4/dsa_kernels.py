@@ -881,13 +881,14 @@ def indexer_logits_paged(
         (num_requests, padded_rows, block_d), device=mean_cache.device, dtype=torch.bfloat16,
     )
     key_valid = torch.empty((num_requests, padded_rows), device=mean_cache.device, dtype=torch.int32)
-    _prepare_indexer_cache[(triton.cdiv(padded_rows, 32), num_requests)](
+    _prepare_indexer_cache[(triton.cdiv(padded_rows, 256), num_requests)](
         mean_cache, block_table, prepared_cache, key_valid,
         seq_k, padded_rows, int(block_table.shape[1]),
         mean_cache.stride(0), mean_cache.stride(1), mean_cache.stride(3),
         block_table.stride(0), block_table.stride(1),
         SUMMARIES_PER_PAGE=int(summaries_per_page), PROXY_DIM=proxy_dim,
-        HAS_CACHE=mean_cache.shape[0] > 0, BLOCK_R=32, BLOCK_D=block_d,
+        HAS_CACHE=mean_cache.shape[0] > 0, BLOCK_R=256, BLOCK_D=block_d,
+        compile_mode = "simd",
     )
     segment_stride = triton.next_power_of_2(chunk_rows + 1)
     segments = torch.empty((q_chunks, segment_stride), device=index_q.device, dtype=torch.int32)
