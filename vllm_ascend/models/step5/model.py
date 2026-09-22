@@ -886,8 +886,6 @@ class AscendStep5Attention(Step5Attention):
             and getattr(self, "use_rope", False)
             and self.head_dim == 192
             and not getattr(self, "use_dsa_backend", False)
-            and not getattr(self, "use_step5_fused_qknorm_cache", False)
-            and not getattr(self, "use_step5_fused_qknorm", False)
         )
         if self.use_fused_qknorm_rope:
             self._fused_rotary_pairs = self.rotary_dim // 2
