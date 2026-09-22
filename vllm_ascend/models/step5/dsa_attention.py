@@ -418,6 +418,9 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         self._summary_cache_config = None
         self._dsa_scratch_workspace = Step5DSAScratchWorkspace()
         self._dsa_scratch_bound = False
+        # Cached ``arange`` for the selector's causal mask, sized to the largest
+        # region count seen so far and reused across calls/layers.
+        self._col_idx_cache: torch.Tensor | None = None
 
     # -- upstream-compatible side-storage contract ---------------------------
 
@@ -1193,31 +1196,28 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             p.context_lens_host,
         )
         groups = self.num_kv_groups
-        q_positions = positions[token_offset : token_offset + num_query_tokens].to(
-            torch.int32
-        )
-        # Token -> request map straight from the device start-loc.
-        requests = (
-            torch.searchsorted(
-                p.query_start_loc,
-                torch.arange(
-                    num_query_tokens, device=index_q.device, dtype=p.query_start_loc.dtype
-                ),
-                right=True,
+        # int64 positions go straight through: the append kernel narrows them
+        # in-register, and the history-length div works in int64.
+        q_positions = positions[token_offset : token_offset + num_query_tokens]
+        width = int(logits.shape[1])
+        col_idx = self._col_idx_cache
+        if col_idx is None or col_idx.numel() < width:
+            col_idx = torch.arange(
+                max(width, self._max_regions), device=logits.device
             )
-            - 1
-        ).to(torch.int32)
-        if groups > 1:
-            q_positions = q_positions.repeat(groups).contiguous()
-            requests = requests.repeat(groups).contiguous()
+            self._col_idx_cache = col_idx
+        # No per-row token -> request map: the append kernel derives the
+        # request from its grid coordinate via query_start_loc.
         packed, counts = prefill_sparse_meta(
             logits,
             q_positions,
             p.block_table,
-            requests,
+            p.query_start_loc,
+            max_query_len=p.max_query_len,
             topk=self.topk_regions,
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
+            col_idx=col_idx[:width],
         )
         out, _ = sparse_attention_prefill(
             query,

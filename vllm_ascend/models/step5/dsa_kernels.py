@@ -2215,52 +2215,74 @@ PREFILL_REGION_VALID_SHIFT = tl.constexpr(24)
 DECODE_PHYS_SHIFT = tl.constexpr(32)
 
 
+# Region ids sort in int16 whenever the width allows it: the NPU sort kernel is
+# roughly 2x faster on int16, and valid ids are strictly below ``cols``.
+_INT16_SORT_MAX_REGIONS = torch.iinfo(torch.int16).max  # 32767
+
+
 def topk_select_new(
-    logits: torch.Tensor, lengths: torch.Tensor, *, topk: int
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    *,
+    topk: int,
+    col_idx: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select logical region ids per row: batched ``torch.topk`` with causal truncation.
 
     Replaces the per-row Python loop with a single ``torch.topk`` on the full 2-D
     score matrix.  Causal truncation (``lengths``) is fused by writing SENTINEL to
     positions beyond each row's visible window, so ``torch.topk`` never selects them.
+    ``logits`` is modified **in place**: it is a fresh local buffer whose only
+    consumer is this selection, and the mask is built directly as the *invalid*
+    set (``col >= length``) -- together that skips the whole-tensor copy and the
+    logical-not of the old out-of-place formulation.
 
     Output order is ascending region id (matching the Triton selector's contract),
-    with ``-1`` padding kept at the tail.  ``torch.topk`` returns score-descending
-    order, so a stable sort by id restores the ascending-id convention that
-    ``_append_current_region_kernel`` expects (it inserts the current region at
-    ``history_counts``, which is correct only when history ids are ascending).
+    with the tail padded by the dtype-max sentinel -- ``INT16_MAX`` when
+    ``cols < 32767`` (the int16 sort halves the sort-kernel traffic), else
+    ``INT32_MAX``.  ``_append_current_region_kernel`` maps the sentinel to ``-1``
+    in-register, so no cast-back or trailing ``where`` pass is needed here.
+    ``torch.topk`` returns score-descending order, so a stable sort by id restores
+    the ascending-id convention that ``_append_current_region_kernel`` expects (it
+    inserts the current region at ``history_counts``, which is correct only when
+    history ids are ascending).
     """
     rows, cols = logits.shape
     device = logits.device
     topk = int(topk)
 
-    # Causal mask: col_idx < lengths[row] means visible.
-    col_idx = torch.arange(cols, device=device).unsqueeze(0)
-    visible_mask = col_idx < lengths.unsqueeze(1)
+    # Causal mask: col_idx < lengths[row] means visible.  ``col_idx`` is cached
+    # by the caller across layers; the comparison stays in int64 to match.
+    if col_idx is None:
+        col_idx = torch.arange(cols, device=device)
+    invalid_mask = col_idx.unsqueeze(0) >= lengths.unsqueeze(1)
 
     # SENTINEL for non-causal / invalid positions.
     SENTINEL = -1e30
     SENTINEL_THRESHOLD = -1e29
-    scores = logits.masked_fill(~visible_mask, SENTINEL)
+    logits.masked_fill_(invalid_mask, SENTINEL)
 
     # Batch top-k: single torch.topk on the full 2-D matrix.
     # sorted=False because we sort by id below anyway, so the internal score
     # ordering from topk is wasted work.
     k = min(topk, cols)
-    values, indices = torch.topk(scores, k=k, dim=1, sorted=False)
+    values, indices = torch.topk(logits, k=k, dim=1, sorted=False)
     valid = values > SENTINEL_THRESHOLD
 
-    # Build sort key directly: valid ids as-is, invalid -> INT_MAX so they
-    # sort to the tail, then one sort + one where to restore -1 sentinels.
-    INT_MAX = torch.iinfo(torch.int32).max
-    sort_input = torch.where(valid, indices.to(torch.int32), INT_MAX)
+    # Build sort key directly: valid ids as-is, invalid -> dtype-max sentinel so
+    # they sort to the tail.  NPU SelectV2 has no fast int16 path (it falls back
+    # and costs ~19 ms at this shape), so the int16 branch injects the sentinel
+    # in int32 first and narrows afterwards -- 32767 is INT16_MAX, exact in both
+    # widths, so the cast loses nothing.
+    use_int16 = cols < _INT16_SORT_MAX_REGIONS
+    sentinel = torch.iinfo(torch.int16).max if use_int16 else torch.iinfo(torch.int32).max
+    sort_input = torch.where(valid, indices.to(torch.int32), sentinel)
+    if use_int16:
+        sort_input = sort_input.to(torch.int16)
     if k < topk:
-        pad = torch.full((rows, topk - k), INT_MAX, dtype=torch.int32, device=device)
+        pad = torch.full((rows, topk - k), sentinel, dtype=sort_input.dtype, device=device)
         sort_input = torch.cat([sort_input, pad], dim=1)
-    logical = torch.sort(sort_input, dim=1).values
-    logical = torch.where(logical < INT_MAX, logical, -1)
-
-    return logical
+    return torch.sort(sort_input, dim=1).values
 
 
 @triton.jit
@@ -2268,16 +2290,18 @@ def _append_current_region_kernel(
     history_ptr,
     q_positions_ptr,
     block_table_ptr,
-    request_ptr,
+    query_start_loc_ptr,
     out_ptr,
     counts_ptr,
-    total_rows,
+    total_tokens,
     stride_history_row,
     stride_table_row,
     stride_out_row,
+    num_groups: tl.constexpr,
     topk: tl.constexpr,
     region_size: tl.constexpr,
     regions_per_page: tl.constexpr,
+    HISTORY_INVALID: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ) -> None:
@@ -2294,6 +2318,16 @@ def _append_current_region_kernel(
     (``min(current_region, topk) + 1``) and not a count of live entries. The appended slot
     lands at exactly the index the selector stopped filling.
 
+    Grid partitioning mirrors ``grid_score`` in the MiniMax-M3 Triton kernels:
+    axis 0 tiles one request's packed query tokens in ``BLOCK_ROWS`` chunks and
+    axis 1 folds ``num_reqs * num_groups``. Each program reads its token range
+    from ``query_start_loc`` and exits early once past the request's query
+    length, so the block-table row is a grid-derived scalar and no per-row
+    request-index tensor is materialized. Output rows stay group-major --
+    ``row = group * total_tokens + token`` -- and are contiguous within a
+    program. ``q_positions`` is indexed by token, so it is shared across
+    groups without a host-side ``repeat``.
+
     NPU optimisation: the current-region value is **merged** into the history tile via
     ``tl.where`` before a single vector store, eliminating the per-element exclusion
     mask (``slots != history_counts``) that was the vector-engine bottleneck and the
@@ -2302,24 +2336,31 @@ def _append_current_region_kernel(
     ``topk``-th slot is written by a separate scalar store whose address never overlaps
     the 2-D store, so no race is possible.
     """
-    pid = tl.program_id(0)
-    row_start = pid * BLOCK_ROWS
+    pid_q = tl.program_id(0)
+    pid_bg = tl.program_id(1)
+    req = pid_bg // num_groups
+    grp = pid_bg % num_groups
 
-    rows = row_start + tl.arange(0, BLOCK_ROWS)
-    row_ok = rows < total_rows
+    tok_begin = tl.load(query_start_loc_ptr + req).to(tl.int32)
+    tok_end = tl.load(query_start_loc_ptr + req + 1).to(tl.int32)
+    if pid_q * BLOCK_ROWS >= tok_end - tok_begin:
+        return
 
-    q_positions = tl.load(q_positions_ptr + rows, mask=row_ok, other=0).to(tl.int32)
-    requests = tl.load(request_ptr + rows, mask=row_ok, other=0).to(tl.int32)
+    tokens = tok_begin + pid_q * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    tok_ok = tokens < tok_end
+    rows = grp * total_tokens + tokens
+
+    q_positions = tl.load(q_positions_ptr + tokens, mask=tok_ok, other=0).to(tl.int32)
     current_regions = tl.maximum(q_positions // region_size, 0)
     history_counts = tl.minimum(current_regions, topk)
 
-    # Compute the current-region packed value (scalar per row) before the merge
-    # so it can be fused into the history tile.
+    # Compute the current-region packed value (scalar block-table row) before
+    # the merge so it can be fused into the history tile.
     pages = tl.load(
         block_table_ptr
-        + requests * stride_table_row
+        + req * stride_table_row
         + current_regions // regions_per_page,
-        mask=row_ok,
+        mask=tok_ok,
         other=-1,
     )
     physical = pages * regions_per_page + current_regions % regions_per_page
@@ -2330,21 +2371,23 @@ def _append_current_region_kernel(
     current_val = tl.where(pages >= 0, packed, -1)
 
     # Load history **logical region ids** for slots 0..topk-1 and pack them into
-    # prefill metadata words (phys_region | valid_tokens << 24).  Padding ids (-1)
-    # and unmapped pages both become -1 slots.
+    # prefill metadata words (phys_region | valid_tokens << 24).  The selector
+    # pads the tail with the dtype-max sentinel (INT16_MAX or INT32_MAX, passed
+    # as ``HISTORY_INVALID``); the ``>= 0`` half also accepts legacy -1 padding.
+    # Padding ids and unmapped pages both become -1 slots.
     slots = tl.arange(0, BLOCK_K)
     region_ids = tl.load(
         history_ptr + rows[:, None] * stride_history_row + slots[None, :],
-        mask=row_ok[:, None] & (slots[None, :] < topk),
-        other=-1,
-    )
-    valid_id = region_ids >= 0
+        mask=tok_ok[:, None] & (slots[None, :] < topk),
+        other=HISTORY_INVALID,
+    ).to(tl.int32)
+    valid_id = (region_ids >= 0) & (region_ids != HISTORY_INVALID)
     safe_ids = tl.where(valid_id, region_ids, 0)
     hist_pages = tl.load(
         block_table_ptr
-        + requests[:, None] * stride_table_row
+        + req * stride_table_row
         + safe_ids // regions_per_page,
-        mask=row_ok[:, None] & (slots[None, :] < topk),
+        mask=tok_ok[:, None] & (slots[None, :] < topk),
         other=-1,
     )
     hist_physical = hist_pages * regions_per_page + safe_ids % regions_per_page
@@ -2365,7 +2408,7 @@ def _append_current_region_kernel(
     tl.store(
         out_ptr + rows[:, None] * stride_out_row + slots[None, :],
         merged,
-        mask=row_ok[:, None] & (slots[None, :] < topk),
+        mask=tok_ok[:, None] & (slots[None, :] < topk),
     )
 
     # Handle the topk-th slot: current_val when history_counts == topk, else -1.
@@ -2374,9 +2417,9 @@ def _append_current_region_kernel(
     tl.store(
         out_ptr + rows * stride_out_row + topk,
         tl.where(history_counts == topk, current_val, -1),
-        mask=row_ok,
+        mask=tok_ok,
     )
-    tl.store(counts_ptr + rows, history_counts + 1, mask=row_ok)
+    tl.store(counts_ptr + rows, history_counts + 1, mask=tok_ok)
 
 
 @triton.jit
@@ -2509,11 +2552,13 @@ def prefill_sparse_meta(
     logits: torch.Tensor,
     q_positions: torch.Tensor,
     block_table: torch.Tensor,
-    request_indices: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor,
     *,
+    max_query_len: int,
     topk: int,
     region_size: int = REGION_BLOCK_SIZE,
     regions_per_page: int,
+    col_idx: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select regions and build prefill sparse metadata.
 
@@ -2521,12 +2566,21 @@ def prefill_sparse_meta(
         logits: ``[rows, seq_regions]`` float32 indexer scores, which may be signed,
             group-major (``rows = num_kv_groups * total_q``). The scores are weighted
             sums of per-head ReLU terms and unconstrained signed indexer weights.
-        q_positions: ``[rows]`` int32, absolute token position of each row's query.
+            **Modified in place** (dead columns are filled with SENTINEL).
+        q_positions: ``[total_q]`` int32 or int64, absolute token position of each
+            packed query token. Shared across KV groups -- the append kernel
+            indexes it by token, not by row, so no host-side ``repeat`` is needed.
         block_table: ``[num_reqs, pages]`` int32, logical page -> physical page, one row
             per request. ``-1`` marks an unmapped page, which yields a ``-1`` slot rather
             than an error.
-        request_indices: ``[rows]`` int32, which block-table row each score row uses.
-            Defaults to all-zero, i.e. every row shares one table.
+        query_start_loc: ``[num_reqs + 1]`` int32, each request's first token offset
+            within the packed query. Replaces the old per-row request-index tensor:
+            the append kernel's grid folds ``(request, group)`` into axis 1 and
+            derives its rows from these offsets.
+        max_query_len: host-side maximum per-request query length, sizing the
+            grid's token-block axis without a device sync.
+        col_idx: optional cached ``arange(seq_regions)`` for the causal mask;
+            the caller caches it across layers (see ``AscendStep4DSAImpl``).
 
     Returns:
         ``(packed [rows, topk + 1] int32, region_counts [rows] int32)``, ready for
@@ -2537,17 +2591,27 @@ def prefill_sparse_meta(
     region being force-included and it competing for a slot.
     """
     rows = int(logits.shape[0])
+    total_tokens = int(q_positions.shape[0])
     topk = int(topk)
-    if request_indices is None:
-        request_indices = torch.zeros((rows,), device=logits.device, dtype=torch.int32)
-    history_lengths = torch.div(
-        q_positions.to(torch.int32), region_size, rounding_mode="floor"
-    ).contiguous()
-
-    history = topk_select_new(logits, history_lengths, topk=topk)
-
     packed = torch.empty((rows, topk + 1), device=logits.device, dtype=torch.int32)
     counts = torch.empty((rows,), device=logits.device, dtype=torch.int32)
+    if rows == 0:
+        return packed, counts
+    if total_tokens == 0 or rows % total_tokens:
+        raise ValueError(
+            f"{rows} score rows do not divide into {total_tokens} query tokens"
+        )
+    groups = rows // total_tokens
+    num_reqs = int(query_start_loc.shape[0]) - 1
+
+    history_lengths = torch.div(q_positions, region_size, rounding_mode="floor")
+    if groups > 1:
+        history_lengths = history_lengths.repeat(groups)
+    history_lengths = history_lengths.contiguous()
+
+    history = topk_select_new(logits, history_lengths, topk=topk, col_idx=col_idx)
+    history_invalid = int(torch.iinfo(history.dtype).max)
+
     block_k = topk #triton.next_power_of_2(topk)
     # The merge-based kernel eliminates the per-element exclusion mask, so
     # the tile can be larger than the old 16 384-element ceiling.  However
@@ -2560,20 +2624,23 @@ def prefill_sparse_meta(
         max(2, triton.next_power_of_2(triton.cdiv(rows, 64))),
         max(2, _append_max_tile // block_k),
     )
-    _append_current_region_kernel[(triton.cdiv(rows, block_rows),)](
+    grid = (triton.cdiv(max(max_query_len, 1), block_rows), num_reqs * groups)
+    _append_current_region_kernel[grid](
         history,
         q_positions,
         block_table,
-        request_indices,
+        query_start_loc,
         packed,
         counts,
-        rows,
+        total_tokens,
         history.stride(0),
         shared_table_stride(block_table),
         packed.stride(0),
+        num_groups=groups,
         topk=topk,
         region_size=region_size,
         regions_per_page=regions_per_page,
+        HISTORY_INVALID=history_invalid,
         BLOCK_ROWS=block_rows,
         BLOCK_K=block_k,
     )
