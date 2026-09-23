@@ -17,6 +17,7 @@ import torch
 
 from cann_ops_transformer_custom.ops import (
     step4_block_sparse_attention,
+    step4_block_sparse_attention_metadata,
 )
 
 
@@ -75,8 +76,22 @@ def step4_block_sparse_attention_decode(
     """aclnn operator version of ``sparse_attention_decode``.
 
     ``packed_regions`` must be INT64 (Decode mode). ``kv_seqlens`` is required.
+    Generates FlashDecoding metadata via ``step4_block_sparse_attention_metadata``
+    before calling the main operator.
     """
     num_heads = query.shape[1]
+    head_dim = query.shape[-1]
+    kv_tokens = key_cache.shape[0]
+    metadata = step4_block_sparse_attention_metadata(
+        packed_regions,
+        region_counts,
+        kv_seqlens,
+        num_heads,
+        num_kv_groups,
+        head_dim,
+        region_size,
+        kv_tokens,
+    )
     out, lse = step4_block_sparse_attention(
         query,
         key_cache,
@@ -92,6 +107,6 @@ def step4_block_sparse_attention_decode(
         layout_q="TND",
         layout_kv="TGD",
         return_softmax_lse=return_softmax_lse,
-        metadata=None,
+        metadata=metadata,
     )
     return out, lse
