@@ -2189,12 +2189,20 @@ word          ``phys | valid_tokens << 24``    ``start_token | phys << 32``
 valid_tokens  packed                          derived from ``kv_seqlen``
 dropped slot  left in place as ``-1``         compacted out
 tail padding  ``-1``                          **zero**
-order         ascending logical region        ascending packed word (physical)
+order         ascending logical region        ascending logical region
 ============  ==============================  ================================
 
 The zero padding on the decode side is the sharp edge: a zero word is a structurally valid
 slot pointing at physical region 0 with a full complement of tokens. Nothing but
 ``region_counts`` distinguishes it from a real selection.
+
+The decode ordering was changed from ascending *packed word* (physical page order) to
+ascending *logical region id*, matching the H200 reference's production decode path
+(``convert_region_block_topk_to_sparse_meta_step3p5`` with ``sort_output=False``,
+gated by ``VLLM_STEP4_DSA_FORCE_STABLE_TOPK``, default on): a logical ordering is
+reproducible under prefix-cache page remapping, a physical one is not. The attention
+consumer treats the slots as an unordered set, so this only changes FP reduction
+order, not the selected set.
 """
 
 
@@ -2205,8 +2213,6 @@ import triton.language as tl
 
 PREFILL_REGION_VALID_SHIFT = tl.constexpr(24)
 DECODE_PHYS_SHIFT = tl.constexpr(32)
-# Larger than any real packed word, so invalid slots sort to the tail.
-DECODE_SORT_SENTINEL = tl.constexpr(1 << 62)
 
 
 def topk_select_new(
@@ -2378,10 +2384,10 @@ def _decode_pack_kernel(
     ids_ptr,
     seqlens_ptr,
     block_table_ptr,
-    request_ptr,
     out_ptr,
     counts_ptr,
     total_rows,
+    num_reqs,
     stride_ids_row,
     stride_table_row,
     stride_out_row,
@@ -2390,26 +2396,26 @@ def _decode_pack_kernel(
     regions_per_page: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    USE_SORT: tl.constexpr,
 ) -> None:
     """Pack selected logical regions into the int64 decode word.
 
-    Invalid slots are mapped to a sentinel above every real word.  Compaction
-    places valid entries first (sorted ascending), then the current region,
-    then zero padding.
+    Compaction places valid entries first **in their input (ascending logical
+    region id) order**, then the current region, then zero padding.  This
+    matches the H200 reference's production decode metadata
+    (``convert_region_block_topk_to_sparse_meta_step3p5`` with
+    ``sort_output=False``): a logical ordering is reproducible under
+    prefix-cache page remapping, whereas a physical-page ordering is not.
+    The attention consumer is order-insensitive (online softmax over a slot
+    set), so only the FP reduction order changes versus the old
+    physical-word-sorted layout.
 
-    Two ranking strategies, selected at launch time by ``USE_SORT``:
-
-    * ``USE_SORT=False`` (small ``BLOCK_K``): comparison-matrix rank on a 2-D
-      tile.  Valid packed words are unique, so a single 3-D pass counting
-      strictly-smaller elements gives a unique rank.  Sentinel ties are broken
-      by a cheap 1-D cumsum -- no second O(K^2) pass.
-
-    * ``USE_SORT=True`` (large ``BLOCK_K``): ``tl.sort(.., dim=1)`` on the 2-D
-      tile, which avoids the 3-D tensor size limit of the NPU backend.
-
-    In both cases the current region is merged into the output tensor before a
-    single vector store, avoiding any vector/scalar store race.
+    The scatter is race-free by construction: live slots take positions
+    ``0..count-1`` via a cumsum, dead slots take disjoint tail positions
+    ``count..topk-1`` via a second cumsum, and every output position is
+    written exactly once.  The current region is merged into the dead slot
+    landing at position ``count`` before the single 2-D store (and into the
+    separate ``topk``-th slot store when ``count == topk``), so no address is
+    ever written twice.
 
     NPU optimisation: one program processes ``BLOCK_ROWS`` rows simultaneously
     via 2-D vectorisation.
@@ -2420,7 +2426,9 @@ def _decode_pack_kernel(
     rows = row_start + tl.arange(0, BLOCK_ROWS)
     row_ok = rows < total_rows
 
-    requests = tl.load(request_ptr + rows, mask=row_ok, other=0).to(tl.int32)
+    # Decode rows are group-major: row = group * num_reqs + request, so the
+    # request index is grid-derived and no per-row request tensor is needed.
+    requests = rows % num_reqs
     kv_seqlens = tl.load(seqlens_ptr + requests, mask=row_ok, other=0).to(tl.int32)
     valid_regions = (kv_seqlens + region_size - 1) // region_size
 
@@ -2446,11 +2454,6 @@ def _decode_pack_kernel(
     packed = (safe_ids * region_size).to(tl.int64) | (
         physical.to(tl.int64) << DECODE_PHYS_SHIFT
     )
-    # Give each sentinel a unique high-32-bit value so the ranking produces
-    # unique ranks without needing a cumsum-based tie-break pass.
-    sentinel_hi = ((DECODE_SORT_SENTINEL >> DECODE_PHYS_SHIFT) + slots).to(tl.int32)
-    sentinel_packed = sentinel_hi.to(tl.int64) << DECODE_PHYS_SHIFT
-    packed = tl.where(live, packed, sentinel_packed[None, :])
 
     count = tl.sum(live.to(tl.int32), axis=1)
 
@@ -2472,74 +2475,25 @@ def _decode_pack_kernel(
     )
     current_val = tl.where(current_live, current_packed, 0)
 
-    if USE_SORT:
-        packed_hi = (packed >> DECODE_PHYS_SHIFT).to(tl.int32)
-        local_rows = tl.arange(0, BLOCK_ROWS)
-        xbase = row_start * stride_ids_row
-        tl.store(
-            ids_ptr + xbase + slots[None, :] * BLOCK_ROWS + local_rows[:, None],
-            packed_hi,
-            mask=row_ok[:, None],
-        )
-        # Four independent rank accumulators break the sequential
-        # dependency chain of a single ``rank +=`` — the four
-        # comparison-and-add sub-chains execute with more ILP, and the
-        # loop runs BLOCK_K/4 iterations instead of BLOCK_K.
-        rank0 = tl.zeros((BLOCK_ROWS, BLOCK_K), dtype=tl.int32)
-        rank1 = tl.zeros((BLOCK_ROWS, BLOCK_K), dtype=tl.int32)
-        rank2 = tl.zeros((BLOCK_ROWS, BLOCK_K), dtype=tl.int32)
-        rank3 = tl.zeros((BLOCK_ROWS, BLOCK_K), dtype=tl.int32)
-        for j_start in tl.range(0, BLOCK_K, 4, num_stages=4):
-            c0 = tl.load(ids_ptr + xbase + (j_start) * BLOCK_ROWS + local_rows, mask=row_ok, other=2147483648)
-            c1 = tl.load(ids_ptr + xbase + (j_start + 1) * BLOCK_ROWS + local_rows, mask=row_ok, other=2147483648)
-            c2 = tl.load(ids_ptr + xbase + (j_start + 2) * BLOCK_ROWS + local_rows, mask=row_ok, other=2147483648)
-            c3 = tl.load(ids_ptr + xbase + (j_start + 3) * BLOCK_ROWS + local_rows, mask=row_ok, other=2147483648)
-            rank0 += (c0[:, None] < packed_hi).to(tl.int32)
-            rank1 += (c1[:, None] < packed_hi).to(tl.int32)
-            rank2 += (c2[:, None] < packed_hi).to(tl.int32)
-            rank3 += (c3[:, None] < packed_hi).to(tl.int32)
-        rank = (rank0 + rank1) + (rank2 + rank3)
-        # Sentinel values are already unique (see packed construction above),
-        # so every element has a unique rank — no tie-breaking needed.
+    # Cumsum compaction in ascending logical region id order.  Live slots
+    # scatter to 0..count-1 (input order preserved); dead slots scatter to
+    # disjoint tail positions count..topk-1 carrying zeros.  The dead rank
+    # needs no second scan: dead_count(s) = s - live_pos(s), so
+    # dead_pos(s) = count + s - live_pos(s) - 1.  The dead slot at position
+    # ``count`` is overwritten by the current region in-register, so every
+    # output position in 0..topk-1 is written exactly once.
+    live_pos = tl.cumsum(live.to(tl.int32), axis=1) - 1
+    dead_pos = count[:, None] + slots[None, :] - live_pos - 1
+    positions = tl.where(live, live_pos, dead_pos)
+    out_val = tl.where(live, packed, 0)
+    out_val = tl.where(positions == count[:, None], current_val[:, None], out_val)
+    tl.store(
+        out_ptr + rows[:, None] * stride_out_row + positions,
+        out_val,
+        mask=row_ok[:, None] & (slots[None, :] < topk),
+    )
 
-        out_val = tl.where(rank < count[:, None], packed, 0)
-        out_val = tl.where(rank == count[:, None], current_val[:, None], out_val)
-        tl.store(
-            out_ptr + rows[:, None] * stride_out_row + rank,
-            out_val,
-            mask=row_ok[:, None]
-            & (slots[None, :] < topk + 1)
-            & (rank < topk + 1),
-        )
-    else:
-        # Comparison-matrix rank (single 3-D pass, int32 comparisons).
-        # Each valid packed word carries a unique *physical* id in the high
-        # 32 bits (because the block table is a permutation and
-        # regions_per_page distinguishes regions within a page).  Sentinels
-        # carry unique high-bits values (1 << 30 + slot) which exceed every
-        # real physical id.  So an int32 comparison on the high word alone
-        # gives the same ordering as the full int64 comparison -- at roughly
-        # half the vector-engine cost on the NPU.
-        packed_hi = (packed >> DECODE_PHYS_SHIFT).to(tl.int32)
-        rank = tl.sum(
-            (packed_hi[:, None, :] < packed_hi[:, :, None]).to(tl.int32), axis=2
-        )
-        # Sentinel values are already unique, so rank is unique — no
-        # cumsum tie-break needed.
-
-        # Scatter to rank positions: rank < count -> sorted value,
-        # rank == count -> current region, rank > count -> 0.
-        out_val = tl.where(rank < count[:, None], packed, 0)
-        out_val = tl.where(rank == count[:, None], current_val[:, None], out_val)
-        tl.store(
-            out_ptr + rows[:, None] * stride_out_row + rank,
-            out_val,
-            mask=row_ok[:, None]
-            & (slots[None, :] < topk + 1)
-            & (rank < topk + 1),
-        )
-
-    # When BLOCK_K == topk the scatter/sort above only covers positions
+    # When BLOCK_K == topk the scatter above only covers positions
     # 0..topk-1.  Store the topk-th position separately: current region
     # if all topk slots are valid (count == topk), else zero.
     tl.store(
@@ -2630,7 +2584,6 @@ def decode_sparse_meta(
     logits: torch.Tensor,
     kv_seqlens: torch.Tensor,
     block_table: torch.Tensor,
-    request_indices: torch.Tensor | None = None,
     *,
     topk: int,
     region_size: int = REGION_BLOCK_SIZE,
@@ -2644,8 +2597,6 @@ def decode_sparse_meta(
             than by the magnitude encoded in their IEEE-754 bit pattern.
         kv_seqlens: ``[num_reqs]`` int32, context length *including* the current token.
         block_table: ``[num_reqs, pages]`` int32, logical page -> physical page.
-        request_indices: ``[rows]`` int32. Defaults to the group-major layout implied by
-            the row count, ``arange(num_reqs)`` tiled once per KV group.
 
     Returns:
         ``(packed [rows, topk + 1] int64, region_counts [rows] int32)``, ready for
@@ -2654,45 +2605,44 @@ def decode_sparse_meta(
     ``region_counts`` here is a count of *surviving* entries, so it varies with how much of
     the block table is mapped. The tail beyond it is zero, and a zero word is not
     self-identifying -- the count is the only bound.
+
+    Rows are group-major (``row = group * num_reqs + request``), so the pack kernel
+    derives each row's request from its index and no per-row request-index tensor is
+    materialized; ``history_lengths`` is likewise a plain ``repeat`` of the
+    per-request base lengths rather than a gather.
     """
     rows, _ = logits.shape
     num_reqs = int(kv_seqlens.shape[0])
     topk = int(topk)
     if rows % num_reqs:
         raise ValueError(f"{rows} score rows do not divide into {num_reqs} requests")
-
-    if request_indices is None:
-        request_indices = (
-            torch.arange(num_reqs, device=logits.device, dtype=torch.int32)
-            .repeat(rows // num_reqs)
-            .contiguous()
-        )
-    req_idx = request_indices.to(torch.long)
+    groups = rows // num_reqs
 
     history_lengths = torch.div(
         (kv_seqlens.to(torch.int32) - 1).clamp_min(0), region_size, rounding_mode="floor"
-    )[req_idx].contiguous()
+    )
+    if groups > 1:
+        history_lengths = history_lengths.repeat(groups)
+    history_lengths = history_lengths.contiguous()
 
     ids = region_topk_ids(logits, history_lengths, topk=topk)
 
     packed = torch.empty((rows, topk + 1), device=logits.device, dtype=torch.int64)
     counts = torch.empty((rows,), device=logits.device, dtype=torch.int32)
     block_k = triton.next_power_of_2(topk)
-    use_sort = block_k > 256
-    if use_sort:
-        block_rows = min(128, max(2, triton.next_power_of_2(triton.cdiv(rows, 64))))
-        block_rows = min(block_rows, max(1, 65536 // block_k))
-    else:
-        block_rows = min(128, max(2, triton.next_power_of_2(triton.cdiv(rows, 64))))
-        block_rows = min(block_rows, max(1, 1048576 // (block_k * block_k)))
+    # The cumsum compaction needs no staging buffer and no O(K^2) tile, so the
+    # only tile-size constraint is the NPU UB budget (same 8 192-element
+    # guidance as the prefill append kernel).
+    block_rows = min(128, max(2, triton.next_power_of_2(triton.cdiv(rows, 64))))
+    block_rows = min(block_rows, max(2, 8192 // block_k))
     _decode_pack_kernel[(triton.cdiv(rows, block_rows),)](
         ids,
         kv_seqlens,
         block_table,
-        request_indices,
         packed,
         counts,
         rows,
+        num_reqs,
         ids.stride(0),
         shared_table_stride(block_table),
         packed.stride(0),
@@ -2701,7 +2651,6 @@ def decode_sparse_meta(
         regions_per_page=regions_per_page,
         BLOCK_ROWS=block_rows,
         BLOCK_K=block_k,
-        USE_SORT=use_sort,
     )
     return packed, counts
 
