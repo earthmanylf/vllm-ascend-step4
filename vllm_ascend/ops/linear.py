@@ -390,16 +390,11 @@ class AscendRowParallelLinear(RowParallelLinear):
             and self.tp_size in MMRS_SUPPORTED_TP_SIZES
             and isinstance(self.quant_method, AscendUnquantizedLinearMethod)
             and self.params_dtype in MMRS_SUPPORTED_DTYPES
-            # Only the STANDARD family (A2/A3, comm_mode="aiv") is enabled.
-            # On A5 the kernel only accepts comm_mode="ai_cpu"/"ccu", and
-            # experiments on 950DT (CANN 9.1.0 / torch_npu 2.10.0.post4) show
-            # that once the fused kernel runs on a user-created HCCL comm
-            # (vllm's TP group is always one), subsequent plain collectives
-            # on other comms fail with HcclLaunchAicpuKernel "execute kernel
-            # param invalid" -- vllm deployments always run multiple comms
-            # (TP/EP/PP/DP), so the kernel is unusable on A5 until the
-            # platform fixes this. 310P has no such kernel at all.
-            and get_current_hardware_profile().device_adaptor_family is DeviceAdaptorFamily.STANDARD
+            # comm_mode is dispatched per adaptor family by DeviceOperator:
+            # A2/A3 (STANDARD) run comm_mode="aiv", A5 (FP8_OPTIMIZED) runs
+            # comm_mode="ai_cpu" (validated on 950DT). Only 310P is excluded:
+            # it has no such kernel at all.
+            and get_current_hardware_profile().device_adaptor_family is not DeviceAdaptorFamily.COMPATIBILITY
         )
 
     def _mmrs_fusion_ready(self) -> bool:

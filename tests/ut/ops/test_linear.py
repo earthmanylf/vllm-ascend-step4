@@ -326,9 +326,9 @@ class TestRowParallelLinearMmrsFusion(unittest.TestCase):
             patch("vllm_ascend.ops.linear_op.get_tp_group", return_value=self.mock_group),
             patch("vllm.distributed.parallel_state.get_tp_group", return_value=self.mock_group),
             patch("vllm.distributed.get_tp_group", return_value=self.mock_group),
-            # The fused kernel is only enabled on the STANDARD device adaptor
-            # family (A2/A3); pin the hardware profile so the tests do not
-            # depend on the machine running them.
+            # The fused kernel is enabled on every device adaptor family
+            # except 310P (COMPATIBILITY); pin the hardware profile so the
+            # tests do not depend on the machine running them.
             patch(
                 "vllm_ascend.ops.linear.get_current_hardware_profile",
                 return_value=MagicMock(device_adaptor_family=DeviceAdaptorFamily.STANDARD),
@@ -370,16 +370,21 @@ class TestRowParallelLinearMmrsFusion(unittest.TestCase):
         linear.tp_size = 16
         self.assertFalse(linear._mmrs_fusion_eligible())
 
-    def test_ineligible_on_non_standard_device_family(self):
-        """A5 (FP8_OPTIMIZED) and 310P (COMPATIBILITY) must not fuse: the
-        kernel breaks other HCCL comms there (950DT, CANN 9.1.0)."""
+    def test_ineligible_on_compatibility_device_family(self):
+        """310P (COMPATIBILITY) must not fuse: it has no such kernel at all.
+        A5 (FP8_OPTIMIZED) fuses via the ai_cpu comm_mode adaptor dispatch."""
         linear = self._make_linear()
-        for family in (DeviceAdaptorFamily.FP8_OPTIMIZED, DeviceAdaptorFamily.COMPATIBILITY):
+        with patch(
+            "vllm_ascend.ops.linear.get_current_hardware_profile",
+            return_value=MagicMock(device_adaptor_family=DeviceAdaptorFamily.COMPATIBILITY),
+        ):
+            self.assertFalse(linear._mmrs_fusion_eligible())
+        for family in (DeviceAdaptorFamily.STANDARD, DeviceAdaptorFamily.FP8_OPTIMIZED):
             with patch(
                 "vllm_ascend.ops.linear.get_current_hardware_profile",
                 return_value=MagicMock(device_adaptor_family=family),
             ):
-                self.assertFalse(linear._mmrs_fusion_eligible())
+                self.assertTrue(linear._mmrs_fusion_eligible())
 
     @patch("vllm_ascend.ops.linear.get_forward_context")
     @patch("vllm_ascend.ops.linear.torch_npu.get_npu_format", return_value=2)
