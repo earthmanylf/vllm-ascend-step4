@@ -59,6 +59,14 @@ from vllm.v1.request import RequestStatus
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, AscendSlidingWindowMLASpec
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.kv_transfer.utils.step5 import (
+    STEP5_PD_VERSION,
+    add_step5_summary_caches,
+    is_step5_model,
+    prepare_step5_prefill,
+    step5_remote_prefix_tokens,
+    validate_step5_pd_config,
+)
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     RegisterRegions,
     collect_storage_merged_register_regions,
@@ -979,6 +987,15 @@ class KVCacheRecvingThread(threading.Thread):
                     group_spec,
                     raw_layer_indices,
                 )
+                if is_step5_model(self.vllm_config):
+                    if tp_num_need_pulls != 1 or len(local_kv_caches_base_addrs[layer_idx]) != len(
+                        remote_kv_caches_base_addrs[remote_layer_idx]
+                    ):
+                        raise ValueError("Step5 Mooncake V1 requires matching P/D cache components and TP.")
+                    if len(local_kv_caches_base_addrs[layer_idx]) == 3 and (
+                        self.block_stride_per_addr[layer_idx][2] != remote_block_stride_per_addr[remote_layer_idx][2]
+                    ):
+                        raise ValueError("Step5 P/D summary page sizes differ.")
                 for cache_idx in range(len(local_kv_caches_base_addrs[layer_idx])):
                     src_layer_base_addr = local_kv_caches_base_addrs[layer_idx][cache_idx]
                     dst_layer_base_addr = remote_kv_caches_base_addrs[remote_layer_idx][cache_idx]
@@ -1622,6 +1639,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
+
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
@@ -1762,6 +1783,13 @@ class MooncakeConnectorScheduler:
         self.use_compress = self._model_uses_compress()
         self.group_transfer_info = [self._get_group_transfer_info(group) for group in kv_cache_config.kv_cache_groups]
         self.need_truncate = self.use_compress or any(info.is_state_group for info in self.group_transfer_info)
+        self.step5_pd = is_step5_model(vllm_config)
+        if self.step5_pd:
+            validate_step5_pd_config(vllm_config)
+
+    def on_new_request(self, request: "Request") -> None:
+        if self.step5_pd:
+            prepare_step5_prefill(request, self.block_size)
 
     def _model_uses_compress(self) -> bool:
         hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
@@ -1915,7 +1943,11 @@ class MooncakeConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
-            actual = self._state_prefill_token_count(len(token_ids))
+            actual = (
+                step5_remote_prefix_tokens(request, self.block_size)
+                if getattr(self, "step5_pd", False)
+                else self._state_prefill_token_count(len(token_ids))
+            )
             params["num_computed_tokens"] = num_computed_tokens
             count = max(actual - num_computed_tokens, 0)
             if count > 0:
@@ -2023,16 +2055,19 @@ class MooncakeConnectorScheduler:
         if not params.get("do_remote_decode") or request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             return False, None
 
-        num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
-        computed_block_ids = self._get_transfer_block_ids(block_ids, len(request.prompt_token_ids))
+        prompt_len = request.num_prompt_tokens if getattr(self, "step5_pd", False) else len(request.prompt_token_ids)
+        num_prompt_blocks = math.ceil(prompt_len / self.block_size)
+        computed_block_ids = self._get_transfer_block_ids(block_ids, prompt_len)
         computed_block_ids = self._get_swa_transfer_block_ids(computed_block_ids)
+        if getattr(self, "step5_pd", False) and params["step5_prefix_tokens"] == 0:
+            computed_block_ids = tuple([] for _ in self.kv_cache_groups)
         computed_block_lens = [len(block_id_list) for block_id_list in computed_block_ids]
         delay_free_blocks = sum(computed_block_lens) > 0
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s", sum(computed_block_lens), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
 
-        return delay_free_blocks, dict(
+        transfer_params = dict(
             do_remote_prefill=True,
             do_remote_decode=False,
             remote_block_ids=computed_block_ids,
@@ -2048,6 +2083,13 @@ class MooncakeConnectorScheduler:
             num_prompt_blocks=num_prompt_blocks,
             remote_block_size=self.block_size,
         )
+        if getattr(self, "step5_pd", False):
+            transfer_params.update(
+                step5_pd_version=STEP5_PD_VERSION,
+                step5_prefix_tokens=params["step5_prefix_tokens"],
+                step5_original_prompt_tokens=params["step5_original_prompt_tokens"],
+            )
+        return delay_free_blocks, transfer_params
 
     def _port_offset_from_handshake_metadata(
         self,
@@ -2131,7 +2173,16 @@ class MooncakeConnectorWorker:
 
         self.max_device_id = self.tp_size * self.dp_size * self.pcp_size * self.pp_size
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-        self.num_key_value_heads = self.vllm_config.model_config.hf_text_config.num_key_value_heads
+        self.step5_pd = is_step5_model(vllm_config)
+        if self.step5_pd:
+            validate_step5_pd_config(vllm_config)
+            if self.ascend_config.enable_kv_nz:
+                raise ValueError("Step5 Mooncake V1 requires ND KV cache (enable_kv_nz=False).")
+        self.num_key_value_heads = (
+            self.vllm_config.model_config.hf_text_config.num_attention_groups
+            if self.step5_pd
+            else self.vllm_config.model_config.hf_text_config.num_key_value_heads
+        )
 
         # kv cache config
         self.kv_cache_config = kv_cache_config
@@ -2520,6 +2571,12 @@ class MooncakeConnectorWorker:
 
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
+        owner_kv_caches = kv_caches
+        summary_caches = {}
+        if self.step5_pd:
+            kv_caches, summary_caches = add_step5_summary_caches(
+                kv_caches, self.vllm_config.compilation_config.static_forward_context
+            )
         self.kv_caches = kv_caches
         # Maps each KV cache group to its serialized group spec and physical
         # layer indices: {group_id: (group_spec, [layer_idx0, layer_idx1, ...])}.
@@ -2563,16 +2620,21 @@ class MooncakeConnectorWorker:
                 self.kv_caches_base_addr[layer_idx].append(single_kv_cache.data_ptr())
 
         if has_mamba_group:
-            ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
+            ptrs, lengths = self._get_registered_kv_tensor_buffers(owner_kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         elif self.use_hybrid:
-            ptrs, lengths = self._get_registered_kv_tensor_buffers_hybrid(kv_caches)
+            ptrs, lengths = self._get_registered_kv_tensor_buffers_hybrid(owner_kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         else:
             # For normal attention / sparse-c8 KV cache, keep metadata at the
             # logical tensor level but merge registration ranges by underlying
             # storage to avoid exceeding the HCCL per-process region limit.
-            register_regions = collect_storage_merged_register_regions(kv_caches)
+            register_regions = collect_storage_merged_register_regions(owner_kv_caches)
+
+        if summary_caches:
+            summary_regions = collect_storage_merged_register_regions(summary_caches)
+            register_regions.ptrs.extend(summary_regions.ptrs)
+            register_regions.lengths.extend(summary_regions.lengths)
 
         validate_register_region_count(register_regions)
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
@@ -3648,6 +3710,13 @@ class MooncakeConnectorWorker:
 
             remote_req_id = meta.remote_request_id
             prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
+            if getattr(self, "step5_pd", False) and (
+                prefill_tp_size != self.tp_size
+                or meta.remote_pcp_size != 1
+                or meta.remote_dcp_size != 1
+                or meta.remote_block_size != self.block_size
+            ):
+                raise ValueError("Step5 remote peer must have matching TP/block size and PCP=DCP=1.")
             (
                 local_block_ids_replicate_k,
                 remote_block_ids_replicate_k,

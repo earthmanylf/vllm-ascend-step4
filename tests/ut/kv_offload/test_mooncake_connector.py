@@ -1,3 +1,4 @@
+import ctypes
 import os
 import queue
 import socket
@@ -87,6 +88,15 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     string_to_int64_hash,
     transfer_groups_need_independent_block_ids,
     zmq_ctx,
+)
+from vllm_ascend.distributed.kv_transfer.utils.step5 import (  # noqa: E402
+    STEP5_BUFFER_ALIGNMENT,
+    add_step5_summary_caches,
+    allocate_step5_summary_cache,
+    prepare_step5_prefill,
+    step5_prefix_tokens,
+    step5_remote_prefix_tokens,
+    validate_step5_pd_config,
 )
 
 for _k, _v in _saved_modules.items():
@@ -1102,6 +1112,42 @@ class TestCoreFunctionality(unittest.TestCase):
         self.mock_queue.task_done.assert_called_once()
 
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
+    def test_step5_reads_kv_and_summary_with_identical_page_remapping(self, mock_get_meta):
+        # Exercise real byte copies through the connector's transfer address
+        # builder: summary pages must follow K/V even for noncontiguous IDs.
+        self.vllm_config.model_config.hf_text_config.model_type = "step5"
+        k = torch.arange(8, dtype=torch.bfloat16).view(8, 1, 1, 1).expand(8, 128, 1, 192).clone()
+        remote = (k, k + 32, torch.arange(8, dtype=torch.uint8).view(8, 1).expand(8, 4096).clone())
+        local = tuple(torch.zeros_like(cache) for cache in remote)
+        local_ptrs = [cache.data_ptr() for cache in local]
+        remote_ptrs = [cache.data_ptr() for cache in remote]
+        lengths = [cache[0].numel() * cache.element_size() for cache in local]
+        self.thread.kv_caches_base_addr["local_engine"] = {5555: [local_ptrs]}
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [remote_ptrs]}
+        self.thread.block_len_per_addr = [lengths]
+        self.thread.block_stride_per_addr = [lengths]
+        self.thread.remote_block_stride_per_addr["remote_engine"] = {6666: [lengths]}
+        self.thread.block_size_scale = [[1, 1, 1]]
+        self.thread.remote_block_size_scale["remote_engine"] = {6666: [[1, 1, 1]]}
+        self.thread.kv_group2layeridx = {0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0])}
+
+        def read_bytes(session, dst, src, sizes):
+            for d, s, size in zip(dst, src, sizes):
+                ctypes.memmove(d, s, size)
+            return 0
+
+        self.engine.batch_transfer_sync_read.side_effect = read_bytes
+        req = dict(self.test_req, local_block_ids=[[1, 5]], remote_block_ids=[[6, 2]], remote_block_size=128)
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config") as config:
+            config.return_value.enable_kv_nz = False
+            self.thread._transfer_kv_cache_all_groups(req)
+        for dst, src in zip(local, remote):
+            torch.testing.assert_close(dst[1], src[6])
+            torch.testing.assert_close(dst[5], src[2])
+            self.assertEqual(dst[0].count_nonzero(), 0)
+        mock_get_meta.assert_not_called()
+
+    @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_kv_cache(self, mock_get_meta):
         with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config") as mock_config:
             mock_config.return_value.enable_kv_nz = False
@@ -1695,6 +1741,99 @@ class MockKVCacheConfig:
         self.num_blocks = num_blocks
 
 
+class TestStep5MooncakeContract(unittest.TestCase):
+    def test_prefill_truncation_updates_water18_request_views(self):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request
+
+        request = Request(
+            "step5",
+            list(range(1025)),
+            SamplingParams(max_tokens=1, extra_args={"kv_transfer_params": {"do_remote_decode": True}}),
+            None,
+        )
+        prepare_step5_prefill(request, 128)
+        self.assertEqual(request.num_tokens, 896)
+        self.assertEqual(request.num_prompt_tokens, 896)
+        self.assertEqual(list(request.all_token_ids), list(range(896)))
+        request.append_output_token_ids(17)
+        self.assertEqual(request.num_tokens, 897)
+        self.assertEqual(list(request.output_token_ids), [17])
+
+    def test_replay_boundaries_cover_region_and_page_edges(self):
+        for length in (1, 7, 8, 9, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025):
+            with self.subTest(length=length):
+                prefix = step5_prefix_tokens(length, 128)
+                self.assertEqual(prefix % 128, 0)
+                self.assertEqual(prefix % 8, 0)
+                self.assertLessEqual(prefix, max(0, length - 128))
+                if prefix:
+                    self.assertGreaterEqual(length - prefix, 128)
+                    self.assertLess(length - prefix, 256)
+
+    def test_rejects_incompatible_remote_handoff(self):
+        params = dict(
+            step5_pd_version=1, step5_original_prompt_tokens=1025, step5_prefix_tokens=896, remote_block_size=128
+        )
+        request = types.SimpleNamespace(num_prompt_tokens=1025, kv_transfer_params=params)
+        self.assertEqual(step5_remote_prefix_tokens(request, 128), 896)
+        for key in params:
+            with self.subTest(key=key):
+                request.kv_transfer_params = {**params, key: -1}
+                with self.assertRaisesRegex(ValueError, "handoff contract mismatch"):
+                    step5_remote_prefix_tokens(request, 128)
+
+    def test_only_connector_view_contains_aligned_summary_pages(self):
+        summary = allocate_step5_summary_cache(4, 4096, "cpu")
+        k = torch.zeros((4, 128, 1, 192), dtype=torch.bfloat16)
+        original = {"model.layers.0.attn": (k, k.clone())}
+        owner = types.SimpleNamespace(sparse_summary_cache=types.SimpleNamespace(kv_cache=summary))
+        transfer, sidecars = add_step5_summary_caches(original, {"model.layers.0.attn": owner})
+        self.assertEqual(len(original["model.layers.0.attn"]), 2)
+        self.assertIs(transfer["model.layers.0.attn"][2], summary)
+        self.assertIs(sidecars["model.layers.0.attn"], summary)
+        self.assertEqual(summary.data_ptr() % STEP5_BUFFER_ALIGNMENT, 0)
+        self.assertEqual(summary.count_nonzero(), 0)
+        self.assertEqual(summary.untyped_storage().nbytes(), summary.numel() + STEP5_BUFFER_ALIGNMENT - 1)
+
+    def test_rejects_unbound_or_incompatible_summary_pages(self):
+        k = torch.zeros((4, 128, 1, 192), dtype=torch.bfloat16)
+        original = {"layer": (k, k.clone())}
+        owner = types.SimpleNamespace(sparse_summary_cache=types.SimpleNamespace(kv_cache=None))
+        with self.assertRaisesRegex(ValueError, "not been bound"):
+            add_step5_summary_caches(original, {"layer": owner})
+        owner.sparse_summary_cache.kv_cache = allocate_step5_summary_cache(3, 4096, "cpu")
+        with self.assertRaisesRegex(ValueError, "one scheduler page"):
+            add_step5_summary_caches(original, {"layer": owner})
+
+    def test_unsupported_parallel_and_speculative_modes_fail_before_serving(self):
+        config = MockVllmConfig()
+        config.cache_config.block_size = 128
+        validate_step5_pd_config(config)
+        for field in ("prefill_context_parallel_size", "decode_context_parallel_size", "pipeline_parallel_size"):
+            with self.subTest(field=field):
+                setattr(config.parallel_config, field, 2)
+                with self.assertRaisesRegex(ValueError, "PP=PCP=DCP=1"):
+                    validate_step5_pd_config(config)
+                setattr(config.parallel_config, field, 1)
+        config.speculative_config = object()
+        with self.assertRaisesRegex(ValueError, "speculative decoding"):
+            validate_step5_pd_config(config)
+        config.speculative_config = None
+        config.parallel_config.tensor_parallel_size = 4
+        with self.assertRaisesRegex(ValueError, "matching P/D TP"):
+            validate_step5_pd_config(config)
+
+    def test_does_not_mutate_ordinary_requests_or_cut_multimodal_inputs(self):
+        request = types.SimpleNamespace(kv_transfer_params={})
+        prepare_step5_prefill(request, 128)
+        self.assertEqual(vars(request), {"kv_transfer_params": {}})
+        request.kv_transfer_params = {"do_remote_decode": True}
+        request.mm_features = [object()]
+        with self.assertRaisesRegex(ValueError, "text prompts only"):
+            prepare_step5_prefill(request, 128)
+
+
 class TestKVCacheTaskTracker(unittest.TestCase):
     def setUp(self):
         self.tracker = KVCacheTaskTracker()
@@ -2053,6 +2192,58 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         tokens, async_flag = self.scheduler.get_num_new_matched_tokens(request, 0)
         self.assertEqual(tokens, 0)
         self.assertFalse(async_flag)
+
+    def test_step5_handoff_leaves_page_aligned_replay_and_preserves_swa_tail(self):
+        self.scheduler.step5_pd = True
+        self.scheduler.block_size = 128
+        p = types.SimpleNamespace(
+            request_id="p",
+            prompt_token_ids=list(range(1025)),
+            prompt_embeds=None,
+            _all_token_ids=list(range(1025)),
+            num_prompt_tokens=1025,
+            kv_transfer_params={"do_remote_decode": True},
+            output_token_ids=[7],
+            status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        )
+        self.scheduler.on_new_request(p)
+        self.assertEqual(p.num_prompt_tokens, 896)
+        self.assertEqual(p.prompt_token_ids, list(range(896)))
+        self.scheduler.on_new_request(p)
+        self.assertEqual(p.num_prompt_tokens, 896)
+        # P now ends exactly at the handoff point, so ordinary SWA tail
+        # clipping retains the window D needs to replay token 896.
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GroupTransferInfo
+
+        self.scheduler.group_transfer_info = [GroupTransferInfo(128, 5, False)]
+        delayed, metadata = self.scheduler.request_finished(p, ([1, 2, 3, 4, 5, 6, 7],))
+        self.assertTrue(delayed)
+        self.assertEqual(metadata["remote_block_ids"], ([3, 4, 5, 6, 7],))
+        d = types.SimpleNamespace(
+            prompt_token_ids=list(range(1025)), num_prompt_tokens=1025, kv_transfer_params=metadata
+        )
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(d, 256), (640, True))
+        self.assertLessEqual(256 + 640, d.num_prompt_tokens - 128)
+
+    def test_step5_short_prompt_has_no_delayed_remote_blocks(self):
+        self.scheduler.step5_pd = True
+        self.scheduler.block_size = 128
+        p = types.SimpleNamespace(
+            request_id="p",
+            prompt_token_ids=[1] * 129,
+            prompt_embeds=None,
+            _all_token_ids=[1] * 129,
+            num_prompt_tokens=129,
+            kv_transfer_params={"do_remote_decode": True},
+            output_token_ids=[7],
+            status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        )
+        self.scheduler.on_new_request(p)
+        delayed, metadata = self.scheduler.request_finished(p, ([1, 2],))
+        self.assertFalse(delayed)
+        self.assertEqual(metadata["remote_block_ids"], ([],))
+        d = types.SimpleNamespace(prompt_token_ids=[1] * 129, num_prompt_tokens=129, kv_transfer_params=metadata)
+        self.assertEqual(self.scheduler.get_num_new_matched_tokens(d, 0), (0, False))
 
     def test_get_num_new_matched_tokens_with_remote_prefill(self):
         request = MockRequest("req1", kv_transfer_params={"do_remote_prefill": True})
@@ -2605,6 +2796,38 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertEqual(len(worker.kv_caches), 1)
         self.assertIsNotNone(worker.kv_send_thread)
         self.assertIsNone(worker.kv_recv_thread)
+
+    def test_register_step5_includes_summary_in_metadata_and_registered_memory(self):
+        self.vllm_config.model_config.hf_text_config.model_type = "step5"
+        self.vllm_config.model_config.hf_text_config.num_attention_groups = 2
+        self.vllm_config.cache_config.block_size = 128
+        name = "model.layers.0.self_attn"
+        summary = allocate_step5_summary_cache(4, 4096, "cpu")
+        k = torch.zeros((4, 128, 1, 192), dtype=torch.bfloat16)
+        caches = {name: (k, k.clone())}
+        self.vllm_config.compilation_config = types.SimpleNamespace(
+            static_forward_context={
+                name: types.SimpleNamespace(sparse_summary_cache=types.SimpleNamespace(kv_cache=summary))
+            }
+        )
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config",
+                return_value=types.SimpleNamespace(enable_kv_nz=False),
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer"
+            ) as register,
+        ):
+            worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig(num_blocks=4))
+            worker.register_kv_caches(caches)
+        self.assertEqual(worker.num_key_value_heads, 2)
+        self.assertEqual(len(caches[name]), 2)
+        self.assertEqual(worker.block_len_per_addr[0], [49152, 49152, 4096])
+        self.assertEqual(worker.block_size_scale[0], [1, 1, 1])
+        self.assertEqual(worker.xfer_handshake_metadata.kv_caches_base_addr[0][2], summary.data_ptr())
+        self.assertIn(summary.data_ptr(), register.call_args.args[0])
+        self.assertIn(summary.nbytes, register.call_args.args[1])
 
     def test_register_kv_caches_consumer(self):
         self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"

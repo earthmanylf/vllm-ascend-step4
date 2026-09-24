@@ -30,6 +30,10 @@ from vllm.models.step5.sparse_summary_cache import (
     step5_sparse_summary_cache_bytes_per_block,
 )
 
+from vllm_ascend.distributed.kv_transfer.utils.step5 import (
+    STEP5_BUFFER_ALIGNMENT,
+    allocate_step5_summary_cache,
+)
 from vllm_ascend.models.step5.summary_kernels import csa_reset_blocks
 
 logger = init_logger(__name__)
@@ -118,6 +122,12 @@ class AscendStep5SparseSummaryCache(Step5SparseSummaryCache):
 class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
     """Binds ``AscendStep5SparseSummaryCache`` instead of the upstream class."""
 
+    mooncake_pd: bool = False
+
+    def _fixed_runtime_state_budget(self, block_size: int) -> int:
+        budget = super()._fixed_runtime_state_budget(block_size)
+        return budget + (STEP5_BUFFER_ALIGNMENT - 1 if self.mooncake_pd else 0)
+
     def bind_kv_cache_side_storage(
         self,
         forward_context: dict[str, Any],
@@ -139,7 +149,9 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
                 and _cfg.kv_transfer_config.kv_connector
                 in ("DecodeBenchConnector", "PreFilledDecodeBenchConnector")
             )
-            if not _is_decode_bench:
+            if not _is_decode_bench and not (
+                self.mooncake_pd and _cfg.kv_transfer_config.kv_connector == "MooncakeConnectorV1"
+            ):
                 raise RuntimeError(
                     "Step5 DSA sparse summary side storage is not compatible with "
                     "v1 KV transfer/offload yet. Disable kv_transfer_config for "
@@ -215,11 +227,14 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
         )
         self._backing_bytes_per_page = int(backing_bytes)
         self._budget_bytes_per_page = int(backing_bytes + reverse_map_bytes)
-        backing = torch.zeros(
-            (num_blocks, int(backing_bytes)),
-            device=owner_k_cache.device,
-            dtype=torch.uint8,
-        )
+        if self.mooncake_pd:
+            backing = allocate_step5_summary_cache(num_blocks, int(backing_bytes), owner_k_cache.device)
+        else:
+            backing = torch.zeros(
+                (num_blocks, int(backing_bytes)),
+                device=owner_k_cache.device,
+                dtype=torch.uint8,
+            )
         self._kv_cache = backing
         self._bind_summary_cache(backing, summary_dtype=summary_dtype)
         cache = self._target_impl._summary_cache

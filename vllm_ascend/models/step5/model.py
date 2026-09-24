@@ -92,6 +92,7 @@ from vllm.models.step5.model import (
 import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
 from vllm_ascend import envs
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.distributed.kv_transfer.utils.step5 import validate_step5_pd_config
 from vllm_ascend.models.step5.dsa_attention import (
     AscendStep5DSABackend,
     AscendStep5DSAImpl,
@@ -435,6 +436,12 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             main_layer_name=self.layer_name,
             static_forward_context=compilation_config.static_forward_context,
         )
+        transfer_config = vllm_config.kv_transfer_config
+        self.sparse_summary_cache.mooncake_pd = (
+            transfer_config is not None and transfer_config.kv_connector == "MooncakeConnectorV1"
+        )
+        if self.sparse_summary_cache.mooncake_pd:
+            validate_step5_pd_config(vllm_config)
         self.kv_cache_extra_budget_page_size_bytes = (
             self.sparse_summary_cache._set_summary_cache_budget
         )
