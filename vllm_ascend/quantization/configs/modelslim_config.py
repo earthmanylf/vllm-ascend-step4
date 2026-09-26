@@ -406,6 +406,12 @@ QUANT_MODEL_SUBSTR_MAPPINGS = {
     "step3p5_mtp": {
         ".mtp_block.": ".",
     },
+    # Same for the step5 MTP draft: the module tree nests the decoder block
+    # under ".mtp_block." while the checkpoint keys it without that infix
+    # (e.g. "model.layers.92.self_attn.q_proj.weight").
+    "step5_mtp": {
+        ".mtp_block.": ".",
+    },
     # Gemma4 MoE renames ".experts." to ".moe.experts." in the vLLM module tree
     # (gemma4.py weight mapper), but the ModelSlim quant description keeps the
     # original ".experts." naming. Strip the ".moe" infix so the quant lookup
@@ -417,6 +423,12 @@ QUANT_MODEL_SUBSTR_MAPPINGS = {
         ".moe.experts": ".experts",
     },
 }
+
+
+# Step5 model types whose ModelSlim checkpoints share the same layout.  The
+# MTP draft (vLLM's speculative config sets model_type="step5_mtp") reuses
+# the same fused module layout as the verifier.
+_STEP5_MODEL_TYPES = ("step5", "step5_vl", "step5_mtp")
 
 
 def get_packed_modules_mapping(model_type: str) -> dict[str, list[str]]:
@@ -449,6 +461,18 @@ def get_packed_modules_mapping(model_type: str) -> dict[str, list[str]]:
                 "in_proj_gfab": gate_shards,
             }
         )
+        return mapping
+    if model_type in _STEP5_MODEL_TYPES:
+        # Start from vLLM's model-owned mapping so changes to its fused
+        # attention/MLP projections remain the source of truth.  ModelSlim
+        # Step5 checkpoints store the routed-expert projections fused across
+        # all experts as "moe.{gate,up,down}_proj" (no "experts.E." infix), so
+        # the FusedMoE "experts" container resolves its shards directly
+        # against those keys.
+        from vllm.models.step5.model import STEP5_PACKED_MODULES_MAPPING
+
+        mapping = {packed_name: list(shard_names) for packed_name, shard_names in STEP5_PACKED_MODULES_MAPPING.items()}
+        mapping["experts"] = ["gate_proj", "up_proj", "down_proj"]
         return mapping
     return packed_modules_model_mapping.get(model_type, {})
 
@@ -791,7 +815,7 @@ class AscendModelSlimConfig(QuantizationConfig):
             # Adapt to bailing_hybrid architecture: update layer names to MoE convention
             prefix = prefix.replace("linear_attn", "attention")
             prefix = prefix.replace("self_attn", "attention")
-        if model_type in packed_modules_model_mapping or model_type in ("kimi_k3", "kimi_linear"):
+        if model_type in packed_modules_model_mapping or model_type in ("kimi_k3", "kimi_linear") + _STEP5_MODEL_TYPES:
             self.packed_modules_mapping = get_packed_modules_mapping(model_type)
         prefix = self.quant_prefix_mapper(model_type, prefix)
 
@@ -846,6 +870,22 @@ class AscendModelSlimConfig(QuantizationConfig):
             # The model adapter replaces this temporary packed projection with
             # separate quantized q/k/v and floating-point gate projections.
             return True
+
+        if self.model_type == "step5_mtp":
+            # The ModelSlim tool does not emit quant entries for Step5 MTP
+            # draft layers (they stay in bf16), so a prefix with no
+            # description coverage at all is treated as FLOAT, i.e.
+            # unquantized.  Prefixes with partial coverage fall through to
+            # the strict shard checks below.
+            probe_proj_name = prefix.split(".")[-1]
+            if probe_proj_name in fused_mapping:
+                probe_prefixes = [
+                    prefix.replace(probe_proj_name, shard_proj_name) for shard_proj_name in fused_mapping[probe_proj_name]
+                ]
+            else:
+                probe_prefixes = [prefix]
+            if not any(f"{probe_prefix}.weight" in self.quant_description for probe_prefix in probe_prefixes):
+                return True
 
         proj_name = prefix.split(".")[-1]
         if proj_name in fused_mapping:

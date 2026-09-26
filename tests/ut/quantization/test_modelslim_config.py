@@ -726,6 +726,144 @@ class TestQuantPrefixMapper(TestBase):
 
         self.assertEqual(prefix, "model.layers.0.moe.experts")
 
+    def test_step5_packed_modules_mapping_covers_attention_mlp_and_moe(self):
+        expected_mapping = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            "qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+            "qkv_indexer_proj": [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "sparse_indexer_q",
+                "sparse_indexer_k",
+                "sparse_indexer_z",
+                "g_proj",
+            ],
+            "gate_up_proj": ["gate_proj", "up_proj"],
+            "experts": ["gate_proj", "up_proj", "down_proj"],
+        }
+        for model_type in ("step5", "step5_vl"):
+            with self.subTest(model_type=model_type):
+                self.assertEqual(get_packed_modules_mapping(model_type), expected_mapping)
+
+    def test_step5_moe_experts_prefix_maps_to_fused_quant_description_keys(self):
+        # ModelSlim Step5 checkpoints fuse all routed experts into single
+        # tensors named "moe.{gate,up,down}_proj" (no "experts.E." infix).
+        quant_description = {
+            "model.layers.3.moe.gate_proj.weight": "W8A8_MXFP8",
+            "model.layers.3.moe.up_proj.weight": "W8A8_MXFP8",
+            "model.layers.3.moe.down_proj.weight": "W8A8_MXFP8",
+        }
+        for model_type in ("step5", "step5_vl"):
+            with self.subTest(model_type=model_type):
+                config = AscendModelSlimConfig(quant_description)
+                packed_mapping = get_packed_modules_mapping(model_type)
+                prefix = "model.layers.3.moe.experts"
+
+                self.assertEqual(get_linear_quant_type(quant_description, prefix, packed_mapping), "W8A8_MXFP8")
+                self.assertFalse(config.is_layer_skipped_ascend(prefix, packed_mapping))
+
+    def test_step5_moe_experts_float_shards_are_skipped_together(self):
+        quant_description = {
+            "model.layers.88.moe.gate_proj.weight": "FLOAT",
+            "model.layers.88.moe.up_proj.weight": "FLOAT",
+            "model.layers.88.moe.down_proj.weight": "FLOAT",
+        }
+        config = AscendModelSlimConfig(quant_description)
+
+        self.assertTrue(config.is_layer_skipped_ascend("model.layers.88.moe.experts", get_packed_modules_mapping("step5_vl")))
+
+    def test_step5_moe_experts_mixed_shards_still_raise(self):
+        quant_description = {
+            "model.layers.3.moe.gate_proj.weight": "FLOAT",
+            "model.layers.3.moe.up_proj.weight": "W8A8_MXFP8",
+            "model.layers.3.moe.down_proj.weight": "W8A8_MXFP8",
+        }
+        config = AscendModelSlimConfig(quant_description)
+        packed_mapping = get_packed_modules_mapping("step5_vl")
+
+        with self.assertRaises(ValueError):
+            get_linear_quant_type(quant_description, "model.layers.3.moe.experts", packed_mapping)
+        with self.assertRaises(ValueError):
+            config.is_layer_skipped_ascend("model.layers.3.moe.experts", packed_mapping)
+
+    def test_step5_fused_attention_layers_keep_upstream_mapping(self):
+        quant_description = {
+            f"model.layers.3.self_attn.{name}.weight": "FLOAT"
+            for name in (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "g_proj",
+                "sparse_indexer_q",
+                "sparse_indexer_k",
+                "sparse_indexer_z",
+            )
+        }
+        config = AscendModelSlimConfig(quant_description)
+        packed_mapping = get_packed_modules_mapping("step5_vl")
+
+        for fused_name in ("qkv_proj", "qkvg_proj", "qkv_indexer_proj"):
+            with self.subTest(fused_name=fused_name):
+                self.assertTrue(config.is_layer_skipped_ascend(f"model.layers.3.self_attn.{fused_name}", packed_mapping))
+
+    def test_step5_mtp_packed_modules_mapping_matches_verifier(self):
+        self.assertEqual(
+            get_packed_modules_mapping("step5_mtp"),
+            get_packed_modules_mapping("step5_vl"),
+        )
+
+    def test_step5_mtp_prefix_mapper_strips_mtp_block_infix(self):
+        config = AscendModelSlimConfig()
+
+        prefix = config.quant_prefix_mapper("step5_mtp", "model.layers.92.mtp_block.self_attn.qkv_proj")
+
+        self.assertEqual(prefix, "model.layers.92.self_attn.qkv_proj")
+
+    def test_step5_mtp_layers_without_description_coverage_are_skipped(self):
+        # The ModelSlim tool emits no quant entries for Step5 MTP draft
+        # layers (they stay in bf16), so uncovered prefixes are unquantized.
+        quant_description = {
+            "model.embed_tokens.weight": "FLOAT",
+        }
+        config = AscendModelSlimConfig(quant_description)
+        config.model_type = "step5_mtp"
+        packed_mapping = get_packed_modules_mapping("step5_mtp")
+
+        for prefix in (
+            "model.layers.92.self_attn.qkv_proj",
+            "model.layers.92.self_attn.o_proj",
+            "model.layers.92.mlp.gate_up_proj",
+            "model.layers.92.mlp.down_proj",
+            "model.layers.92.eh_proj",
+            "model.layers.92.shared_head.head",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertTrue(config.is_layer_skipped_ascend(prefix, packed_mapping))
+        # Described layers still follow the normal FLOAT/skip logic.
+        self.assertTrue(config.is_layer_skipped_ascend("model.embed_tokens", packed_mapping))
+
+    def test_step5_mtp_partial_description_coverage_still_raises(self):
+        quant_description = {
+            "model.layers.92.self_attn.q_proj.weight": "W8A8_MXFP8",
+        }
+        config = AscendModelSlimConfig(quant_description)
+        config.model_type = "step5_mtp"
+        packed_mapping = get_packed_modules_mapping("step5_mtp")
+
+        with self.assertRaises(KeyError):
+            config.is_layer_skipped_ascend("model.layers.92.self_attn.qkv_proj", packed_mapping)
+
+    def test_step5_mtp_missing_coverage_probe_is_model_type_scoped(self):
+        # The same missing prefix must keep raising for the verifier model
+        # type so genuine description gaps are not masked.
+        config = AscendModelSlimConfig({})
+        config.model_type = "step5_vl"
+        packed_mapping = get_packed_modules_mapping("step5_vl")
+
+        with self.assertRaises(KeyError):
+            config.is_layer_skipped_ascend("model.layers.92.self_attn.qkv_proj", packed_mapping)
+
 
 class TestGetKvQuantDtype(TestBase):
     def test_enable_fa_quant(self):

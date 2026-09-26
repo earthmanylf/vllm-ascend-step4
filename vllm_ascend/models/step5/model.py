@@ -12,7 +12,10 @@ self-managed per layer while K/V live in the standard paged KV pool.
 
 Weight loading, MoE, norms and the causal-LM shell are inherited from the
 upstream vLLM implementation, so module/parameter names here mirror it
-exactly (qkv_indexer_proj, sparse_indexer_*, ssmax_s, ...).
+exactly (qkv_indexer_proj, sparse_indexer_*, ssmax_s, ...).  The only
+load-time adaptation reshapes ModelSlim's 2D fused-expert tensors into the
+3D stacked layout the upstream loader expects (see
+``_reshape_step5_fused_expert_weights``).
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import copy
 import os
 import re
 
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -1344,6 +1348,50 @@ class AscendStep5Model(Step5Model):
         return hidden_states
 
 
+# ModelSlim MXFP8 checkpoints store the routed-expert projections fused
+# across all experts as 2D "[num_experts * out_features, in_features]"
+# tensors, while the upstream Step5 loader requires 3D stacked
+# "[num_experts, out_features, in_features]" tensors (it validates that the
+# leading dimension equals moe_num_experts).  The suffixes below mirror the
+# upstream expert_params_mapping weight names; ".moe.share_expert.*" and the
+# dense-MLP projections must not match.
+_STEP5_FUSED_EXPERT_2D_SUFFIXES = (
+    ".moe.gate_proj.weight",
+    ".moe.up_proj.weight",
+    ".moe.down_proj.weight",
+    ".moe.gate_proj.weight_scale",
+    ".moe.up_proj.weight_scale",
+    ".moe.down_proj.weight_scale",
+    ".moe.gate_proj.weight_scale_2",
+    ".moe.up_proj.weight_scale_2",
+    ".moe.down_proj.weight_scale_2",
+    ".moe.gate_proj.input_scale",
+    ".moe.up_proj.input_scale",
+    ".moe.down_proj.input_scale",
+)
+
+
+def _reshape_step5_fused_expert_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    num_experts: int,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Reshape 2D fused-expert checkpoint tensors to the 3D stacked layout.
+
+    Only tensors with an expert-projection suffix, a 2D shape, and a leading
+    dimension that is a non-trivial multiple of ``num_experts`` are reshaped;
+    everything else passes through untouched (the reshape is a view).
+    """
+    for name, tensor in weights:
+        if (
+            tensor.ndim == 2
+            and name.endswith(_STEP5_FUSED_EXPERT_2D_SUFFIXES)
+            and tensor.shape[0] != num_experts
+            and tensor.shape[0] % num_experts == 0
+        ):
+            tensor = tensor.reshape(num_experts, tensor.shape[0] // num_experts, tensor.shape[1])
+        yield name, tensor
+
+
 class AscendStep5ForCausalLM(Step5ForCausalLM):
     def __init__(
         self,
@@ -1394,6 +1442,11 @@ class AscendStep5ForCausalLM(Step5ForCausalLM):
                 example_layer = layer.moe
                 self.moe_layers.append(layer.moe.experts)
         _set_step5_moe_protocol_metadata(self, example_layer)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Adapt 2D fused-expert tensors (ModelSlim MXFP8 layout) to the 3D
+        # stacked layout the upstream loader expects.
+        return super().load_weights(_reshape_step5_fused_expert_weights(weights, self.model.moe_num_experts))
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.fp32_residual_connection:
