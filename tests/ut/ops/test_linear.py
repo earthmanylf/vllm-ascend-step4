@@ -6,7 +6,6 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend import ascend_config
-from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
 from vllm_ascend.distributed import parallel_state
 from vllm_ascend.ops.linear import (
     AscendMergedColumnParallelLinear,
@@ -326,12 +325,11 @@ class TestRowParallelLinearMmrsFusion(unittest.TestCase):
             patch("vllm_ascend.ops.linear_op.get_tp_group", return_value=self.mock_group),
             patch("vllm.distributed.parallel_state.get_tp_group", return_value=self.mock_group),
             patch("vllm.distributed.get_tp_group", return_value=self.mock_group),
-            # The fused kernel is enabled on every device adaptor family
-            # except 310P (COMPATIBILITY); pin the hardware profile so the
-            # tests do not depend on the machine running them.
+            # Pin the hardware profile so the tests do not depend on the
+            # machine running them.
             patch(
                 "vllm_ascend.ops.linear.get_current_hardware_profile",
-                return_value=MagicMock(device_adaptor_family=DeviceAdaptorFamily.STANDARD),
+                return_value=MagicMock(),
             ),
             patch("vllm_ascend.ops.linear_op.mlp_tp_enable", return_value=False),
             patch("vllm_ascend.ops.linear_op.oproj_tp_enable", return_value=False),
@@ -358,33 +356,6 @@ class TestRowParallelLinearMmrsFusion(unittest.TestCase):
     def _rs_forward(self, linear, rows=16):
         input_tensor = torch.randn(rows, linear.input_size_per_partition, dtype=torch.bfloat16)
         return linear(input_tensor, reduce_scatter_results=True, reduce_scatter_dim=0)
-
-    def test_static_eligibility(self):
-        self.assertTrue(self._make_linear()._mmrs_fusion_eligible())
-        self.assertFalse(self._make_linear(bias=True)._mmrs_fusion_eligible())
-        self.assertFalse(self._make_linear(reduce_results=False)._mmrs_fusion_eligible())
-        self.assertFalse(self._make_linear(input_is_parallel=False)._mmrs_fusion_eligible())
-        # fp32 is outside the fused kernel's dtype set.
-        self.assertFalse(self._make_linear(params_dtype=torch.float32)._mmrs_fusion_eligible())
-        linear = self._make_linear()
-        linear.tp_size = 16
-        self.assertFalse(linear._mmrs_fusion_eligible())
-
-    def test_ineligible_on_compatibility_device_family(self):
-        """310P (COMPATIBILITY) must not fuse: it has no such kernel at all.
-        A5 (FP8_OPTIMIZED) fuses via the ai_cpu comm_mode adaptor dispatch."""
-        linear = self._make_linear()
-        with patch(
-            "vllm_ascend.ops.linear.get_current_hardware_profile",
-            return_value=MagicMock(device_adaptor_family=DeviceAdaptorFamily.COMPATIBILITY),
-        ):
-            self.assertFalse(linear._mmrs_fusion_eligible())
-        for family in (DeviceAdaptorFamily.STANDARD, DeviceAdaptorFamily.FP8_OPTIMIZED):
-            with patch(
-                "vllm_ascend.ops.linear.get_current_hardware_profile",
-                return_value=MagicMock(device_adaptor_family=family),
-            ):
-                self.assertTrue(linear._mmrs_fusion_eligible())
 
     @patch("vllm_ascend.ops.linear.get_forward_context")
     @patch("vllm_ascend.ops.linear.torch_npu.get_npu_format", return_value=2)

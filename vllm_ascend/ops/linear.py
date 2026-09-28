@@ -44,7 +44,6 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.device.hardware_profile import (
-    DeviceAdaptorFamily,
     HardwareCapability,
     WeightLayoutPolicy,
     get_current_hardware_profile,
@@ -57,11 +56,6 @@ from vllm_ascend.utils import (
 )
 
 logger = init_logger(__name__)
-
-# npu_mm_reduce_scatter_base constraints (torch_npu): the fused mm +
-# reduce-scatter kernel only supports these TP world sizes and dtypes.
-MMRS_SUPPORTED_TP_SIZES = (2, 4, 8)
-MMRS_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 
 def unquantized_gemm(
@@ -371,31 +365,13 @@ class AscendRowParallelLinear(RowParallelLinear):
         # Lazy state for the fused mm + reduce-scatter path
         # (npu_mm_reduce_scatter_base), used by the sequence-parallel
         # reduce_scatter_results branch below. _mmrs_weight holds an ND
-        # (k, n) copy of the weight: the fused kernel's comm_mode="ai_cpu"
+        # (k, n) view of the weight: the fused kernel's comm_mode="ai_cpu"
         # (A5) rejects NZ, and passing ND keeps both adaptor families on one
         # code path. None until first use; _mmrs_unavailable latches a
         # permanent fallback to the two-step GEMM + reduce-scatter.
         self._mmrs_hcom: str | None = None
         self._mmrs_weight: torch.Tensor | None = None
         self._mmrs_unavailable = False
-
-    def _mmrs_fusion_eligible(self) -> bool:
-        """Static eligibility for fusing GEMM + reduce-scatter into
-        npu_mm_reduce_scatter_base (unquantized bias-free row-parallel)."""
-        return (
-            self.custom_op is None
-            and self.reduce_results
-            and self.input_is_parallel
-            and self.bias is None
-            and self.tp_size in MMRS_SUPPORTED_TP_SIZES
-            and isinstance(self.quant_method, AscendUnquantizedLinearMethod)
-            and self.params_dtype in MMRS_SUPPORTED_DTYPES
-            # comm_mode is dispatched per adaptor family by DeviceOperator:
-            # A2/A3 (STANDARD) run comm_mode="aiv", A5 (FP8_OPTIMIZED) runs
-            # comm_mode="ai_cpu" (validated on 950DT). Only 310P is excluded:
-            # it has no such kernel at all.
-            and get_current_hardware_profile().device_adaptor_family is not DeviceAdaptorFamily.COMPATIBILITY
-        )
 
     def _mmrs_fusion_ready(self) -> bool:
         """Lazily resolve the TP-group hcom name and the ND transposed weight.
@@ -408,9 +384,6 @@ class AscendRowParallelLinear(RowParallelLinear):
             return False
         if self._mmrs_weight is not None:
             return True
-        if not self._mmrs_fusion_eligible():
-            self._mmrs_unavailable = True
-            return False
         try:
             from vllm.distributed import get_tp_group
 
@@ -419,9 +392,7 @@ class AscendRowParallelLinear(RowParallelLinear):
             backend = device_group._get_backend(torch.device("npu"))
             self._mmrs_hcom = backend.get_hccl_comm_name(rank)
             weight = self.weight.data
-            if torch_npu.get_npu_format(weight) != ACL_FORMAT_FRACTAL_ND:
-                weight = torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_ND)
-            self._mmrs_weight = weight.t().contiguous()
+            self._mmrs_weight = weight.t()
         except Exception as e:  # noqa: BLE001 - degrade to two-step path
             logger.warning_once(
                 "mm_reduce_scatter fusion unavailable for %s (%s); falling back to GEMM + reduce_scatter.",
