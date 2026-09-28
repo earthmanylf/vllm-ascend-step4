@@ -1,3 +1,4 @@
+import copy
 import inspect
 from typing import Optional
 
@@ -151,9 +152,24 @@ class Step5Fp8BlockConfig(AscendFp8Config):
     untouched and executes them with the kernels vendored from the step5-hf
     reference (see ``Step5Fp8BlockFusedMoEMethod``) instead of resolving to
     bf16 or requantizing to MXFP8. Dense linear layers keep the inherited
-    behaviour; the Step5 model only hands this config to ``FusedMoEFactory``
-    when the ``VLLM_ASCEND_ENABLE_STEP4_FP8`` env var is set.
+    behaviour.
+
+    Skipped layers (those listed under ``ignored_layers`` / ``modules_to_not_convert``)
+    are handled exactly like upstream ``Fp8Config``: ``is_layer_skipped`` is used
+    to decide whether a FusedMoE layer falls back to the unquantized Ascend MoE
+    method. For Step5 block-fp8 checkpoints this means layers whose
+    ``moe.experts.*`` weights appear in ``modules_to_not_convert`` become bf16.
     """
+
+    @classmethod
+    def from_ascend_fp8_config(
+        cls,
+        config: AscendFp8Config,
+    ) -> "Step5Fp8BlockConfig":
+        """Create a Step5-specific fp8 config from a generic AscendFp8Config."""
+        step5_config = copy.copy(config)
+        step5_config.__class__ = cls
+        return step5_config
 
     def get_quant_method(
         self,
@@ -162,8 +178,23 @@ class Step5Fp8BlockConfig(AscendFp8Config):
         tid2eid=None,
     ) -> Optional["QuantizeMethodBase"]:
         from ..method_adapters import AscendFusedMoEMethod
+        from vllm_ascend.ops.fused_moe.routed_experts import (
+            AscendUnquantizedFusedMoEMethod,
+        )
 
         if is_fused_moe_layer(layer):
+            skip_kwargs = {}
+            if _IS_LAYER_SKIPPED_SUPPORTS_MATCH_MODE:
+                skip_kwargs["match_mode"] = getattr(
+                    self, "ignored_layers_match_mode", "exact"
+                )
+            if is_layer_skipped(
+                prefix,
+                self.ignored_layers,
+                self.packed_modules_mapping,
+                **skip_kwargs,
+            ):
+                return AscendUnquantizedFusedMoEMethod(layer.moe_config, tid2eid)
             self._verify_block_quantization()
             scheme_class = get_scheme_class(FP8_METHOD, "step5_moe")
             assert scheme_class is not None, f"No scheme registered for {FP8_METHOD}/step5_moe"

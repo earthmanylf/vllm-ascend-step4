@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import copy
 import os
-import re
 
 from typing import Any
 
@@ -90,7 +89,6 @@ from vllm.models.step5.model import (
 )
 
 import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
-from vllm_ascend import envs
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.step5.dsa_attention import (
     AscendStep5DSABackend,
@@ -103,7 +101,6 @@ from vllm_ascend.models.step5.fused_qknorm_rope import (
     fused_qknorm_rope,
 )
 from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCacheLayer
-from vllm_ascend.quantization.configs.fp8_config import AscendFp8Config, Step5Fp8BlockConfig
 
 logger = init_logger(__name__)
 
@@ -118,37 +115,6 @@ def _kv_cache_torch_dtype(cache_config, vllm_config) -> torch.dtype:
     if cache_dtype in ("float", "fp32", "float32"):
         return torch.float32
     raise ValueError(f"Unsupported step5-ascend KV cache dtype: {cache_dtype}")
-
-
-def _step5_fp8_expert_layout(config: Any) -> tuple[set[int], int]:
-    """Return (bf16 expert layer indices, quant block size).
-
-    A Step5 checkpoint either declares ``quantization_config.fp8`` with
-    128x128 weight blocks -- in which case every MoE layer is fp8 except
-    those under ``modules_to_not_convert`` -- or declares nothing, in which
-    case every expert is bf16.
-    """
-    quant_config = getattr(config, "quantization_config", None)
-    if not quant_config:
-        return set(), 0
-    quant_method = quant_config.get("quant_method")
-    if quant_method not in ("fp8", "compressed-tensors"):
-        raise ValueError(
-            f"Step5 Ascend fp8 experts support quant_method=fp8, got "
-            f"{quant_method!r}."
-        )
-    block = quant_config.get("weight_block_size") or [128, 128]
-    if list(block) != [128, 128]:
-        raise ValueError(
-            "Step5 Ascend fp8 experts require 128x128 weight blocks, got "
-            f"{list(block)}."
-        )
-    bf16_layers: set[int] = set()
-    for entry in quant_config.get("modules_to_not_convert") or []:
-        match = re.search(r"layers\.(\d+)\.", entry)
-        if match and ".moe." in entry:
-            bf16_layers.add(int(match.group(1)))
-    return bf16_layers, 128
 
 
 class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
@@ -762,32 +728,14 @@ class AscendStep5FusedMoEBlock(Step5MoE):
                 )
             activation = "swiglustep"
 
-        # Optional Step5-native fp8 expert execution, gated by the
-        # ``VLLM_ASCEND_ENABLE_STEP4_FP8`` env var (default off): the routed
-        # experts keep the checkpoint's fp8 e4m3 weights and 128x128 block
-        # scales and run them with the kernels vendored from the step5-hf
-        # reference (Step5Fp8BlockFusedMoEMethod), instead of the default
-        # AscendFp8BlockFusedMoEMethod path that resolves to bf16 or
-        # requantizes to MXFP8. Layers the checkpoint left in bf16
-        # (modules_to_not_convert) stay unquantized either way.
+        # The Step5 native fp8 block scheme is selected centrally in
+        # ``NPUPlatform.check_and_update_config`` by converting the global
+        # ``AscendFp8Config`` into ``Step5Fp8BlockConfig`` when
+        # ``VLLM_ASCEND_ENABLE_STEP4_FP8`` is set for a Step5 checkpoint.
+        # The quantization config itself decides per-layer whether to use the
+        # Step5 fp8 kernels or fall back to bf16 (for layers listed under
+        # ``modules_to_not_convert`` for ``moe.experts.*``).
         moe_quant_config = quant_config
-        enable_step5_fp8 = bool(envs.VLLM_ASCEND_ENABLE_STEP4_FP8)
-        if enable_step5_fp8 and isinstance(quant_config, AscendFp8Config):
-            bf16_expert_layers, _ = _step5_fp8_expert_layout(config)
-            if self.layer_idx in bf16_expert_layers:
-                moe_quant_config = None
-            else:
-                # Shallow copy re-bound to the Step5 config so the
-                # framework's fp8-block parsing is preserved while the MoE
-                # route changes.
-                step5_config = copy.copy(quant_config)
-                step5_config.__class__ = Step5Fp8BlockConfig
-                moe_quant_config = step5_config
-                logger.info(
-                    "Layer %s: enable_step5_fp8 is set; routed experts run "
-                    "the native fp8 block kernels (Step5Fp8BlockFusedMoEMethod).",
-                    self.layer_idx,
-                )
 
         share_expert_dim = config.share_expert_dim
         moe_intermediate_size = config.moe_intermediate_size

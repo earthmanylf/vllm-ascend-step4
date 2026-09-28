@@ -27,6 +27,7 @@ import torch
 import vllm.envs as envs_vllm
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
+from vllm_ascend import envs
 
 # todo: please remove it when solve cuda hard code in vllm
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
@@ -470,6 +471,30 @@ class NPUPlatform(Platform):
 
         # 3.Auto detect quantization method
         maybe_auto_detect_quantization(vllm_config)
+
+        # 3.5 Route Step5 checkpoints to the native Step5 fp8 block scheme when
+        # the dedicated env var is set. This keeps the Step5 model code free of
+        # the enablement switch; the quantization config itself decides which
+        # MoE scheme to use based on the layer index.
+        if envs.VLLM_ASCEND_ENABLE_STEP4_FP8:
+            from vllm_ascend.quantization.configs.fp8_config import (
+                AscendFp8Config,
+                Step5Fp8BlockConfig,
+            )
+
+            quant_config = getattr(vllm_config, "quant_config", None)
+            if isinstance(quant_config, AscendFp8Config):
+                hf_config = getattr(vllm_config.model_config, "hf_config", None)
+                model_type = getattr(hf_config, "model_type", None)
+                architectures = getattr(hf_config, "architectures", None) or []
+                if model_type in ("step5", "step5_vl") or "Step5ForCausalLM" in architectures:
+                    vllm_config.quant_config = Step5Fp8BlockConfig.from_ascend_fp8_config(
+                        quant_config
+                    )
+                    logger.info(
+                        "Step5 native fp8 block scheme enabled for %s.",
+                        vllm_config.model_config.model,
+                    )
 
         # 4.Make sure the config is compatible with Ascend
         _fix_incompatible_config(vllm_config)
