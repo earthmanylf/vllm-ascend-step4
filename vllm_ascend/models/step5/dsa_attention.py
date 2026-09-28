@@ -488,8 +488,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
 
         One prefill launch can hold two tail generations per request (the
         carry-over tail has not released its slot while the new tail already
-        claimed one), so one slot per request is not enough; the 8x policy
-        matches upstream, and every allocation failure is fail-closed through
+        claimed one), so one slot per request is not enough. This backend reserves 8x
+        max_num_seqs, and every allocation failure is fail-closed through
         the device-side ``allocation_success`` flag.
         """
         return 8 * int(self.max_num_seqs)
@@ -592,20 +592,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 name, (max_layout_rows,), device=device, dtype=dtype
             )
         self._get_dsa_tensor_buffer_at_least(
-            "csa_prefill_scratch_region_ids",
-            (max_layout_rows,),
-            device=device,
-            dtype=torch.int32,
-        )
-        self._get_dsa_tensor_buffer_at_least(
-            "csa_prefill_scratch_row_map",
-            (max_layout_rows * self.region_size,),
-            device=device,
-            dtype=torch.int32,
-        )
-        self._get_dsa_tensor_buffer_at_least(
-            "csa_prefill_scratch_reset_map",
-            (max_layout_rows,),
+            "csa_prefill_task_prefix",
+            (self.max_num_seqs + 1,),
             device=device,
             dtype=torch.int32,
         )
@@ -719,8 +707,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
 
         Mirrors upstream: a pure decode batch (single token per request)
         stages tokens and flushes completed regions; any batch containing
-        prefill tokens (mixed included) runs the ordered two-pass update over
-        all tokens of the batch. MTP verify batches (uniform K+1 rows per
+        prefill tokens (mixed included) prepares active slots before a single
+        update over all tokens of the batch. MTP verify batches (uniform K+1 rows per
         decode request) stage their rows without flushing and materialize
         fully-committed regions through the deferred flush, so rejected
         tokens never pollute the fp8 page cache.
@@ -783,24 +771,11 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 **common,
             )
         else:
-            device = index_k.device
-            padded_rows = self._round_up(num_tokens, 64)
-            scratch_region_ids = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_region_ids",
-                (padded_rows,),
-                device=device,
-                dtype=torch.int32,
-            )
-            scratch_row_map = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_row_map",
-                (padded_rows * self.region_size,),
-                device=device,
-                dtype=torch.int32,
-            )
-            scratch_reset_map = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_reset_map",
-                (padded_rows,),
-                device=device,
+            num_requests = md.num_decodes + md.num_prefills
+            task_prefix = self._get_dsa_tensor_buffer_at_least(
+                "csa_prefill_task_prefix",
+                (num_requests + 1,),
+                device=index_k.device,
                 dtype=torch.int32,
             )
             csa_compact_prefill_update(
@@ -812,15 +787,15 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 summary_cache._step5_csa_denominator_cache,
                 summary_cache._step5_csa_max_cache,
                 summary_cache._step5_csa_active_token_valid,
-                scratch_region_ids,
-                scratch_row_map,
-                scratch_reset_map,
                 layout.token_flat_slot,
                 layout.reset_slots,
                 layout.token_valid,
                 layout.token_positions,
                 index_k,
                 index_z,
+                query_start_loc=md.query_start_loc[:num_requests + 1],
+                seq_lens=md.seq_lens[:num_requests],
+                task_prefix=task_prefix,
                 live_rows=num_tokens,
                 **common,
             )
@@ -846,7 +821,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         only staged, so the next round's rewrite of rejected positions
         replaces their contribution exactly (the Ascend equivalent of the
         upstream MTP transaction's rollback-to-accepted-prefix). In a mixed
-        batch, the prefill tail still runs the ordinary ordered fold over
+        batch, the prefill tail still runs slot preparation and a single update over
         its own rows; a request never contributes rows to both segments.
         """
         d = md.decode
@@ -896,29 +871,15 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             query_len=query_len,
             **common,
         )
-        # 3) Mixed batch: fold the prefill tail with the ordinary ordered
-        #    two-pass update (prefill requests own private pages; their
+        # 3) Mixed batch: prepare slots, then update the prefill tail once
+        #    (prefill requests own private pages; their
         #    regions never collide with the verify requests' regions).
         if md.num_prefills > 0:
-            device = index_k.device
             prefill_rows = int(md.num_actual_tokens) - nv
-            padded_rows = self._round_up(prefill_rows, 64)
-            scratch_region_ids = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_region_ids",
-                (padded_rows,),
-                device=device,
-                dtype=torch.int32,
-            )
-            scratch_row_map = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_row_map",
-                (padded_rows * self.region_size,),
-                device=device,
-                dtype=torch.int32,
-            )
-            scratch_reset_map = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_reset_map",
-                (padded_rows,),
-                device=device,
+            task_prefix = self._get_dsa_tensor_buffer_at_least(
+                "csa_prefill_task_prefix",
+                (md.num_prefills + 1,),
+                device=index_k.device,
                 dtype=torch.int32,
             )
             csa_compact_prefill_update(
@@ -930,15 +891,16 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 summary_cache._step5_csa_denominator_cache,
                 summary_cache._step5_csa_max_cache,
                 summary_cache._step5_csa_active_token_valid,
-                scratch_region_ids,
-                scratch_row_map,
-                scratch_reset_map,
                 layout.token_flat_slot[nv:],
                 layout.reset_slots[nv:],
                 layout.token_valid[nv:],
                 layout.token_positions[nv:],
                 index_k[nv:],
                 index_z[nv:],
+                # 边界仍是全批次行号；kernel 减去首项，与 [nv:] 的输入对齐。
+                query_start_loc=md.query_start_loc[n:n + md.num_prefills + 1],
+                seq_lens=md.seq_lens[n:n + md.num_prefills],
+                task_prefix=task_prefix,
                 live_rows=prefill_rows,
                 **common,
             )

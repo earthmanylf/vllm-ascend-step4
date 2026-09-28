@@ -490,67 +490,153 @@ def csa_compact_decode_update(
 
 
 # ---------------------------------------------------------------------------
-# Prefill / mixed-batch summary update (two-pass ordered fold)
+# Prefill / mixed-batch summary update (slot preparation + single update)
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def _csa_prefill_clear_scratch_kernel(
-    scratch_region_ids,
-    scratch_row_map,
-    scratch_reset_map,
-    unique_regions,
-    scratch_rows,
-    total_items,
+def _csa_prefill_task_prefix_kernel(
+    query_start_loc,
+    seq_lens,
+    task_prefix,
+    num_requests,
     REGION_BLOCK_SIZE: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    BLOCK_R: tl.constexpr,
 ) -> None:
+    # 每个请求需要的任务数：本次 token 覆盖了多少个逻辑 region。
+    requests = tl.arange(0, BLOCK_R)
+    valid = requests < num_requests
+    starts = tl.load(query_start_loc + requests, mask=valid, other=0)
+    ends = tl.load(query_start_loc + requests + 1, mask=valid, other=0)
+    lengths = tl.load(seq_lens + requests, mask=valid, other=0)
+    query_lengths = ends - starts
+    context_offsets = (lengths - query_lengths) % REGION_BLOCK_SIZE
+    counts = tl.where(
+        valid & (query_lengths > 0),
+        tl.cdiv(context_offsets + query_lengths, REGION_BLOCK_SIZE),
+        0,
+    ).to(tl.int32)
+    # 例如任务数 [3, 1] 得到累计边界 [0, 3, 4]，由 slot 准备和 update 复用。
+    tl.store(task_prefix, 0)
+    tl.store(task_prefix + requests + 1, tl.cumsum(counts, axis=0), mask=valid)
+
+
+@triton.jit
+def _csa_prefill_task_rows(
+    task, query_start_loc, seq_lens, task_prefix, num_requests,
+    flat_slot, token_valid, token_positions, live_rows, total_regions,
+    REGION_BLOCK_SIZE: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    # 准备和计算阶段共用任务定位及有效性规则，避免两阶段对同一任务判断不同。
+    row_base = tl.load(query_start_loc)
+    # 找到 prefix[req] <= task < prefix[req + 1] 的请求，跳过零任务请求。
+    lo = tl.full((), 0, tl.int32)
+    hi = num_requests
+    while lo < hi:
+        mid = (lo + hi) // 2
+        task_end = tl.load(task_prefix + mid + 1)
+        go_left = task < task_end
+        hi = tl.where(go_left, mid, hi)
+        lo = tl.where(go_left, lo, mid + 1)
+    request = lo
+    task_base = tl.load(task_prefix + request)
+    query_start = tl.load(query_start_loc + request) - row_base
+    query_end = tl.load(query_start_loc + request + 1) - row_base
+    query_length = query_end - query_start
+    context_length = tl.load(seq_lens + request) - query_length
+    context_offset = context_length % REGION_BLOCK_SIZE
+    ordinal = task - task_base
+    # 第一个任务从本次请求首行开始；后续任务跨过首个 region 的剩余位置。
+    start_row = query_start + tl.where(
+        ordinal == 0,
+        0,
+        REGION_BLOCK_SIZE - context_offset + (ordinal - 1) * REGION_BLOCK_SIZE,
+    )
+    start_ok = (start_row >= 0) & (start_row < query_end) & (start_row < live_rows)
+    region = tl.load(flat_slot + start_row, mask=start_ok, other=-1).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_T)
+    rows = start_row + offsets
+    span = tl.where(ordinal == 0, REGION_BLOCK_SIZE - context_offset, REGION_BLOCK_SIZE)
+    region_ok = start_ok & (region >= 0) & (region < total_regions)
+    in_bounds = region_ok & (offsets < span) & (offsets < REGION_BLOCK_SIZE)
+    in_bounds = in_bounds & (rows >= 0) & (rows < query_end) & (rows < live_rows)
+    row_regions = tl.load(flat_slot + rows, mask=in_bounds, other=-1)
+    in_region = in_bounds & (row_regions == region)
+    valid_row = in_region & tl.load(token_valid + rows, mask=in_region, other=0).to(tl.int1)
+    positions = tl.load(token_positions + rows, mask=valid_row, other=0)
+    complete = tl.sum(
+        (valid_row & (positions % REGION_BLOCK_SIZE == REGION_BLOCK_SIZE - 1)).to(tl.int32), axis=0
+    ) > 0
+    return region, rows, valid_row, complete
+
+
+@triton.jit
+def _csa_prefill_prepare_slots_kernel(
+    active_region_ids, active_slot_by_region, allocation_success,
+    active_numerator, denominator, max_logits, staging_valid,
+    flat_slot, token_valid, token_positions,
+    query_start_loc, seq_lens, task_prefix, num_requests, live_rows, total_regions,
+    active_capacity,
+    NUM_CORES: tl.constexpr,
+    NUMERATOR_STRIDE_SLOT: tl.constexpr,
+    DENOMINATOR_STRIDE_SLOT: tl.constexpr,
+    MAX_STRIDE_SLOT: tl.constexpr,
+    PROXY_DIM: tl.constexpr,
+    REGION_BLOCK_SIZE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    # 只为未完成且没有 slot 的 region 申请空位，不提前释放完成任务的旧状态。
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-    tl.store(scratch_row_map + offsets, -1, mask=offsets < total_items)
-    row_mask = offsets < scratch_rows
-    region_vals = tl.load(unique_regions + offsets, mask=row_mask, other=0).to(tl.int32)
-    tl.store(scratch_region_ids + offsets, region_vals, mask=row_mask)
-    tl.store(scratch_reset_map + offsets, 0, mask=row_mask)
+    dims = tl.arange(0, BLOCK_D)
+    toks = tl.arange(0, BLOCK_T)
+    num_tasks = tl.load(task_prefix + num_requests)
+    for task in range(pid, num_tasks, NUM_CORES):
+        region, rows, valid_row, complete = _csa_prefill_task_rows(
+            task, query_start_loc, seq_lens, task_prefix, num_requests,
+            flat_slot, token_valid, token_positions, live_rows, total_regions,
+            REGION_BLOCK_SIZE, BLOCK_T,
+        )
+        if tl.sum(valid_row.to(tl.int32), axis=0) > 0:
+            region_i32 = region.to(tl.int32)
+            hint = tl.load(active_slot_by_region + region).to(tl.int64)
+            hint_ok = (hint >= 0) & (hint < active_capacity)
+            safe_hint = tl.where(hint_ok, hint, 0)
+            owner = tl.load(active_region_ids + safe_hint, mask=hint_ok, other=-1)
+            has_slot = hint_ok & (owner == region_i32)
+            if ~has_slot:
+                # 反向映射只是提示：先在权威拥有者表中找回已有 slot。
+                # 不能先申请空位，否则旧 slot 排在空位后面时会重复分配并丢失累计值。
+                # 完成任务也必须修复映射，保证 update 能读到它的旧状态。
+                slots = tl.arange(0, BLOCK_S)
+                owners = tl.load(active_region_ids + slots, mask=slots < active_capacity, other=-1)
+                slot = tl.min(
+                    tl.where((slots < active_capacity) & (owners == region_i32), slots, active_capacity),
+                    axis=0,
+                ).to(tl.int64)
+                newly_allocated = tl.full((), False, tl.int1)
+                if (slot == active_capacity) & ~complete:
+                    for cand in tl.range(0, active_capacity):
+                        if slot == active_capacity:
+                            old = tl.atomic_cas(active_region_ids + cand, -1, region_i32)
+                            if (old == -1) | (old == region_i32):
+                                slot = cand.to(tl.int64)
+                                newly_allocated = old == -1
+                if slot < active_capacity:
+                    # 只有本次新占用的空位需要初始化；找回的已有状态必须保留。
+                    if newly_allocated:
+                        tl.store(active_numerator + slot * NUMERATOR_STRIDE_SLOT + dims, 0.0, mask=dims < PROXY_DIM)
+                        tl.store(denominator + slot * DENOMINATOR_STRIDE_SLOT + dims, 0.0, mask=dims < PROXY_DIM)
+                        tl.store(max_logits + slot * MAX_STRIDE_SLOT, -float("inf"))
+                        tl.store(staging_valid + slot * REGION_BLOCK_SIZE + toks, 0, mask=toks < REGION_BLOCK_SIZE)
+                    tl.store(active_slot_by_region + region, slot.to(tl.int32))
+                elif ~complete:
+                    tl.store(allocation_success, 0)
 
 
 @triton.jit
-def _csa_prefill_fill_direct_kernel(
-    scratch_row_map,
-    scratch_reset_map,
-    inverse_indices,
-    flat_slot,
-    reset_slots,
-    token_valid,
-    token_positions,
-    live_rows,
-    REGION_BLOCK_SIZE: tl.constexpr,
-) -> None:
-    """Direct-index fill: each token writes to its group via inverse_indices.
-
-    Replaces the O(n^2) CAS hash-table with O(n) direct stores. The
-    ``inverse_indices`` tensor (from ``torch.unique``) maps each token to
-    its de-duplicated group slot, eliminating all atomic operations and
-    linear probing.
-    """
-    row = tl.program_id(0)
-    if row >= live_rows:
-        return
-    valid = tl.load(token_valid + row).to(tl.int1)
-    if ~valid:
-        return
-    group_idx = tl.load(inverse_indices + row).to(tl.int64)
-    position = tl.load(token_positions + row)
-    offset = position % REGION_BLOCK_SIZE
-    if (offset >= 0) & (offset < REGION_BLOCK_SIZE):
-        tl.store(scratch_row_map + group_idx * REGION_BLOCK_SIZE + offset, row)
-    region = tl.load(flat_slot + row)
-    if tl.load(reset_slots + row) == region:
-        tl.store(scratch_reset_map + group_idx, 1)
-
-
-@triton.jit
-def _csa_prefill_update_ordered_kernel(
+def _csa_prefill_update_kernel(
     mean_cache,
     active_region_ids,
     active_slot_by_region,
@@ -559,14 +645,18 @@ def _csa_prefill_update_ordered_kernel(
     denominator,
     max_logits,
     staging_valid,
-    scratch_region_ids,
-    scratch_row_map,
-    scratch_reset_map,
+    flat_slot,
+    reset_slots,
+    token_valid,
+    token_positions,
     index_k,
     index_z,
+    query_start_loc,
+    seq_lens,
+    task_prefix,
+    num_requests,
     live_rows,
     total_regions,
-    num_tasks,
     NUM_CORES: tl.constexpr,
     MEAN_STRIDE_PAGE: tl.constexpr,
     NUMERATOR_STRIDE_SLOT: tl.constexpr,
@@ -576,146 +666,144 @@ def _csa_prefill_update_ordered_kernel(
     PROXY_DIM: tl.constexpr,
     REGION_BLOCK_SIZE: tl.constexpr,
     active_capacity,
-    PROCESS_COMPLETE: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ) -> None:
-    """Fold scratch region groups with grid collapsed to physical cores.
+    """Fold all prepared region tasks in one launch without slot allocation.
 
-    Each core iterates over multiple region groups via a strided loop,
-    eliminating the overhead of launching num_unique programs (which can
-    far exceed the physical vector core count).
+    Query rows must follow contiguous sequence positions within each request.
+    Each physical region must have only one updating task in the batch.
     """
+    # 按请求边界和长度定位 region，不再逐行比较 flat_slot 寻找首行。
     pid = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
     dim_mask = dims < PROXY_DIM
     toks = tl.arange(0, BLOCK_T)
     tok_mask = toks < REGION_BLOCK_SIZE
 
-    for group_slot in range(pid, num_tasks, NUM_CORES):
-        region = tl.load(scratch_region_ids + group_slot).to(tl.int64)
-        if region >= 0:
-            rows = tl.load(
-                scratch_row_map + group_slot * REGION_BLOCK_SIZE + toks,
-                mask=tok_mask,
-                other=-1,
+    # 准备阶段分配失败时停止本次更新，由调用方报告容量不足。
+    if tl.load(allocation_success) == 0:
+        return
+    num_tasks = tl.load(task_prefix + num_requests)
+    for task in range(pid, num_tasks, NUM_CORES):
+        region, rows, valid_row, complete = _csa_prefill_task_rows(
+            task, query_start_loc, seq_lens, task_prefix, num_requests,
+            flat_slot, token_valid, token_positions, live_rows, total_regions,
+            REGION_BLOCK_SIZE, BLOCK_T,
+        )
+        if tl.sum(valid_row.to(tl.int32), axis=0) > 0:
+            # 反向映射只是 slot 位置提示，还要核对 slot 的实际拥有者。
+            # 无有效 slot 时使用安全地址，后续通过 mask 禁止读取旧状态。
+            region_i32 = region.to(tl.int32)
+            hint = tl.load(active_slot_by_region + region).to(tl.int64)
+            hint_ok = (hint >= 0) & (hint < active_capacity)
+            safe_hint = tl.where(hint_ok, hint, 0)
+            hint_owner = tl.load(active_region_ids + safe_hint, mask=hint_ok, other=-1)
+            slot = tl.where(hint_ok & (hint_owner == region_i32), hint, active_capacity)
+            has_slot = slot != active_capacity
+            safe_slot = tl.where(has_slot, slot, 0)
+
+            # 读取跨批次保留的分子、分母和最大分数；没有旧状态时从零累计。
+            prefix_num = tl.load(
+                active_numerator + safe_slot * NUMERATOR_STRIDE_SLOT + dims,
+                mask=has_slot & dim_mask,
+                other=0.0,
             )
-            if tl.max(rows) >= 0:
-                last_row = tl.load(
-                    scratch_row_map + group_slot * REGION_BLOCK_SIZE + (REGION_BLOCK_SIZE - 1)
+            prefix_den = tl.load(
+                denominator + safe_slot * DENOMINATOR_STRIDE_SLOT + dims,
+                mask=has_slot & dim_mask,
+                other=0.0,
+            )
+            prefix_max = tl.load(
+                max_logits + safe_slot * MAX_STRIDE_SLOT, mask=has_slot, other=-float("inf")
+            ).to(tl.float32)
+
+            # 任一有效 token 要求 reset，就忽略本次之前的累计值，
+            # 并清除该 slot 的 token 暂存有效标记；无效行不能触发 reset。
+            resets = tl.load(reset_slots + rows, mask=valid_row, other=-1)
+            reset = tl.sum((valid_row & (resets == region)).to(tl.int32), axis=0) > 0
+            prefix_num = tl.where(reset, 0.0, prefix_num)
+            prefix_den = tl.where(reset, 0.0, prefix_den)
+            prefix_max = tl.where(reset, -float("inf"), prefix_max)
+            if reset:
+                tl.store(
+                    staging_valid + safe_slot * REGION_BLOCK_SIZE + toks,
+                    0,
+                    mask=has_slot & tok_mask,
                 )
-                complete = last_row >= 0
-                if complete == PROCESS_COMPLETE:
-                    region_i32 = region.to(tl.int32)
-                    hint = tl.load(active_slot_by_region + region).to(tl.int64)
-                    hint_ok = (hint >= 0) & (hint < active_capacity)
-                    safe_hint = tl.where(hint_ok, hint, 0)
-                    hint_owner = tl.load(active_region_ids + safe_hint, mask=hint_ok, other=-1)
-                    slot = tl.where(hint_ok & (hint_owner == region_i32), hint, active_capacity)
-                    has_slot = slot != active_capacity
-                    safe_slot = tl.where(has_slot, slot, 0)
 
-                    prefix_num = tl.load(
+            # 直接按输入行读取数值和分数，转为 FP32 后累计。
+            # 无效行不读取数据，也不参与后面的权重计算。
+            safe_rows = tl.where(valid_row, rows, 0)
+            values = tl.load(
+                index_k + safe_rows[:, None] * PROXY_DIM + dims[None, :],
+                mask=valid_row[:, None] & dim_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            logits = tl.load(
+                index_z + safe_rows[:, None] * PROXY_DIM + dims[None, :],
+                mask=valid_row[:, None] & dim_mask[None, :],
+                other=-float("inf"),
+            ).to(tl.float32)
+
+            # 统一旧状态与当前分数的最大值，避免指数计算数值过大。
+            # 先把旧分子、分母缩放到同一尺度，再加上当前 token 的贡献。
+            has_prefix = tl.max(prefix_den) > 0.0
+            base_max = tl.where(has_prefix, prefix_max, -float("inf"))
+            shared_max = tl.maximum(
+                base_max, tl.max(tl.where(valid_row[:, None], logits, -float("inf")))
+            )
+            scale = tl.where(has_prefix, tl.exp(prefix_max - shared_max), 0.0)
+            weights = tl.where(valid_row[:, None], tl.exp(logits - shared_max), 0.0)
+            numerator = prefix_num * scale + tl.sum(weights * values, axis=0)
+            denominator_acc = prefix_den * scale + tl.sum(weights, axis=0)
+            mean = tl.where(
+                denominator_acc > 0.0,
+                numerator / tl.maximum(denominator_acc, 1.0e-20),
+                0.0,
+            )
+
+            # 完成后按实际 region 编号定位页内缓存，写入最终 summary，
+            # 然后清空并释放已有 slot；完整 region 不需要新申请 slot。
+            if complete:
+                _csa_store_fp8_mean(
+                    mean_cache
+                    + (region // SUMMARIES_PER_PAGE) * MEAN_STRIDE_PAGE
+                    + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
+                    dims,
+                    mean,
+                    dim_mask,
+                )
+                tl.store(active_slot_by_region + region, -1)
+                if has_slot:
+                    tl.store(active_region_ids + safe_slot, -1)
+                    tl.store(
                         active_numerator + safe_slot * NUMERATOR_STRIDE_SLOT + dims,
-                        mask=has_slot & dim_mask,
-                        other=0.0,
-                    )
-                    prefix_den = tl.load(
-                        denominator + safe_slot * DENOMINATOR_STRIDE_SLOT + dims,
-                        mask=has_slot & dim_mask,
-                        other=0.0,
-                    )
-                    prefix_max = tl.load(
-                        max_logits + safe_slot * MAX_STRIDE_SLOT, mask=has_slot, other=-float("inf")
-                    ).to(tl.float32)
-
-                    reset = tl.load(scratch_reset_map + group_slot) != 0
-                    prefix_num = tl.where(reset, 0.0, prefix_num)
-                    prefix_den = tl.where(reset, 0.0, prefix_den)
-                    prefix_max = tl.where(reset, -float("inf"), prefix_max)
-                    if reset:
-                        tl.store(
-                            staging_valid + safe_slot * REGION_BLOCK_SIZE + toks,
-                            0,
-                            mask=has_slot & tok_mask,
-                        )
-
-                    valid_row = (rows >= 0) & (rows < live_rows) & tok_mask
-                    safe_rows = tl.where(valid_row, rows, 0)
-                    values = tl.load(
-                        index_k + safe_rows[:, None] * PROXY_DIM + dims[None, :],
-                        mask=valid_row[:, None] & dim_mask[None, :],
-                        other=0.0,
-                    ).to(tl.float32)
-                    logits = tl.load(
-                        index_z + safe_rows[:, None] * PROXY_DIM + dims[None, :],
-                        mask=valid_row[:, None] & dim_mask[None, :],
-                        other=-float("inf"),
-                    ).to(tl.float32)
-
-                    has_prefix = tl.max(prefix_den) > 0.0
-                    base_max = tl.where(has_prefix, prefix_max, -float("inf"))
-                    shared_max = tl.maximum(
-                        base_max, tl.max(tl.where(valid_row[:, None], logits, -float("inf")))
-                    )
-                    scale = tl.where(has_prefix, tl.exp(prefix_max - shared_max), 0.0)
-                    weights = tl.where(valid_row[:, None], tl.exp(logits - shared_max), 0.0)
-                    numerator = prefix_num * scale + tl.sum(weights * values, axis=0)
-                    denominator_acc = prefix_den * scale + tl.sum(weights, axis=0)
-                    mean = tl.where(
-                        denominator_acc > 0.0,
-                        numerator / tl.maximum(denominator_acc, 1.0e-20),
                         0.0,
+                        mask=dim_mask,
                     )
-
-                    if complete:
-                        _csa_store_fp8_mean(
-                            mean_cache
-                            + (region // SUMMARIES_PER_PAGE) * MEAN_STRIDE_PAGE
-                            + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
-                            dims,
-                            mean,
-                            dim_mask,
-                        )
-                        tl.store(active_slot_by_region + region, -1)
-                        if has_slot:
-                            tl.store(active_region_ids + safe_slot, -1)
-                            tl.store(
-                                active_numerator + safe_slot * NUMERATOR_STRIDE_SLOT + dims,
-                                0.0,
-                                mask=dim_mask,
-                            )
-                            tl.store(
-                                denominator + safe_slot * DENOMINATOR_STRIDE_SLOT + dims,
-                                0.0,
-                                mask=dim_mask,
-                            )
-                            tl.store(max_logits + safe_slot * MAX_STRIDE_SLOT, -float("inf"))
-                    else:
-                        if ~has_slot:
-                            empty = tl.full((), -1, tl.int32)
-                            for cand in tl.range(0, active_capacity):
-                                if slot == active_capacity:
-                                    old = tl.atomic_cas(active_region_ids + cand, empty, region_i32)
-                                    if (old == empty) | (old == region_i32):
-                                        slot = cand.to(tl.int64)
-                        if slot == active_capacity:
-                            tl.store(allocation_success, 0)
-                        slot_ok = (slot >= 0) & (slot < active_capacity)
-                        safe_slot = tl.where(slot_ok, slot, 0)
-                        if slot_ok:
-                            tl.store(active_slot_by_region + region, slot.to(tl.int32))
-                            tl.store(
-                                active_numerator + safe_slot * NUMERATOR_STRIDE_SLOT + dims,
-                                numerator,
-                                mask=dim_mask,
-                            )
-                            tl.store(
-                                denominator + safe_slot * DENOMINATOR_STRIDE_SLOT + dims,
-                                denominator_acc,
-                                mask=dim_mask,
-                            )
-                            tl.store(max_logits + safe_slot * MAX_STRIDE_SLOT, shared_max)
+                    tl.store(
+                        denominator + safe_slot * DENOMINATOR_STRIDE_SLOT + dims,
+                        0.0,
+                        mask=dim_mask,
+                    )
+                    tl.store(max_logits + safe_slot * MAX_STRIDE_SLOT, -float("inf"))
+            else:
+                # 准备阶段已确定 slot；这里只写累计结果，不再申请空位。
+                if has_slot:
+                    tl.store(
+                        active_numerator + safe_slot * NUMERATOR_STRIDE_SLOT + dims,
+                        numerator,
+                        mask=dim_mask,
+                    )
+                    tl.store(
+                        denominator + safe_slot * DENOMINATOR_STRIDE_SLOT + dims,
+                        denominator_acc,
+                        mask=dim_mask,
+                    )
+                    tl.store(max_logits + safe_slot * MAX_STRIDE_SLOT, shared_max)
+                else:
+                    tl.store(allocation_success, 0)
 
 
 def csa_compact_prefill_update(
@@ -727,9 +815,6 @@ def csa_compact_prefill_update(
     denominator: torch.Tensor,
     max_logits: torch.Tensor,
     staging_valid: torch.Tensor,
-    scratch_region_ids: torch.Tensor,
-    scratch_row_map: torch.Tensor,
-    scratch_reset_map: torch.Tensor,
     flat_slot: torch.Tensor,
     reset_slots: torch.Tensor,
     token_valid: torch.Tensor,
@@ -737,95 +822,101 @@ def csa_compact_prefill_update(
     index_k: torch.Tensor,
     index_z: torch.Tensor,
     *,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    task_prefix: torch.Tensor,
     live_rows: int,
     num_pages: int,
     summaries_per_page: int,
     proxy_dim: int,
     region_block_size: int,
-    fill_compile_mode: str = "unstructured_in_simt",
 ) -> None:
-    """Fold a packed token chunk (prefill or mixed batch) into the summary state.
+    """Fold request-derived region tasks without unique or token-row scratch.
 
-    Uses ``torch.unique`` to de-duplicate region ids and produce an
-    inverse-index, replacing the original O(n^2) CAS hash-table with an
-    O(n) direct-index fill. The update kernel grid shrinks from
-    ``num_tokens`` to ``num_unique_regions``, eliminating idle programs.
+    Query rows must follow consecutive sequence positions within each request,
+    with each physical region updated by only one task. Query boundaries may
+    have a nonzero origin when processing a sliced prefill tail. The caller
+    provides an int32 task-prefix buffer with at least one entry per boundary.
+    Slot capacity must cover existing states plus all new incomplete regions;
+    preparation cannot reuse slots released by this call's update.
     """
-    rows = int(flat_slot.numel())
     live_rows = int(live_rows)
-    if rows == 0 or live_rows <= 0:
+    if live_rows < 0 or live_rows > flat_slot.numel():
+        raise ValueError("live_rows must be within flat_slot")
+    if region_block_size <= 0:
+        raise ValueError("region_block_size must be positive")
+    if live_rows == 0:
         return
 
-    # Step 1: torch.unique — de-duplicate region ids + inverse index
-    unique_regions, inverse_indices = torch.unique(
-        flat_slot[:live_rows], return_inverse=True
-    )
-    num_unique = int(unique_regions.numel())
-
-    # Step 2: clear scratch buffers + write unique region ids (fused in kernel)
-    total_items = num_unique * int(region_block_size)
-    clear_block = 256
-    _csa_prefill_clear_scratch_kernel[
-        (triton.cdiv(max(total_items, num_unique), clear_block),)
-    ](
-        scratch_region_ids,
-        scratch_row_map,
-        scratch_reset_map,
-        unique_regions,
-        num_unique,
-        total_items,
+    num_requests = int(query_start_loc.numel()) - 1
+    if num_requests <= 0 or seq_lens.numel() < num_requests:
+        raise ValueError("prefill requires query boundaries and sequence lengths")
+    if task_prefix.dtype != torch.int32 or task_prefix.numel() < num_requests + 1:
+        raise ValueError("task_prefix must be int32 with num_requests + 1 entries")
+    # 每次调用刷新累计任务数，避免复用缓冲区时读取上一批次的请求长度。
+    _csa_prefill_task_prefix_kernel[(1,)](
+        query_start_loc,
+        seq_lens,
+        task_prefix,
+        num_requests,
         REGION_BLOCK_SIZE=int(region_block_size),
-        BLOCK_N=clear_block,
+        BLOCK_R=triton.next_power_of_2(num_requests),
     )
 
-    # Step 3: direct-index fill — no CAS, no probing (O(n))
-    _csa_prefill_fill_direct_kernel[(rows,)](
-        scratch_row_map,
-        scratch_reset_map,
-        inverse_indices,
+    # 三次顺序提交：任务计数、slot 准备、一次全量 update。
+    # 新申请不能依赖本次 update 才会释放的 slot，容量须覆盖旧、新尾部同时存在。
+    num_cores = _get_num_vector_cores()
+    _csa_prefill_prepare_slots_kernel[(num_cores,)](
+        active_region_ids, active_slot_by_region, allocation_success,
+        active_numerator, denominator, max_logits, staging_valid,
+        flat_slot, token_valid, token_positions,
+        query_start_loc, seq_lens, task_prefix, num_requests, live_rows,
+        int(num_pages) * int(summaries_per_page), int(active_region_ids.numel()),
+        NUM_CORES=num_cores,
+        NUMERATOR_STRIDE_SLOT=int(active_numerator.stride(0)),
+        DENOMINATOR_STRIDE_SLOT=int(denominator.stride(0)),
+        MAX_STRIDE_SLOT=int(max_logits.stride(0)),
+        PROXY_DIM=int(proxy_dim),
+        REGION_BLOCK_SIZE=int(region_block_size),
+        BLOCK_T=triton.next_power_of_2(int(region_block_size)),
+        BLOCK_D=triton.next_power_of_2(int(proxy_dim)),
+        BLOCK_S=triton.next_power_of_2(int(active_region_ids.numel())),
+        num_warps=4,
+    )
+    _csa_prefill_update_kernel[(num_cores,)](
+        mean_cache,
+        active_region_ids,
+        active_slot_by_region,
+        allocation_success,
+        active_numerator,
+        denominator,
+        max_logits,
+        staging_valid,
         flat_slot,
         reset_slots,
         token_valid,
         token_positions,
+        index_k,
+        index_z,
+        query_start_loc,
+        seq_lens,
+        task_prefix,
+        num_requests,
         live_rows,
+        int(num_pages) * int(summaries_per_page),
+        NUM_CORES=num_cores,
+        MEAN_STRIDE_PAGE=int(mean_cache.stride(0)),
+        NUMERATOR_STRIDE_SLOT=int(active_numerator.stride(0)),
+        DENOMINATOR_STRIDE_SLOT=int(denominator.stride(0)),
+        MAX_STRIDE_SLOT=int(max_logits.stride(0)),
+        SUMMARIES_PER_PAGE=int(summaries_per_page),
+        PROXY_DIM=int(proxy_dim),
         REGION_BLOCK_SIZE=int(region_block_size),
-        compile_mode=fill_compile_mode,
+        active_capacity=int(active_region_ids.numel()),
+        BLOCK_T=triton.next_power_of_2(int(region_block_size)),
+        BLOCK_D=triton.next_power_of_2(int(proxy_dim)),
+        num_warps=4,
     )
-
-    # Step 4: ordered fold — two-pass (complete then incomplete), grid = num_cores
-    num_cores = _get_num_vector_cores()
-    for process_complete in (True, False):
-        _csa_prefill_update_ordered_kernel[(num_cores,)](
-            mean_cache,
-            active_region_ids,
-            active_slot_by_region,
-            allocation_success,
-            active_numerator,
-            denominator,
-            max_logits,
-            staging_valid,
-            scratch_region_ids,
-            scratch_row_map,
-            scratch_reset_map,
-            index_k,
-            index_z,
-            live_rows,
-            int(num_pages) * int(summaries_per_page),
-            num_tasks=num_unique,
-            NUM_CORES=num_cores,
-            MEAN_STRIDE_PAGE=int(mean_cache.stride(0)),
-            NUMERATOR_STRIDE_SLOT=int(active_numerator.stride(0)),
-            DENOMINATOR_STRIDE_SLOT=int(denominator.stride(0)),
-            MAX_STRIDE_SLOT=int(max_logits.stride(0)),
-            SUMMARIES_PER_PAGE=int(summaries_per_page),
-            PROXY_DIM=int(proxy_dim),
-            REGION_BLOCK_SIZE=int(region_block_size),
-            active_capacity=int(active_region_ids.numel()),
-            PROCESS_COMPLETE=process_complete,
-            BLOCK_T=triton.next_power_of_2(int(region_block_size)),
-            BLOCK_D=triton.next_power_of_2(int(proxy_dim)),
-            num_warps=4,
-        )
 
 
 # ---------------------------------------------------------------------------
