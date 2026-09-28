@@ -989,6 +989,92 @@ def _csa_verify_stage_kernel(
                 )
                 tl.store(staging_valid + safe_slot * REGION_BLOCK_SIZE + offset, 1)
 
+                if offset == REGION_BLOCK_SIZE - 1:
+                    # Upstream alignment: fold the region the moment its last
+                    # offset is staged and install the mean into the fp8 page
+                    # cache, so the indexer scoring in this same forward sees
+                    # a real summary for it (the GPU MTP transaction kernel
+                    # installs every touched region the same way). The slot
+                    # and the staging stay live: a rejected position is
+                    # rewritten by the next round, whose last row re-runs this
+                    # fold with the corrected values, and the deferred flush
+                    # below still re-folds and releases the slot once
+                    # region_end <= committed ctx.
+                    staged_ok = (
+                        tl.load(
+                            staging_valid
+                            + safe_slot * REGION_BLOCK_SIZE
+                            + toks,
+                            mask=toks < REGION_BLOCK_SIZE,
+                            other=0,
+                        )
+                        != 0
+                    )
+                    prefix_num = tl.load(
+                        active_numerator
+                        + safe_slot * numerator_stride_slot
+                        + dims,
+                        mask=dim_mask,
+                        other=0.0,
+                    )
+                    prefix_den = tl.load(
+                        denominator
+                        + safe_slot * denominator_stride_slot
+                        + dims,
+                        mask=dim_mask,
+                        other=0.0,
+                    )
+                    prefix_max = tl.load(
+                        max_logits + safe_slot * max_stride_slot
+                    ).to(tl.float32)
+                    staged_z = tl.load(
+                        staging_z
+                        + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
+                        + toks[:, None] * PROXY_DIM
+                        + dims[None, :],
+                        mask=staged_ok[:, None] & dim_mask[None, :],
+                        other=-float("inf"),
+                    ).to(tl.float32)
+                    staged_k = tl.load(
+                        staging_k
+                        + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
+                        + toks[:, None] * PROXY_DIM
+                        + dims[None, :],
+                        mask=staged_ok[:, None] & dim_mask[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    has_prefix = tl.max(prefix_den) > 0.0
+                    base_max = tl.where(has_prefix, prefix_max, -float("inf"))
+                    shared_max = tl.maximum(
+                        base_max,
+                        tl.max(
+                            tl.where(staged_ok[:, None], staged_z, -float("inf"))
+                        ),
+                    )
+                    prefix_scale = tl.where(
+                        has_prefix, tl.exp(prefix_max - shared_max), 0.0
+                    )
+                    staged_w = tl.where(
+                        staged_ok[:, None], tl.exp(staged_z - shared_max), 0.0
+                    )
+                    fold_num = prefix_num * prefix_scale + tl.sum(
+                        staged_w * staged_k, axis=0
+                    )
+                    fold_den = prefix_den * prefix_scale + tl.sum(staged_w, axis=0)
+                    mean = tl.where(
+                        fold_den > 0.0,
+                        fold_num / tl.maximum(fold_den, 1.0e-20),
+                        0.0,
+                    )
+                    _csa_store_fp8_mean(
+                        mean_cache
+                        + (region // SUMMARIES_PER_PAGE) * mean_stride_page
+                        + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
+                        dims,
+                        mean,
+                        dim_mask,
+                    )
+
 
 def csa_verify_stage_update(
     mean_cache: torch.Tensor,

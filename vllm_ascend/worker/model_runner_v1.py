@@ -465,7 +465,8 @@ class NPUModelRunner(GPUModelRunner):
         self._needs_seq_lens_cpu_sync = self.use_compress or issubclass(
             self.attn_backend, (AscendAttentionBackend, AscendMLABackend)
         )
-        self._needs_seq_lens_cpu_sync = False # Temp bugfix, need to change fa3 backend
+        import os
+        self._needs_seq_lens_cpu_sync = os.environ.get("VLLM_STEP4_ENABLE_FA3", "0") == "0"
 
         # kv role
         self.is_kv_producer = False
