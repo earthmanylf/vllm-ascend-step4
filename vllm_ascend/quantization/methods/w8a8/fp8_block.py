@@ -399,9 +399,9 @@ def _to_kmajor(weight: torch.Tensor, scale_inv: torch.Tensor) -> tuple[torch.Ten
     return weight.transpose(1, 2).contiguous(), scale_inv.transpose(1, 2).contiguous()
 
 
-@register_scheme(FP8_METHOD, "step5_moe")
-class Step5Fp8BlockFusedMoEMethod(AscendMoEScheme):
-    """Step5 routed experts executing the native fp8 block quantization.
+@register_scheme(FP8_METHOD, "fp8_block_128_moe")
+class AscendFp8Block128FusedMoEMethod(AscendMoEScheme):
+    """FusedMoE method for 128x128 block-wise FP8 checkpoints.
 
     Unlike :class:`AscendFp8BlockFusedMoEMethod`, weights stay
     ``float8_e4m3fn`` with their fp32 ``weight_scale_inv`` block scales
@@ -433,7 +433,7 @@ class Step5Fp8BlockFusedMoEMethod(AscendMoEScheme):
     def __init__(self, weight_block_size: tuple[int, int], moe_config) -> None:
         self.block_n, self.block_k = weight_block_size
         if (self.block_n, self.block_k) != (128, 128):
-            raise ValueError(f"Step5 fp8 experts require 128x128 weight blocks, got {(self.block_n, self.block_k)}.")
+            raise ValueError(f"fp8_block_128 experts require 128x128 weight blocks, got {(self.block_n, self.block_k)}.")
         # Hints the upstream loader to narrow ``*_weight_scale_inv`` per
         # expert shard, exactly like AscendFp8BlockFusedMoEMethod.
         self.group_size = self.block_k

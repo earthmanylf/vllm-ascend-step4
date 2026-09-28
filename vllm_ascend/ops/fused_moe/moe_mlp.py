@@ -676,7 +676,7 @@ def fp8_block_apply_mlp(
 
     Consumes the dispatcher's expert-sorted ``hidden_states`` with the
     per-expert ``group_list`` intervals. Two execution paths, chosen by the
-    weight layout ``Step5Fp8BlockFusedMoEMethod.process_weights_after_loading``
+    weight layout ``AscendFp8Block128FusedMoEMethod.process_weights_after_loading``
     left on the tensors:
 
     * aclnn fast path (K-major weights, needs the packaged custom op): the

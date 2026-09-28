@@ -1,3 +1,4 @@
+import copy
 import inspect
 from typing import Optional
 
@@ -144,16 +145,31 @@ class AscendDeepseekV4FP8Config(DeepseekV4FP8Config):
         return None
 
 
-class Step5Fp8BlockConfig(AscendFp8Config):
-    """``AscendFp8Config`` routing FusedMoE layers to the Step5 fp8 scheme.
+class AscendFp8Block128Config(AscendFp8Config):
+    """``AscendFp8Config`` routing FusedMoE layers to the 128x128 block fp8 scheme.
 
-    Step5 keeps its checkpoint's fp8 e4m3 weights and 128x128 block scales
-    untouched and executes them with the kernels vendored from the step5-hf
-    reference (see ``Step5Fp8BlockFusedMoEMethod``) instead of resolving to
-    bf16 or requantizing to MXFP8. Dense linear layers keep the inherited
-    behaviour; the Step5 model only hands this config to ``FusedMoEFactory``
-    when the ``VLLM_ASCEND_ENABLE_STEP4_FP8`` env var is set.
+    Checkpoints that store routed experts in ``float8_e4m3fn`` with fp32
+    ``weight_scale_inv`` block scales of size 128x128 keep that layout untouched
+    and execute them with the kernels vendored from the step5-hf reference
+    (see ``AscendFp8Block128FusedMoEMethod``) instead of resolving to bf16 or
+    requantizing to MXFP8. Dense linear layers keep the inherited behaviour.
+
+    Skipped layers (those listed under ``ignored_layers`` / ``modules_to_not_convert``)
+    are handled exactly like upstream ``Fp8Config``: ``is_layer_skipped`` is used
+    to decide whether a FusedMoE layer falls back to the unquantized Ascend MoE
+    method. For 128x128 block-fp8 checkpoints this means layers whose
+    ``moe.experts.*`` weights appear in ``modules_to_not_convert`` become bf16.
     """
+
+    @classmethod
+    def from_ascend_fp8_config(
+        cls,
+        config: AscendFp8Config,
+    ) -> "AscendFp8Block128Config":
+        """Create a 128x128 block-fp8 config from a generic AscendFp8Config."""
+        block128_config = copy.copy(config)
+        block128_config.__class__ = cls
+        return block128_config
 
     def get_quant_method(
         self,
@@ -162,11 +178,26 @@ class Step5Fp8BlockConfig(AscendFp8Config):
         tid2eid=None,
     ) -> Optional["QuantizeMethodBase"]:
         from ..method_adapters import AscendFusedMoEMethod
+        from vllm_ascend.ops.fused_moe.routed_experts import (
+            AscendUnquantizedFusedMoEMethod,
+        )
 
         if is_fused_moe_layer(layer):
+            skip_kwargs = {}
+            if _IS_LAYER_SKIPPED_SUPPORTS_MATCH_MODE:
+                skip_kwargs["match_mode"] = getattr(
+                    self, "ignored_layers_match_mode", "exact"
+                )
+            if is_layer_skipped(
+                prefix,
+                self.ignored_layers,
+                self.packed_modules_mapping,
+                **skip_kwargs,
+            ):
+                return AscendUnquantizedFusedMoEMethod(layer.moe_config, tid2eid)
             self._verify_block_quantization()
-            scheme_class = get_scheme_class(FP8_METHOD, "step5_moe")
-            assert scheme_class is not None, f"No scheme registered for {FP8_METHOD}/step5_moe"
+            scheme_class = get_scheme_class(FP8_METHOD, "fp8_block_128_moe")
+            assert scheme_class is not None, f"No scheme registered for {FP8_METHOD}/fp8_block_128_moe"
             return AscendFusedMoEMethod(
                 scheme_class(self.weight_block_size, layer.moe_config),
                 layer.moe_config,
