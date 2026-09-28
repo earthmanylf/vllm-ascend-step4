@@ -730,11 +730,10 @@ class AscendStep5FusedMoEBlock(Step5MoE):
 
         # The Step5 native fp8 block scheme is selected centrally in
         # ``NPUPlatform.check_and_update_config`` by converting the global
-        # ``AscendFp8Config`` into ``Step5Fp8BlockConfig`` when
-        # ``VLLM_ASCEND_ENABLE_STEP4_FP8`` is set for a Step5 checkpoint.
-        # The quantization config itself decides per-layer whether to use the
-        # Step5 fp8 kernels or fall back to bf16 (for layers listed under
-        # ``modules_to_not_convert`` for ``moe.experts.*``).
+        # ``AscendFp8Config`` into ``AscendFp8Block128Config`` for Step5
+        # checkpoints. The quantization config itself decides per-layer whether
+        # to use the Step5 fp8 kernels or fall back to bf16 (for layers listed
+        # under ``modules_to_not_convert`` for ``moe.experts.*``).
         moe_quant_config = quant_config
 
         share_expert_dim = config.share_expert_dim
