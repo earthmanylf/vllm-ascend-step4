@@ -98,18 +98,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 )
 
     @property
-    def do_naive_dispatch_combine(self) -> bool:
-        # Ascend comm methods own the sequence-parallel token redistribution:
-        # prepare() gathers the shard (EP all-gather for AllGather, or
-        # replace_allreduce passthrough for MC2/All2All) and finalize()
-        # reduce-scatters the result back. If the upstream naive dispatch
-        # also gathered on is_sequence_parallel, the shard would be gathered
-        # twice (16 -> 128 -> 1024 rows) and finalize's reduce-scatter would
-        # then return a full sequence instead of a shard, breaking the
-        # shared+routed add downstream.
-        return self.moe_config.dp_size > 1 and not self._quant_method.supports_internal_mk
-
-    @property
     def is_internal_router(self) -> bool:
         if vllm_version_is("0.27.1"):
             gate = self.gate
