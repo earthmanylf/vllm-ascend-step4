@@ -1,5 +1,7 @@
 # Step4 prefill summary：按请求生成 region 任务
 
+> 当前普通提示词纯 prefill 已接入 [runner 分配方案](step5_prefill_runner_slots.md)，每层只启动一次 summary update。本文的四阶段设备方案作为混合批次等情况的回退路径保留。
+
 > 上游已将 Step4 重命名为 Step5；当前源码位于 `vllm_ascend/models/step5/`，本文沿用原方案名称。
 
 本文解释当前代码如何从请求信息生成 region 任务，以及如何计算和保存 summary。所有图和示例都围绕这一套算法展开。
@@ -25,7 +27,7 @@ summary 是一个 region 内 token 数值的加权汇总结果，不是自然语
 
 ## 2. 全流程图
 
-kernel 是提交给设备执行的计算程序。当前流程包含三个 kernel 调用：任务计数、slot 准备、一次 summary 更新。
+kernel 是提交给设备执行的计算程序。当前流程包含四个 kernel 调用：任务计数和空位收集、申请判断、按序分配、一次 summary 更新。
 
 ```mermaid
 flowchart TD
@@ -33,8 +35,10 @@ flowchart TD
     B -->|没有| Z[直接返回]
     B -->|有| C[计算每个请求涉及的 region 数]
     C --> D[生成累计任务数 task_prefix]
-    D --> E[slot 准备：保留已有状态，为未完成 region 申请空位]
-    E --> F{分配成功吗？}
+    D --> E[同一 kernel 扫描 slot 表：修复反向映射并收集空位]
+    E --> K[并行判断每个任务是否需要新 slot]
+    K --> L[按申请序号取空位并初始化]
+    L --> F{分配成功吗？}
     F -->|否| X[跳过 update，由调用方报告失败]
     F -->|是| G[一次 update：计算所有有效 region]
     G --> H{region 是否完成？}
@@ -42,7 +46,7 @@ flowchart TD
     H -->|否| J[将累计状态写入准备好的 slot]
 ```
 
-三个 kernel 按顺序执行。slot 准备阶段不会提前释放任何已有 slot，因为 update 仍可能需要读取其中的旧累计状态。
+四个 kernel 按顺序执行。slot 准备阶段不会提前释放任何已有 slot，因为 update 仍可能需要读取其中的旧累计状态。
 
 ## 3. 贯穿全文的输入例子
 
@@ -218,28 +222,30 @@ else:
 
 ```mermaid
 flowchart TD
-    A[slot 准备：定位 region 任务] --> B{有有效 token？}
-    B -->|否| C[跳过任务]
-    B -->|是| D{已有合法 slot？}
-    D -->|是| E[保留旧累计状态]
-    D -->|否| M[先扫描实际拥有者表]
-    M --> N{找到同一 region 的旧 slot？}
-    N -->|是| K[保留旧状态并修复映射]
-    N -->|否| O{region 未完成？}
-    O -->|否| P[不申请 slot，交给 update 计算]
-    O -->|是| F[使用 atomic_cas 查找并占用空位]
-    F --> G{找到 slot？}
-    G -->|否| H[设置分配失败标记]
-    G -->|是| J[初始化新 slot：清零累计值和暂存标记，最大分数设为负无穷]
-    J --> L[记录 region 到 slot 的映射]
-    K --> L
+    A[每批扫描一次实际拥有者表] --> B[修复已有 region 的反向映射]
+    B --> C[按 slot 编号收集空位]
+    C --> D[并行检查每个 region 任务]
+    D --> E{有有效 token、未完成、且没有旧 slot？}
+    E -->|否| F[记录负一，不申请]
+    E -->|是| G[记录需要申请的 region 编号]
+    F --> H[累计申请数量，给申请者编号]
+    G --> H
+    H --> I{申请序号小于空位数？}
+    I -->|否| J[设置分配失败标记]
+    I -->|是| K[取对应空位，初始化并记录双向映射]
 ```
 
-`atomic_cas` 是不可被其他申请者插入打断的“检查并占用”操作，用来防止不同 region 抢到同一个空位。
+扫描拥有者表只在第一个 kernel 中执行一次。例如 slot 3 属于 region 10，就写回 `active_slot_by_region[10] = 3`。所有后续任务都能直接找到旧状态，包括本次将完成的 region，不再逐任务扫描拥有者表。
 
-新占用的 slot 即使过去被使用过，也不能带着旧数值进入 update，所以必须初始化。反向映射失效，但搜索到属于同一 region 的已有 slot 时，则保留累计值并修复映射。
+空位按 slot 编号收集到 `free_slots`。假设 slot 拥有者是 `[10, -1, 20, -1, -1]`，空位列表就是 `[1, 3, 4]`。列表末尾的专用位置 `free_slots[active_capacity]` 保存空位数量，此例为 3。
 
-必须先查旧 slot，再申请空位。例如 region 10 的旧状态在 slot 3，slot 0 为空，而反向映射失效：如果直接从 slot 0 开始申请，就会为 region 10 重复分配并丢失旧累计值。本次完成的 region 也要修复映射，才能在 update 中读到旧状态。
+申请判断阶段向 `slot_requests[task]` 写入需要新 slot 的 region 编号；无需申请时写入 -1。假设结果是 `[11, -1, 23, 40]`，对应申请标记 `[1, 0, 1, 1]`，累计求和得到 `[1, 1, 2, 3]`。申请者用累计值减一作为序号：region 11、23、40 分别拿列表第 0、1、2 项，即 slot 1、3、4。每个申请序号唯一，因此 prefill 分配不需要 `atomic_cas`。
+
+集中分配的 kernel 只有一个程序实例，每次处理 16 个任务，保留前面小批次的累计申请数。这限制了初始化分子、分母、暂存标记时的临时张量大小。只有申请成功的新 slot 会被清零，最大分数初始化为负无穷；旧 slot 的累计值不变。
+
+不能只检查每个请求的最后一个 region：当前接口允许内部无效 token，如果中间 region 的最后一个位置无效，它也可能需要保存状态。因此申请判断仍覆盖全部 region 任务，但每个任务只直接读取映射，不再扫描或抢占 slot。
+
+`free_slots` 需要 `active_capacity + 1` 个 int32 元素，`slot_requests` 预留本次输入行数个 int32 元素（region 任务数不会超过输入行数）。调用方复用这两个缓冲区，不在每次调用中重新申请。
 
 ```mermaid
 flowchart TD
@@ -300,7 +306,7 @@ token_position % region_size == region_size - 1
 
 这里需要足够的空闲空间同时容纳旧尾部和新尾部。如果调用开始时只有 slot0 且已被 region10 占用，准备阶段不能提前释放它给 region23；否则 region10 的旧数据会被覆盖。这种容量不足会报告失败，不会等待本次 update 释放空间后重试。
 
-当前 Ascend 容量策略为 `8 * max_num_seqs`，其中 `max_num_seqs` 是配置允许的最大请求数。它没有在本次修改中扩大；实际运行仍须验证包含候选 token 验证等场景的最大占用量。
+设备分配区仍为 `8 * max_num_seqs`，新增 runner 预留区为 `2 * max_num_seqs`，总容量为 `10 * max_num_seqs`。设备分配不得占用预留区；实际运行仍须验证最大占用量。
 
 ## 9. 用数字算一次 summary
 
@@ -375,13 +381,13 @@ slot 查找通过两张表完成：
 | `active_slot_by_region[region]` | 提示这个 region 的状态可能在哪个 slot |
 | `active_region_ids[slot]` | 记录 slot 实际属于哪个 region，用来核对提示 |
 
-slot 准备阶段发现未完成 region 没有已有 slot 时，通过 `atomic_cas` 申请空位。它是不可被其他申请者插入打断的“检查并占用”操作，防止不同 region 同时抢到同一个 slot。
+prefill 准备阶段发现未完成 region 没有已有 slot 时，记录申请；集中分配阶段按申请序号取唯一空位。decode 和 MTP 路径原有的分配方式没有在本次修改中替换。
 
 如果没有空位，就把 `allocation_success` 设置为 0，update 在开始时检查该标记并返回，调用方随后报告失败。准备阶段可能已为其他任务申请了 slot；这不是自动回滚机制，也不应忽略错误继续推理。代码不会向无效 slot 下标写入。
 
 ## 11. 任务如何在设备上分配
 
-一次 kernel 调用启动多个执行实例，每个实例执行同一段程序，但负责不同任务。`pid` 是实例编号，`NUM_CORES` 是实例数量，取设备向量计算核数。向量计算核可以理解为处理一组数值运算的计算单元。
+申请判断和 update 的一次 kernel 调用启动多个执行实例，每个实例执行同一段程序，但负责不同任务。任务计数与空位收集、集中分配各使用一个实例。`pid` 是实例编号，`NUM_CORES` 是实例数量，取设备向量计算核数。向量计算核可以理解为处理一组数值运算的计算单元。
 
 分配方式为：
 
@@ -426,13 +432,14 @@ kernel 读取第一项作为起点 `row_base=6`，在使用边界时统一减去
 
 | 代码入口 | 职责 |
 | --- | --- |
-| `_csa_prefill_task_prefix_kernel` | 根据请求边界和长度生成累计任务数 |
+| `_csa_prefill_task_prefix_kernel` | 生成累计任务数，扫描一次拥有者表，修复映射并收集空位 |
 | `_csa_prefill_task_rows` | 两个阶段共用的任务定位辅助函数，不单独启动 kernel |
-| `_csa_prefill_prepare_slots_kernel` | 为未完成 region 申请并初始化 slot，保留已有状态 |
+| `_csa_prefill_prepare_slots_kernel` | 并行判断哪些 region 需要新 slot，写入申请表 |
+| `_csa_prefill_assign_slots_kernel` | 累计申请数量，按序取空位并初始化，不使用 CAS |
 | `_csa_prefill_update_kernel` | 一次调用计算全部有效任务，不分配 slot |
-| `csa_compact_prefill_update` | 检查基本参数，依次提交任务计数、slot 准备和一次更新 |
-| `dsa_attention.py` 中的调用方 | 准备请求信息、token 数据和可复用的 task_prefix 缓冲区 |
+| `csa_compact_prefill_update` | 检查基本参数，依次提交元数据准备、申请判断、集中分配和一次更新 |
+| `dsa_attention.py` 中的调用方 | 准备请求信息、token 数据和可复用的 task_prefix、free_slots、slot_requests 缓冲区 |
 
 对应源码：[summary_kernels.py](../vllm_ascend/models/step5/summary_kernels.py)、[dsa_attention.py](../vllm_ascend/models/step5/dsa_attention.py)。
 
-GPU 单独 kernel 的精度检查结果见 [GPU 验证记录](step4_prefill_gpu_accuracy.md)。NPU 编译、数值精度和性能仍待验证。整个流程仍为三次 kernel 调用，减少的是 update 的调用次数，并未减少总启动次数，也没有保证性能一定提升。
+[GPU 验证记录](step4_prefill_gpu_accuracy.md) 对应之前的 CAS 分配版本，不代表当前空闲列表分配版本的设备验证结果。2026-09-29 的修改完成后，按要求跳过设备测试；此前本地通过了 1,000 组实际元数据 kernel 函数体的 NumPy 模拟，未验证 Triton 编译或设备执行。当前流程为四次 kernel 调用，update 仍为一次；移除了逐 region 扫表与 CAS 竞争，但新增了集中分配启动，其净性能收益需要 NPU 实测。

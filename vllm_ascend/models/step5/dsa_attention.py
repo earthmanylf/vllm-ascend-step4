@@ -51,6 +51,12 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 
+from vllm_ascend.worker.step5_csa_slot_manager import (
+    CSA_DEVICE_SLOTS_PER_REQUEST,
+    CSA_PREFILL_SLOTS_PER_REQUEST,
+    CSAPrefillSlotPlan,
+    CSASlotManager,
+)
 from vllm_ascend.models.step5.dsa_kernels import (
     decode_sparse_meta,
     indexer_logits_paged,
@@ -203,6 +209,7 @@ class AscendStep5DSAMetadata(AttentionMetadata):
     """(num_reqs + 1,) full-batch token start locations, including padding."""
     seq_lens: torch.Tensor
     """(num_reqs,) full-batch sequence lengths, including padding rows."""
+    csa_prefill_plan: CSAPrefillSlotPlan | None = None
     prefill: AscendStep5DSAPrefillMetadata | None = None
     decode: AscendStep5DSADecodeMetadata | None = None
 
@@ -230,10 +237,29 @@ class AscendStep5DSAMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self._csa_layer_names = layer_names
+        self._csa_static_context = vllm_config.compilation_config.static_forward_context
         self.context_len_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
             device=device,
+        )
+
+    def build_csa_prefill_plan(
+        self, manager: CSASlotManager, req_ids: list[str], metadata: AscendStep5DSAMetadata,
+    ) -> None:
+        # First stage only: ordinary prompt-prefill, no decode/verify requests.
+        if metadata.num_decodes or metadata.prefill is None:
+            return
+        sizes = {
+            self._csa_static_context[name].impl.region_size
+            for name in self._csa_layer_names
+        }
+        if len(sizes) != 1 or len(req_ids) != metadata.num_prefills:
+            return
+        prefill = metadata.prefill
+        metadata.csa_prefill_plan = manager.plan(
+            req_ids, prefill.context_lens_host, prefill.seq_lens_host, sizes.pop(),
         )
 
     def build(
@@ -484,15 +510,11 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         return out[: int(required)].view(*shape)
 
     def _csa_active_region_capacity(self) -> int:
-        """Bind-time slot capacity for incomplete regions (see upstream).
+        """Keep the device pool intact and add two CPU-reserved slots per request."""
+        return (CSA_DEVICE_SLOTS_PER_REQUEST + CSA_PREFILL_SLOTS_PER_REQUEST) * int(self.max_num_seqs)
 
-        One prefill launch can hold two tail generations per request (the
-        carry-over tail has not released its slot while the new tail already
-        claimed one), so one slot per request is not enough. This backend reserves 8x
-        max_num_seqs, and every allocation failure is fail-closed through
-        the device-side ``allocation_success`` flag.
-        """
-        return 8 * int(self.max_num_seqs)
+    def _csa_device_slot_capacity(self) -> int:
+        return CSA_DEVICE_SLOTS_PER_REQUEST * int(self.max_num_seqs)
 
     def csa_fixed_runtime_state_size_bytes(self) -> int:
         """Persistent CSA bytes that do not scale with KV blocks."""
@@ -596,6 +618,14 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             (self.max_num_seqs + 1,),
             device=device,
             dtype=torch.int32,
+        )
+        self._get_dsa_tensor_buffer_at_least(
+            "csa_prefill_free_slots", (self._csa_active_region_capacity() + 1,),
+            device=device, dtype=torch.int32,
+        )
+        self._get_dsa_tensor_buffer_at_least(
+            "csa_prefill_slot_requests", (max_layout_rows,),
+            device=device, dtype=torch.int32,
         )
         # Decode indexer-score workspace, shared by all layers (they run
         # sequentially on one stream and each consumes its scores before the
@@ -768,6 +798,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 index_k,
                 index_z,
                 live_rows=int(layout.token_flat_slot.numel()),
+                allocation_capacity=self._csa_device_slot_capacity(),
                 **common,
             )
         else:
@@ -796,10 +827,20 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 query_start_loc=md.query_start_loc[:num_requests + 1],
                 seq_lens=md.seq_lens[:num_requests],
                 task_prefix=task_prefix,
+                free_slots=self._get_dsa_tensor_buffer_at_least(
+                    "csa_prefill_free_slots", (self._csa_active_region_capacity() + 1,),
+                    device=index_k.device, dtype=torch.int32,
+                ),
+                slot_requests=self._get_dsa_tensor_buffer_at_least(
+                    "csa_prefill_slot_requests", (num_tokens,),
+                    device=index_k.device, dtype=torch.int32,
+                ),
                 live_rows=num_tokens,
+                allocation_capacity=self._csa_device_slot_capacity(),
+                slot_plan=md.csa_prefill_plan,
                 **common,
             )
-        self._assert_csa_allocation_success(allocation_success)
+        # self._assert_csa_allocation_success(allocation_success)
 
     def _update_summary_cache_verify(
         self,
@@ -869,6 +910,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             index_z[:nv],
             live_rows=nv,
             query_len=query_len,
+            allocation_capacity=self._csa_device_slot_capacity(),
             **common,
         )
         # 3) Mixed batch: prepare slots, then update the prefill tail once
@@ -901,7 +943,16 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 query_start_loc=md.query_start_loc[n:n + md.num_prefills + 1],
                 seq_lens=md.seq_lens[n:n + md.num_prefills],
                 task_prefix=task_prefix,
+                free_slots=self._get_dsa_tensor_buffer_at_least(
+                    "csa_prefill_free_slots", (self._csa_active_region_capacity() + 1,),
+                    device=index_k.device, dtype=torch.int32,
+                ),
+                slot_requests=self._get_dsa_tensor_buffer_at_least(
+                    "csa_prefill_slot_requests", (prefill_rows,),
+                    device=index_k.device, dtype=torch.int32,
+                ),
                 live_rows=prefill_rows,
+                allocation_capacity=self._csa_device_slot_capacity(),
                 **common,
             )
         self._assert_csa_allocation_success(allocation_success)

@@ -112,6 +112,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend.worker.step5_csa_slot_manager import CSASlotManager
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -462,6 +463,7 @@ class NPUModelRunner(GPUModelRunner):
         # AscendMLABackend, and DSV4 compressed attention metadata) need
         # ``optimistic_seq_lens_cpu`` to match the corrected GPU seq_lens
         # in async spec decode mode; others (SFA, GDN, etc.) do not.
+        self._step5_csa_slot_managers: dict[tuple[int, int], CSASlotManager] = {}
         self._needs_seq_lens_cpu_sync = self.use_compress or issubclass(
             self.attn_backend, (AscendAttentionBackend, AscendMLABackend)
         )
@@ -845,6 +847,14 @@ class NPUModelRunner(GPUModelRunner):
 
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
         sampling_metadata = super()._update_states(scheduler_output)
+        # The parent schedules CSA side-storage cleanup for finish/preemption.
+        # Release host reservations afterwards; never free just because a
+        # request was omitted from this batch or moved to another batch row.
+        released = set(scheduler_output.finished_req_ids)
+        released.update(scheduler_output.preempted_req_ids or ())
+        for manager in self._step5_csa_slot_managers.values():
+            for req_id in released:
+                manager.release(req_id)
         self._track_tmp_encoder_cache_refs(scheduler_output)
         return sampling_metadata
 
@@ -965,6 +975,12 @@ class NPUModelRunner(GPUModelRunner):
             for mm_feature in new_req_data.mm_features:
                 cur_hash = mm_feature.identifier
                 self.cached.setdefault(cur_hash, set()).add(new_req_data.req_id)
+
+    def _release_request_kv_cache_side_storage(self, req_state: Any | None) -> None:
+        super()._release_request_kv_cache_side_storage(req_state)
+        if req_state is not None:
+            for manager in getattr(self, "_step5_csa_slot_managers", {}).values():
+                manager.release(req_state.req_id)
 
     def _on_request_state_removed(self, req_id: str, req_state: Any | None) -> None:
         # Mirror the upstream hook: drop the finished request's KV side
@@ -3317,6 +3333,34 @@ class NPUModelRunner(GPUModelRunner):
                     and isinstance(builder, GDNAttentionMetadataBuilder) and attn_metadata_i.num_prefills == 0:
                     if attn_metadata_i.num_decodes == 0 and attn_metadata_i.num_spec_decodes > 0:
                         attn_metadata_i.spec_state_indices_tensor[attn_metadata_i.num_spec_decodes:].fill_(0)
+            # Share one host plan across layers in this attention group. Draft,
+            # graph capture, context parallel and mixed batches keep the device
+            # path until their slot lifetimes are managed by the runner as well.
+            build_csa_plan = getattr(builder, "build_csa_prefill_plan", None)
+            if (build_csa_plan is not None and not for_cudagraph_capture
+                    and not self.use_dcp
+                    and getattr(self.parallel_config, "prefill_context_parallel_size", 1) == 1
+                    and ubatch_slices is None
+                    and attn_metadata_i.num_decodes == 0
+                    and attn_metadata_i.num_prefills == num_reqs):
+                req_ids = list(self.input_batch.req_ids[:num_reqs])
+                # CPU scheduling lengths are exact inside the prompt. Do not
+                # infer MTP acceptance or generated-token validity on the host.
+                prompt_only = all(
+                    req_id in self.requests
+                    and int(self.optimistic_seq_lens_cpu[i]) <= self.requests[req_id].num_prompt_tokens
+                    for i, req_id in enumerate(req_ids)
+                )
+                if prompt_only:
+                    key = (kv_cache_gid, attn_gid)
+                    manager = self._step5_csa_slot_managers.get(key)
+                    if manager is None:
+                        manager = CSASlotManager(
+                            self.max_num_reqs, self.scheduler_config.max_num_batched_tokens,
+                            self.device, self.pin_memory,
+                        )
+                        self._step5_csa_slot_managers[key] = manager
+                    build_csa_plan(manager, req_ids, attn_metadata_i)
             if isinstance(builder, AscendDSAMetadataBuilder):
                 common_ratio_to_sas_metadata = builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
 

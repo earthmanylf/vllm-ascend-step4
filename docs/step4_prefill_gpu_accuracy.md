@@ -1,5 +1,7 @@
 # Step4 prefill kernel GPU 精度验证
 
+> 本记录对应空闲列表分配改造之前的版本。2026-09-29 新增的按序分配路径及后续 runner 管理方案尚未进行 GPU/NPU 设备验证，不能引用本记录作为新路径通过验证的依据。
+
 验证日期：2026-09-28。算法说明见 [prefill region 任务方案](step4_prefill_region_tasks.md)。
 
 ## 验证结论
