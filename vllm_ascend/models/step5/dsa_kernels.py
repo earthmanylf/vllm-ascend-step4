@@ -2654,6 +2654,107 @@ def decode_sparse_meta(
     )
     return packed, counts
 
+
+def decode_pack_from_ids(
+    ids: torch.Tensor,
+    kv_seqlens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    topk: int,
+    region_size: int = REGION_BLOCK_SIZE,
+    regions_per_page: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack pre-selected logical region ids into decode metadata.
+
+    Same packing stage as :func:`decode_sparse_meta` (physical-page mapping,
+    current-region append, ascending compaction into the INT64 word), but the
+    TopK selection has already been done by the caller — ``ids`` must satisfy
+    the ``region_topk_ids`` output contract: ``[rows, topk]`` int32 logical
+    ids, ascending, ``-1`` tail padding. Rows are group-major
+    (``row = group * num_reqs + request``).
+    """
+    rows = int(ids.shape[0])
+    num_reqs = int(kv_seqlens.shape[0])
+    topk = int(topk)
+    if rows % num_reqs:
+        raise ValueError(f"{rows} id rows do not divide into {num_reqs} requests")
+
+    packed = torch.empty((rows, topk + 1), device=ids.device, dtype=torch.int64)
+    counts = torch.empty((rows,), device=ids.device, dtype=torch.int32)
+    block_k = triton.next_power_of_2(topk)
+    block_rows = min(128, max(2, triton.next_power_of_2(triton.cdiv(rows, 64))))
+    block_rows = min(block_rows, max(2, 8192 // block_k))
+    _decode_pack_kernel[(triton.cdiv(rows, block_rows),)](
+        ids,
+        kv_seqlens,
+        block_table,
+        packed,
+        counts,
+        rows,
+        num_reqs,
+        ids.stride(0),
+        shared_table_stride(block_table),
+        packed.stride(0),
+        topk=topk,
+        region_size=region_size,
+        regions_per_page=regions_per_page,
+        BLOCK_ROWS=block_rows,
+        BLOCK_K=block_k,
+    )
+    return packed, counts
+
+
+def prefill_pack_from_ids(
+    ids: torch.Tensor,
+    q_positions: torch.Tensor,
+    block_table: torch.Tensor,
+    request_indices: torch.Tensor | None = None,
+    *,
+    topk: int,
+    region_size: int = REGION_BLOCK_SIZE,
+    regions_per_page: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack pre-selected logical region ids into prefill metadata.
+
+    Same packing stage as :func:`prefill_sparse_meta` (physical-page mapping,
+    valid-token causal truncation, current-region insertion at the positional
+    ``history_counts`` slot), but the TopK selection has already been done by
+    the caller — ``ids`` must satisfy the ``topk_select_new`` output contract:
+    ``[rows, topk]`` int32 logical ids, ascending, ``-1`` tail padding.
+    """
+    rows = int(ids.shape[0])
+    topk = int(topk)
+    if request_indices is None:
+        request_indices = torch.zeros((rows,), device=ids.device, dtype=torch.int32)
+
+    packed = torch.empty((rows, topk + 1), device=ids.device, dtype=torch.int32)
+    counts = torch.empty((rows,), device=ids.device, dtype=torch.int32)
+    block_k = topk
+    _append_max_tile = 8192
+    block_rows = min(
+        128,
+        max(2, triton.next_power_of_2(triton.cdiv(rows, 64))),
+        max(2, _append_max_tile // block_k),
+    )
+    _append_current_region_kernel[(triton.cdiv(rows, block_rows),)](
+        ids,
+        q_positions,
+        block_table,
+        request_indices,
+        packed,
+        counts,
+        rows,
+        ids.stride(0),
+        shared_table_stride(block_table),
+        packed.stride(0),
+        topk=topk,
+        region_size=region_size,
+        regions_per_page=regions_per_page,
+        BLOCK_ROWS=block_rows,
+        BLOCK_K=block_k,
+    )
+    return packed, counts
+
 assert (
     PREFILL_REGION_VALID_SHIFT.value
     == _MERGED_PREFILL_REGION_VALID_SHIFT.value
@@ -4431,6 +4532,8 @@ __all__ = [
     "region_topk_pack",
     "prefill_sparse_meta",
     "decode_sparse_meta",
+    "decode_pack_from_ids",
+    "prefill_pack_from_ids",
     "sparse_attention_prefill",
     "merge_split_states",
     "sparse_attention_decode",
