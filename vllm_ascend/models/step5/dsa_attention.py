@@ -10,9 +10,12 @@ layout builder, and ``forward`` is ``_maybe_update_summary_cache`` followed by
 the sparse-GQA decode/prefill paths.
 
 The CuTeDSL-only operators are replaced by the Triton kernels in
-``vllm_ascend.models.step5.summary_kernels`` (region update, paged indexer
-scoring); region selection, metadata packing and the sparse attention itself
-reuse the parity-pinned kernels of ``dsa_kernels.py``.
+``vllm_ascend.models.step5.summary_kernels`` (region update). The indexer
+region scoring, causal masking, TopK selection and ascending sort are fused
+into the aclnn ``IndexerRegionScore`` operator
+(``vllm_ascend.models.step5.indexer_region_score``); metadata packing
+(physical-page mapping + current-region append) and the sparse attention
+itself reuse the parity-pinned Triton kernels of ``dsa_kernels.py``.
 
 Spec-decode verify batches (multi-token decode rows, ``query_len = K+1``)
 follow the upstream ``Step5DSAMTP`` contract with an equivalent Ascend
@@ -21,10 +24,8 @@ of folded (staging is last-write-wins per (region, offset), so the next
 round's rewrite of rejected positions is an exact rollback to the accepted
 prefix), and completed regions are only materialized into the fp8 page
 cache by the deferred flush once their last position is below the request's
-committed context. The verify attention itself reuses the prefill-style
-causal selection (``prefill_sparse_meta`` bounds each row's candidate
-regions by its own position and force-appends the row's current region),
-which is bit-compatible with the eager prefill path.
+committed context. The verify attention flattens every row to a
+single-token decode request whose causal bound is its own position.
 """
 
 from __future__ import annotations
@@ -57,11 +58,13 @@ from vllm_ascend.worker.step5_csa_slot_manager import (
     CSASlotManager,
 )
 from vllm_ascend.models.step5.dsa_kernels import (
-    decode_sparse_meta,
-    indexer_logits_paged,
-    prefill_sparse_meta,
+    decode_pack_from_ids,
+    prefill_pack_from_ids,
     sparse_attention_decode,
     sparse_attention_prefill,
+)
+from vllm_ascend.models.step5.indexer_region_score import (
+    indexer_score_topk,
 )
 from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache, CSAPrefillState
 from vllm_ascend.models.step5.summary_kernels import (
@@ -661,20 +664,6 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 device=device,
                 dtype=torch.int32,
             )
-        # Decode indexer-score workspace, shared by all layers (they run
-        # sequentially on one stream and each consumes its scores before the
-        # next layer overwrites them). With MTP verify batches every decode
-        # request contributes K+1 scoring rows.
-        decode_rows_per_req = 1 + (self.num_speculative_tokens if self.num_speculative_tokens > 0 else 0)
-        self._get_dsa_tensor_buffer_at_least(
-            "sparse_decode_logits",
-            (
-                self.num_kv_groups * self.max_num_seqs * decode_rows_per_req,
-                self._max_regions,
-            ),
-            device=device,
-            dtype=torch.float32,
-        )
         self._dsa_scratch_bound = True
 
     @staticmethod
@@ -1072,27 +1061,27 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             )
         n = md.num_decodes
         groups = self.num_kv_groups
-        # Region scoring over the static selector capacity, the whole batch
-        # in one kernel launch. Dead columns hold stale scores, but the
-        # selector only reads columns below each row's live history length.
-        logits = self._get_dsa_tensor_buffer_at_least(
-            "sparse_decode_logits",
-            (groups * n, self._max_regions),
-            device=index_q.device,
-            dtype=torch.float32,
+        seq_lens_i32 = d.seq_lens.to(torch.int32)
+        # Fused score + causal topk + ascending sort via aclnn, then the
+        # Triton pack kernel maps logical ids to physical pages and appends
+        # the current region.
+        cu_seq_lens = torch.arange(
+            n + 1, device=index_q.device, dtype=torch.int32
         )
-        indexer_logits_paged(
+        actual_kv_lengths = seq_lens_i32 - 1
+        _scores, ids = indexer_score_topk(
             index_q[:n],
             weights[:n],
             summary_cache.mean_cache.view(torch.float8_e4m3fn),
             d.block_table,
-            torch.arange(n, device=index_q.device, dtype=torch.int32),
-            out=logits,
-            summaries_per_page=int(summary_cache.summaries_per_page),
+            cu_seq_lens,
+            actual_kv_lengths,
+            max_region_len=self._max_regions,
+            topk=self.topk_regions,
+            region_size=self.region_size,
         )
-        seq_lens_i32 = d.seq_lens.to(torch.int32)
-        packed, counts = decode_sparse_meta(
-            logits,
+        packed, counts = decode_pack_from_ids(
+            ids,
             seq_lens_i32,
             d.block_table,
             topk=self.topk_regions,
@@ -1147,37 +1136,37 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         k = int(d.query_len)
         total = n * k
         groups = self.num_kv_groups
-        logits = self._get_dsa_tensor_buffer_at_least(
-            "sparse_decode_logits",
-            (groups * total, self._max_regions),
-            device=index_q.device,
-            dtype=torch.float32,
-        )
-        # Token -> request map: each request contributes K consecutive rows.
+        # Flatten the verify rows to single-token decode requests: row r of
+        # request i carries its own context end, i.e. kv_seqlen = position +
+        # 1. Each row is an independent single-token "request" for the fused
+        # operator; its causal bound floor(position / region_size) keeps the
+        # current region out of top-k competition, and the pack kernel
+        # force-appends it afterwards.
+        row_kv_seqlens = positions[:total].to(torch.int32) + 1
         token_to_req = (
             torch.arange(total, device=index_q.device, dtype=torch.int32) // k
         )
-        indexer_logits_paged(
-            index_q[:total],
-            weights[:total],
-            summary_cache.mean_cache.view(torch.float8_e4m3fn),
-            d.block_table[:n],
-            token_to_req,
-            out=logits,
-            summaries_per_page=int(summary_cache.summaries_per_page),
-        )
-        # Flatten the verify rows to single-token decode requests: row r of
-        # request i carries its own context end, i.e. kv_seqlen = position +
-        # 1. The decode kernel then bounds each selected region by
-        # clamp(kv_seqlen - start_token, 0, region_size), which is the
-        # per-row causal mask.
-        row_kv_seqlens = positions[:total].to(torch.int32) + 1
         # Per-row block-table rows, gathered on device so the flatten stays
         # graph-capturable; this mirrors the reference's metadata-flatten
         # kernel expanding per-request rows to per-token rows.
         row_block_table = d.block_table[:n][token_to_req.to(torch.long)]
-        packed, counts = decode_sparse_meta(
-            logits,
+        cu_seq_lens = torch.arange(
+            total + 1, device=index_q.device, dtype=torch.int32
+        )
+        actual_kv_lengths = row_kv_seqlens - 1
+        _scores, ids = indexer_score_topk(
+            index_q[:total],
+            weights[:total],
+            summary_cache.mean_cache.view(torch.float8_e4m3fn),
+            row_block_table,
+            cu_seq_lens,
+            actual_kv_lengths,
+            max_region_len=self._max_regions,
+            topk=self.topk_regions,
+            region_size=self.region_size,
+        )
+        packed, counts = decode_pack_from_ids(
+            ids,
             row_kv_seqlens,
             row_block_table,
             topk=self.topk_regions,
@@ -1198,69 +1187,6 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         )
         output[:total] = out.to(output.dtype)
 
-    def _score_regions(
-        self,
-        summary_cache: AscendStep5SparseSummaryCache,
-        index_q: torch.Tensor,
-        weights: torch.Tensor,
-        block_table: torch.Tensor,
-        num_tokens: int,
-        num_rows: int,
-        seq_lens_host: list,
-        context_lens_host: list,
-    ) -> torch.Tensor:
-        """Indexer scores for the prefill rows, against the paged summary.
-
-        Same contract as the reference ``score_regions``: a
-        [groups * total_q, width] fp32 tensor in group-major row order, width
-        sized to the live history. The whole packed batch is scored in one
-        kernel launch: each query token reads the fp8 summary pages through
-        its own request's block-table row (widened in-register). Dead columns
-        past a row's live history hold zeros or stale scores, which the
-        top-k stage never reads because each row's candidate range is bounded
-        by its own history length.
-        """
-        groups = self.num_kv_groups
-        # ``seq_lens`` from the common attention metadata hold each request's
-        # FULL history (past + this chunk's query tokens); the per-row query
-        # length is the difference.
-        query_lens_list = [
-            int(seq_lens_host[row]) - int(context_lens_host[row])
-            for row in range(num_rows)
-        ]
-        last_positions = [
-            int(seq_lens_host[row]) - 1
-            for row in range(num_rows)
-            if query_lens_list[row] > 0
-        ]
-        width = max(
-            (position // self.region_size for position in last_positions), default=0
-        )
-        logits = torch.zeros(
-            (groups * num_tokens, max(width, 1)),
-            device=index_q.device,
-            dtype=torch.float32,
-        )
-        if num_tokens == 0:
-            return logits
-        mean_cache = summary_cache.mean_cache.view(torch.float8_e4m3fn)
-        # Token -> block-table row map for the packed batch, built once on the
-        # host (the query lengths already live there) and shipped in one copy.
-        token_to_req = torch.repeat_interleave(
-            torch.arange(num_rows, dtype=torch.int32),
-            torch.tensor(query_lens_list, dtype=torch.int64),
-        ).to(index_q.device)
-        indexer_logits_paged(
-            index_q[:num_tokens],
-            weights[:num_tokens],
-            mean_cache,
-            block_table[:num_rows],
-            token_to_req,
-            out=logits,
-            summaries_per_page=int(summary_cache.summaries_per_page),
-        )
-        return logits
-
     def _forward_sparse_gqa_prefill(
         self,
         *,
@@ -1279,18 +1205,24 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         assert p is not None
         num_reqs = md.num_prefills
         num_query_tokens = p.num_query_tokens
-
-        logits = self._score_regions(
-            summary_cache,
-            index_q,
-            weights,
-            p.block_table,
-            num_query_tokens,
-            num_reqs,
-            p.seq_lens_host,
-            p.context_lens_host,
-        )
         groups = self.num_kv_groups
+
+        # Live history width in logical regions (the furthest last-position
+        # of any request in this chunk), bounding what the fused operator
+        # needs to score.
+        query_lens_list = [
+            int(p.seq_lens_host[row]) - int(p.context_lens_host[row])
+            for row in range(num_reqs)
+        ]
+        width = max(
+            (
+                (int(p.seq_lens_host[row]) - 1) // self.region_size
+                for row in range(num_reqs)
+                if query_lens_list[row] > 0
+            ),
+            default=0,
+        )
+
         q_positions = positions[token_offset : token_offset + num_query_tokens].to(
             torch.int32
         )
@@ -1305,11 +1237,37 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             )
             - 1
         ).to(torch.int32)
+
+        # Fused score + causal topk + ascending sort via aclnn. The
+        # operator's mask3 bound floor((context_lens[n] + j)/region_size) is
+        # each token's own position // region_size, so the current region
+        # never competes for a slot; the pack kernel appends it afterwards.
+        # cu_seq_lens from the device start-loc; actual_kv_lengths is each
+        # request's first-token global KV position (its cached context
+        # length).
+        cu_seq_lens = torch.cat(
+            [
+                torch.zeros((1,), device=index_q.device, dtype=torch.int32),
+                p.query_start_loc[1 : num_reqs + 1].to(torch.int32),
+            ]
+        )
+        actual_kv_lengths = p.context_lens[:num_reqs].to(torch.int32)
+        _scores, ids = indexer_score_topk(
+            index_q[:num_query_tokens],
+            weights[:num_query_tokens],
+            summary_cache.mean_cache.view(torch.float8_e4m3fn),
+            p.block_table[:num_reqs],
+            cu_seq_lens,
+            actual_kv_lengths,
+            max_region_len=width,
+            topk=self.topk_regions,
+            region_size=self.region_size,
+        )
         if groups > 1:
             q_positions = q_positions.repeat(groups).contiguous()
             requests = requests.repeat(groups).contiguous()
-        packed, counts = prefill_sparse_meta(
-            logits,
+        packed, counts = prefill_pack_from_ids(
+            ids,
             q_positions,
             p.block_table,
             requests,
