@@ -5,7 +5,7 @@
 """E2E UT (single NPU): fused aclnn IndexerRegionScore adapter.
 
 Covers ``vllm_ascend.models.step5.indexer_region_score.indexer_score_topk``
-(``indexer_region_score_with_topk`` -> ``aclnnIndexerRegionScore``), the fused
+(``indexer_region_score`` -> ``aclnnIndexerRegionScore``), the fused
 score + causal-topk + ascending-sort operator wired into the Step5 DSA
 decode/prefill paths.
 
