@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import torch
 
-from cann_ops_transformer.ops import indexer_region_score_with_topk
+from cann_ops_transformer_step4_indexer.ops.attention.indexer_region_score.indexer_region_score import (
+    indexer_region_score_with_topk,
+)
 
 
 def indexer_score_topk(
@@ -31,7 +33,9 @@ def indexer_score_topk(
     max_region_len: int,
     topk: int,
     region_size: int = 8,
-    head_scale: float = 0.5,
+    # Weights arrive pre-scaled by H**-0.5 (model.py scales them before the
+    # attention call), so no extra scaling is applied here.
+    head_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused score + topk + sort via aclnnIndexerRegionScore.
 
