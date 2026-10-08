@@ -789,11 +789,11 @@ def get_attention_context(
     attn_metadata_raw = forward_context.attn_metadata
     attn_metadata: AttentionMetadata
     if isinstance(attn_metadata_raw, dict):
-        attn_metadata = attn_metadata_raw[layer_name]
+        attn_metadata = attn_metadata_raw.get(layer_name)
     elif isinstance(attn_metadata_raw, list):
         # list[dict[str, AttentionMetadata]]: used in speculative decoding
         # where [0] is the base-model (non-speculative) metadata dict.
-        attn_metadata = attn_metadata_raw[0][layer_name]
+        attn_metadata = attn_metadata_raw[0].get(layer_name)
     else:
         attn_metadata = attn_metadata_raw
     attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]
