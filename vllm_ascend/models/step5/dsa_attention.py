@@ -13,9 +13,13 @@ The CuTeDSL-only operators are replaced by the Triton kernels in
 ``vllm_ascend.models.step5.summary_kernels`` (region update). The indexer
 region scoring, causal masking, TopK selection and ascending sort are fused
 into the aclnn ``IndexerRegionScore`` operator
-(``vllm_ascend.models.step5.indexer_region_score``); metadata packing
-(physical-page mapping + current-region append) and the sparse attention
-itself reuse the parity-pinned Triton kernels of ``dsa_kernels.py``.
+(``vllm_ascend.models.step5.indexer_region_score``); the exact sparse
+attention runs in the aclnn ``GenericBlockSparseAttention`` operator
+(``vllm_ascend.models.step5.generic_block_sparse_attention``), which
+consumes the indexer's logical region ids directly (current-region append
+and per-token causal truncation happen inside the operator), so the
+physical-page pack kernels and the Triton attention kernels of
+``dsa_kernels.py`` are no longer on the serving path.
 
 Spec-decode verify batches (multi-token decode rows, ``query_len = K+1``)
 follow the upstream ``Step5DSAMTP`` contract with an equivalent Ascend
@@ -52,16 +56,13 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 
+from vllm_ascend.models.step5.generic_block_sparse_attention import (
+    gbsa_sparse_attention,
+)
 from vllm_ascend.worker.step5_csa_slot_manager import (
     CSA_SLOTS_PER_REQUEST,
     CSAMetadata,
     CSASlotManager,
-)
-from vllm_ascend.models.step5.dsa_kernels import (
-    decode_pack_from_ids,
-    prefill_pack_from_ids,
-    sparse_attention_decode,
-    sparse_attention_prefill,
 )
 from vllm_ascend.models.step5.indexer_region_score import (
     indexer_score_topk,
@@ -1039,8 +1040,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         summary_cache: AscendStep5SparseSummaryCache,
         md: AscendStep5DSAMetadata,
         query: torch.Tensor,
-        key_flat: torch.Tensor,
-        value_flat: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         index_q: torch.Tensor,
         weights: torch.Tensor,
         output: torch.Tensor,
@@ -1062,9 +1063,10 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         n = md.num_decodes
         groups = self.num_kv_groups
         seq_lens_i32 = d.seq_lens.to(torch.int32)
-        # Fused score + causal topk + ascending sort via aclnn, then the
-        # Triton pack kernel maps logical ids to physical pages and appends
-        # the current region.
+        # Fused score + causal topk + ascending sort via aclnn; the exact
+        # attention is the aclnn GenericBlockSparseAttention operator, which
+        # appends the current region (floor(pos / region_size)) and applies
+        # the per-token causal truncation itself.
         cu_seq_lens = torch.arange(
             n + 1, device=index_q.device, dtype=torch.int32
         )
@@ -1080,25 +1082,19 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             topk=self.topk_regions,
             region_size=self.region_size,
         )
-        packed, counts = decode_pack_from_ids(
-            ids,
-            seq_lens_i32,
-            d.block_table,
-            topk=self.topk_regions,
-            region_size=self.region_size,
-            regions_per_page=self.regions_per_page,
-        )
-        out, _ = sparse_attention_decode(
+        out = gbsa_sparse_attention(
             query,
-            key_flat,
-            value_flat,
-            packed,
-            counts,
+            key_cache,
+            value_cache,
+            ids,
+            actual_kv_lengths,
+            d.block_table,
+            cu_seq_lens,
             seq_lens_i32,
             num_kv_groups=groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            block_regions=16,
+            max_query_len=1,
         )
         output[:n] = out.to(output.dtype)
 
@@ -1108,8 +1104,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         summary_cache: AscendStep5SparseSummaryCache,
         md: AscendStep5DSAMetadata,
         query: torch.Tensor,
-        key_flat: torch.Tensor,
-        value_flat: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         index_q: torch.Tensor,
         weights: torch.Tensor,
         positions: torch.Tensor,
@@ -1120,13 +1116,13 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         Follows the reference flow's flattened-decode design (its
         ``_flatten_decode_q_le4_metadata`` path): every verify row becomes a
         single-token decode request, runs its own indexer top-k selection,
-        and the exact attention goes through ``sparse_attention_decode``.
-        Each row's ``kv_seqlen`` is its own absolute position + 1, so the
-        decode kernel's per-slot visible length
-        ``clamp(kv_seqlen - start_token, 0, region_size)`` reproduces the
-        per-row causal mask the prefill kernel used to express through
-        per-region ``valid`` counts, while ``decode_sparse_meta`` keeps the
-        row's current region out of top-k competition and force-appends it
+        and the exact attention goes through the aclnn
+        ``GenericBlockSparseAttention`` operator. Each row's ``kv_seqlen``
+        is its own absolute position + 1, so the operator's right-aligned
+        causal bound reproduces the per-row causal mask the prefill kernel
+        used to express through per-region ``valid`` counts, while the
+        fused indexer's mask3 bound keeps the row's current region out of
+        top-k competition and the attention operator appends it causally
         -- the same contract the single-token decode path guarantees.
         Everything is device-driven on static per-bucket shapes, so uniform
         verify batches stay ACL-graph capturable.
@@ -1140,8 +1136,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         # request i carries its own context end, i.e. kv_seqlen = position +
         # 1. Each row is an independent single-token "request" for the fused
         # operator; its causal bound floor(position / region_size) keeps the
-        # current region out of top-k competition, and the pack kernel
-        # force-appends it afterwards.
+        # current region out of top-k competition, and the attention
+        # operator appends and causally truncates it.
         row_kv_seqlens = positions[:total].to(torch.int32) + 1
         token_to_req = (
             torch.arange(total, device=index_q.device, dtype=torch.int32) // k
@@ -1165,25 +1161,19 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             topk=self.topk_regions,
             region_size=self.region_size,
         )
-        packed, counts = decode_pack_from_ids(
-            ids,
-            row_kv_seqlens,
-            row_block_table,
-            topk=self.topk_regions,
-            region_size=self.region_size,
-            regions_per_page=self.regions_per_page,
-        )
-        out, _ = sparse_attention_decode(
+        out = gbsa_sparse_attention(
             query,
-            key_flat,
-            value_flat,
-            packed,
-            counts,
+            key_cache,
+            value_cache,
+            ids,
+            actual_kv_lengths,
+            row_block_table,
+            cu_seq_lens,
             row_kv_seqlens,
             num_kv_groups=groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            block_regions=16,
+            max_query_len=1,
         )
         output[:total] = out.to(output.dtype)
 
@@ -1193,8 +1183,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         summary_cache: AscendStep5SparseSummaryCache,
         md: AscendStep5DSAMetadata,
         query: torch.Tensor,
-        key_flat: torch.Tensor,
-        value_flat: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         index_q: torch.Tensor,
         weights: torch.Tensor,
         positions: torch.Tensor,
@@ -1205,7 +1195,6 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         assert p is not None
         num_reqs = md.num_prefills
         num_query_tokens = p.num_query_tokens
-        groups = self.num_kv_groups
 
         # Live history width in logical regions (the furthest last-position
         # of any request in this chunk), bounding what the fused operator
@@ -1226,22 +1215,12 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         q_positions = positions[token_offset : token_offset + num_query_tokens].to(
             torch.int32
         )
-        # Token -> request map straight from the device start-loc.
-        requests = (
-            torch.searchsorted(
-                p.query_start_loc,
-                torch.arange(
-                    num_query_tokens, device=index_q.device, dtype=p.query_start_loc.dtype
-                ),
-                right=True,
-            )
-            - 1
-        ).to(torch.int32)
 
         # Fused score + causal topk + ascending sort via aclnn. The
         # operator's mask3 bound floor((context_lens[n] + j)/region_size) is
         # each token's own position // region_size, so the current region
-        # never competes for a slot; the pack kernel appends it afterwards.
+        # never competes for a slot; the attention operator appends it and
+        # causally truncates it to the token's position.
         # cu_seq_lens from the device start-loc; actual_kv_lengths is each
         # request's first-token global KV position (its cached context
         # length).
@@ -1263,28 +1242,19 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             topk=self.topk_regions,
             region_size=self.region_size,
         )
-        if groups > 1:
-            q_positions = q_positions.repeat(groups).contiguous()
-            requests = requests.repeat(groups).contiguous()
-        packed, counts = prefill_pack_from_ids(
+        out = gbsa_sparse_attention(
+            query,
+            key_cache,
+            value_cache,
             ids,
             q_positions,
-            p.block_table,
-            requests,
-            topk=self.topk_regions,
-            region_size=self.region_size,
-            regions_per_page=self.regions_per_page,
-        )
-        out, _ = sparse_attention_prefill(
-            query,
-            key_flat,
-            value_flat,
-            packed,
-            counts,
-            num_kv_groups=groups,
+            p.block_table[:num_reqs],
+            cu_seq_lens,
+            p.seq_lens[:num_reqs].to(torch.int32),
+            num_kv_groups=self.num_kv_groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            block_regions=2,
+            max_query_len=p.max_query_len,
         )
         output[token_offset : token_offset + num_query_tokens] = out.to(output.dtype)
 
@@ -1326,8 +1296,6 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             key_cache, value_cache = kv_cache[0], kv_cache[1]
         else:
             key_cache, value_cache = kv_cache[0], kv_cache[1]
-        key_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
-        value_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
 
         if md.num_decodes > 0:
             n = md.num_decodes
@@ -1340,8 +1308,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                     summary_cache=summary_cache,
                     md=md,
                     query=query[:total].contiguous(),
-                    key_flat=key_flat,
-                    value_flat=value_flat,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
                     index_q=index_q[:total],
                     weights=weights[:total],
                     positions=positions,
@@ -1352,8 +1320,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                     summary_cache=summary_cache,
                     md=md,
                     query=query[:n].contiguous(),
-                    key_flat=key_flat,
-                    value_flat=value_flat,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
                     index_q=index_q[:n],
                     weights=weights[:n],
                     output=output,
@@ -1365,8 +1333,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 summary_cache=summary_cache,
                 md=md,
                 query=query[start:num_tokens].contiguous(),
-                key_flat=key_flat,
-                value_flat=value_flat,
+                key_cache=key_cache,
+                value_cache=value_cache,
                 index_q=index_q[start:num_tokens],
                 weights=weights[start:num_tokens],
                 positions=positions,
