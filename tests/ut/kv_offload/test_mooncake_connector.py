@@ -1686,7 +1686,7 @@ class MockRequest:
 class MockKVCacheGroup:
     def __init__(self, layer_names=None, kv_cache_spec=None):
         self.layer_names = layer_names or ["model.layers.0.self_attn"]
-        self.kv_cache_spec = kv_cache_spec or MagicMock()
+        self.kv_cache_spec = kv_cache_spec or MagicMock(remote_decode_recompute_tokens=0)
 
 
 class MockKVCacheConfig:
@@ -2047,6 +2047,92 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
             kv_transfer_params={"do_remote_decode": True},
             status=RequestStatus.FINISHED_LENGTH_CAPPED,
         )
+
+    def test_model_declared_remote_decode_suffix(self):
+        self.scheduler.remote_decode_recompute_tokens = 1
+        self.scheduler.need_truncate = True
+        self.assertEqual(self.scheduler._state_prefill_token_count(10), 9)
+        request = types.SimpleNamespace(
+            kv_transfer_params={"do_remote_decode": True},
+            num_prompt_tokens=10,
+            prompt_token_ids=list(range(10)),
+            prompt_embeds=None,
+            _all_token_ids=list(range(10)),
+            max_tokens=8,
+            block_hashes=["stale"],
+            update_block_hashes=MagicMock(),
+        )
+        self.scheduler._truncate_request_for_prefill(request)
+        self.assertEqual(request.prompt_token_ids, list(range(9)))
+        self.assertEqual(request.num_prompt_tokens, 9)
+        self.assertEqual(request.max_tokens, 1)
+        self.assertEqual(request.block_hashes, [])
+        request.update_block_hashes.assert_called_once()
+
+    def test_snapshot_remote_replay_contract_preserves_original_model_spec(self):
+        config = MockVllmConfig()
+        config.cache_config.enable_prefix_caching = False
+        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=16, dtype=torch.float16).with_side_storage(
+            extra_budget_page_size_bytes=4096, prefix_cache_recompute_tokens=16
+        )
+        groups = MockKVCacheConfig([MockKVCacheGroup(kv_cache_spec=spec)])
+        scheduler = MooncakeConnectorScheduler(config, "snapshot", groups)
+        self.assertTrue(scheduler.requires_summary_snapshots)
+        self.assertEqual(groups.kv_cache_groups[0].kv_cache_spec.prefix_cache_recompute_tokens, 0)
+        self.assertEqual(spec.prefix_cache_recompute_tokens, 16)
+        self.assertEqual(scheduler._state_prefill_token_count(10), 9)
+
+    def test_mtp_prefill_handoff_preserves_known_prompt_suffix(self):
+        self.scheduler.vllm_config.speculative_config = types.SimpleNamespace(method="mtp")
+        self.scheduler.remote_decode_recompute_tokens = 1
+        self.scheduler.need_truncate = True
+        request = types.SimpleNamespace(
+            request_id="handoff",
+            kv_transfer_params={"do_remote_decode": True},
+            num_prompt_tokens=8,
+            prompt_token_ids=list(range(8)),
+            prompt_embeds=None,
+            _all_token_ids=list(range(8)),
+            max_tokens=1,
+            block_hashes=[],
+            update_block_hashes=MagicMock(),
+        )
+        self.scheduler._truncate_request_for_prefill(request)
+        self.assertEqual(self.scheduler._prefill_handoff_tokens, {"handoff": (7, 7)})
+        self.scheduler._truncate_request_for_prefill(request)
+        self.assertEqual(request.prompt_token_ids, list(range(7)))
+
+    def test_prepare_prefill_draft_tokens_only_overrides_final_p_chunk(self):
+        connector = MooncakeConnector.__new__(MooncakeConnector)
+        connector.connector_worker = types.SimpleNamespace(
+            prefill_handoff_tokens={"p": (7, 7)}, mtp_prefix_adapter=None
+        )
+        sampled = torch.tensor([264, 1234])
+        partial = connector.prepare_prefill_draft_tokens(
+            ["p", "d"], types.SimpleNamespace(seq_lens_cpu=torch.tensor([4, 8])), sampled
+        )
+        self.assertIs(partial, sampled)
+        final = connector.prepare_prefill_draft_tokens(
+            ["p", "d"], types.SimpleNamespace(seq_lens_cpu=torch.tensor([7, 8])), sampled
+        )
+        self.assertEqual(final.tolist(), [7, 1234])
+        self.assertEqual(sampled.tolist(), [264, 1234])
+        final_async = connector.prepare_prefill_draft_tokens(
+            ["p", "d"], types.SimpleNamespace(seq_lens_cpu=None, seq_lens=torch.tensor([7, 8])), sampled
+        )
+        self.assertEqual(final_async.tolist(), [7, 1234])
+
+    def test_mtp_transfer_partition_covers_separate_cache_layers(self):
+        receiver = KVCacheRecvingThread.__new__(KVCacheRecvingThread)
+        receiver.num_layers = 92
+        receiver.kv_group2layeridx = {
+            0: ({"layer_names": ["model.layers.0.attn", "model.layers.92.mtp_block.attn"]}, [0, 92]),
+            1: ({"layer_names": ["model.layers.93.mtp_block.attn"]}, [93]),
+            2: ({"layer_names": ["model.layers.94.mtp_block.attn"]}, [94]),
+        }
+        self.assertEqual(receiver._get_num_mtp_cache_layers(), 3)
+        receiver.kv_group2layeridx = {0: receiver.kv_group2layeridx[0]}
+        self.assertEqual(receiver._get_num_mtp_cache_layers(), 1)
 
     def test_get_num_new_matched_tokens_no_remote_prefill(self):
         request = MockRequest("req1")
