@@ -18,6 +18,7 @@ hooks and COW copy hooks are the upstream, platform-agnostic ones.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -35,6 +36,30 @@ from vllm_ascend.models.step5.summary_kernels import csa_reset_blocks
 logger = init_logger(__name__)
 
 
+@dataclass
+class CSAPrefillState:
+    """Prefill 独占的 m/N/D 与归属表，不参与 decode/MTP 的空位扫描。"""
+
+    region_ids: torch.Tensor
+    slot_by_region: torch.Tensor
+    numerator: torch.Tensor
+    denominator: torch.Tensor
+    max_logits: torch.Tensor
+    staging_valid: torch.Tensor
+
+    @classmethod
+    def allocate(cls, capacity: int, total_regions: int, proxy_dim: int,
+                 region_size: int, device: torch.device) -> "CSAPrefillState":
+        return cls(
+            torch.full((capacity,), -1, dtype=torch.int32, device=device),
+            torch.full((total_regions,), -1, dtype=torch.int32, device=device),
+            torch.zeros((capacity, 1, proxy_dim), dtype=torch.float32, device=device),
+            torch.zeros((capacity, 1, proxy_dim), dtype=torch.float32, device=device),
+            torch.full((capacity, 1), -float("inf"), dtype=torch.float32, device=device),
+            torch.zeros((capacity, region_size), dtype=torch.uint8, device=device),
+        )
+
+
 class AscendStep5SparseSummaryCache(Step5SparseSummaryCache):
     """Step5SparseSummaryCache with the NPU Triton block-reset path.
 
@@ -45,6 +70,17 @@ class AscendStep5SparseSummaryCache(Step5SparseSummaryCache):
     Triton kernel is the only path: it clears the fp8 payload, both slot maps
     and the slot's numerator/denominator/max/staging state in one launch.
     """
+
+    def reset_runtime_state(self, *, reset_producer_scratch: bool = True) -> None:
+        super().reset_runtime_state(reset_producer_scratch=reset_producer_scratch)
+        prefill = getattr(self, "_step5_csa_prefill_state", None)
+        if prefill is not None:
+            prefill.region_ids.fill_(-1)
+            prefill.slot_by_region.fill_(-1)
+            prefill.numerator.zero_()
+            prefill.denominator.zero_()
+            prefill.max_logits.fill_(-float("inf"))
+            prefill.staging_valid.zero_()
 
     def reset_blocks(
         self, block_ids: torch.Tensor | list[int], *, clear_mean: bool = True
@@ -105,6 +141,19 @@ class AscendStep5SparseSummaryCache(Step5SparseSummaryCache):
             region_block_size=int(self.region_block_size),
             clear_mean=clear_mean,
         )
+        # Prefill 状态的生命周期也跟随 KV 页；释放原缓存后独立清理。
+        prefill = getattr(self, "_step5_csa_prefill_state", None)
+        if prefill is not None:
+            csa_reset_blocks(
+                ids, self.mean_cache, prefill.region_ids, prefill.slot_by_region,
+                prefill.numerator, prefill.denominator, prefill.max_logits,
+                prefill.staging_valid,
+                num_pages=int(self.num_pages),
+                summaries_per_page=int(self.summaries_per_page),
+                proxy_dim=int(self.proxy_dim),
+                region_block_size=int(self.region_block_size),
+                clear_mean=False,
+            )
 
     def warmup_scheduler_block_reset(self) -> None:
         active_region_ids = getattr(self, "_step5_csa_active_region_ids", None)
@@ -117,6 +166,34 @@ class AscendStep5SparseSummaryCache(Step5SparseSummaryCache):
 
 class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
     """Binds ``AscendStep5SparseSummaryCache`` instead of the upstream class."""
+
+    def copy_kv_cache_side_storage(self, block_copies: Any, num_blocks: int) -> None:
+        cache = self._budget_only_cache
+        prefill = getattr(cache, "_step5_csa_prefill_state", None)
+        if prefill is not None and block_copies:
+            # 原复制钩子只会复制原 CSA 缓存。独立 prefill 尾部尚未支持页分叉，
+            # 在设备端检查并报错，不能仅复制 summary 后丢弃未完成的 m/N/D。
+            pages = sorted({int(page) for copy in block_copies
+                            if copy.src_block_id != copy.dst_block_id
+                            for page in (copy.src_block_id, copy.dst_block_id)})
+            if pages:
+                page_ids = torch.tensor(pages, dtype=torch.int64, device=prefill.region_ids.device)
+                owners = prefill.region_ids
+                affected = (owners >= 0) & torch.isin(owners // cache.summaries_per_page, page_ids)
+                torch._assert_async(~affected.any(), "CSA page copy with an unfinished independent prefill tail is unsupported")
+        super().copy_kv_cache_side_storage(block_copies, num_blocks)
+
+    def _set_summary_cache_budget(self, block_size: int) -> int:
+        budget = super()._set_summary_cache_budget(block_size)
+        # 独立 prefill 缓存增加一份每物理 region 的反向映射。
+        reverse_bytes = Step5SparseSummaryCacheConfig.max_region_fragments_per_block(
+            block_size=block_size,
+            region_block_size=int(self._target_impl.sparse_region_block_size),
+        ) * torch.tensor([], dtype=torch.int32).element_size()
+        self._budget_bytes_per_page = budget + (
+            reverse_bytes if self._target_impl.use_runner_prefill_slots else 0
+        )
+        return self._budget_bytes_per_page
 
     def bind_kv_cache_side_storage(
         self,
@@ -214,7 +291,8 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
             * torch.tensor([], dtype=torch.int32).element_size()
         )
         self._backing_bytes_per_page = int(backing_bytes)
-        self._budget_bytes_per_page = int(backing_bytes + reverse_map_bytes)
+        reverse_map_count = 2 if self._target_impl.use_runner_prefill_slots else 1
+        self._budget_bytes_per_page = int(backing_bytes + reverse_map_count * reverse_map_bytes)
         backing = torch.zeros(
             (num_blocks, int(backing_bytes)),
             device=owner_k_cache.device,

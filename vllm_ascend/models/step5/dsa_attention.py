@@ -51,6 +51,11 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 
+from vllm_ascend.worker.step5_csa_slot_manager import (
+    CSA_SLOTS_PER_REQUEST,
+    CSAMetadata,
+    CSASlotManager,
+)
 from vllm_ascend.models.step5.dsa_kernels import (
     decode_sparse_meta,
     indexer_logits_paged,
@@ -58,11 +63,13 @@ from vllm_ascend.models.step5.dsa_kernels import (
     sparse_attention_decode,
     sparse_attention_prefill,
 )
-from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache
+from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache, CSAPrefillState
 from vllm_ascend.models.step5.summary_kernels import (
     build_decode_summary_layout_step3p5,
     csa_compact_decode_update,
     csa_compact_prefill_update,
+    csa_compact_prefill_update_default,
+    csa_prefill_handoff,
     csa_deferred_flush,
     csa_verify_stage_update,
 )
@@ -203,6 +210,7 @@ class AscendStep5DSAMetadata(AttentionMetadata):
     """(num_reqs + 1,) full-batch token start locations, including padding."""
     seq_lens: torch.Tensor
     """(num_reqs,) full-batch sequence lengths, including padding rows."""
+    csa_prefill_plan: CSAMetadata | None = None
     prefill: AscendStep5DSAPrefillMetadata | None = None
     decode: AscendStep5DSADecodeMetadata | None = None
 
@@ -230,11 +238,39 @@ class AscendStep5DSAMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self._csa_layer_names = layer_names
+        self._csa_static_context = vllm_config.compilation_config.static_forward_context
         self.context_len_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
             device=device,
         )
+
+    def build_csa_slot_plans(
+        self, manager: CSASlotManager, req_ids: list[str | None],
+        metadata: AscendStep5DSAMetadata, plan_prefill: bool,
+        prompt_lens: list[int],
+    ) -> None:
+        sizes = {
+            self._csa_static_context[name].impl.region_size
+            for name in self._csa_layer_names
+        }
+        if len(sizes) != 1:
+            raise ValueError("CSA slot plans require one region size per attention group")
+        region_size = sizes.pop()
+        num_decodes = metadata.num_decodes
+        prefill = metadata.prefill
+        if prefill is not None:
+            prefill_ids = req_ids[num_decodes:num_decodes + metadata.num_prefills]
+            if all(req_id is None for req_id in prefill_ids):
+                metadata.csa_prefill_plan = manager.dummy_prefill(metadata.num_prefills)
+            elif plan_prefill and all(req_id is not None for req_id in prefill_ids):
+                metadata.csa_prefill_plan = manager.plan(
+                    prefill_ids, prefill.context_lens_host, prefill.seq_lens_host, region_size,
+                    prompt_lens,
+                )
+            else:
+                raise ValueError("CSA prefill requires a complete runner prompt plan")
 
     def build(
         self,
@@ -379,7 +415,11 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         max_num_batched_tokens: int,
         decode_out_dtype: torch.dtype | None = None,
         num_speculative_tokens: int = 0,
+        prefill_mnd_slot_allocator: str = "default",
     ) -> None:
+        if prefill_mnd_slot_allocator not in ("default", "runner"):
+            raise ValueError("step5_prefill_mnd_slot_allocator must be 'default' or 'runner'")
+        self.use_runner_prefill_slots = prefill_mnd_slot_allocator == "runner"
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = scale
@@ -504,8 +544,14 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         ).element_size()
         state_elements = capacity * proxy_dim  # num_kv_heads == 1
         active_token_elements = state_elements * region_block_size
+        prefill_capacity = CSA_SLOTS_PER_REQUEST * int(self.max_num_seqs) if self.use_runner_prefill_slots else 0
+        prefill_bytes = prefill_capacity * (
+            (2 * proxy_dim + 1) * torch.tensor([], dtype=torch.float32).element_size()
+            + torch.tensor([], dtype=torch.int32).element_size()
+            + region_block_size * torch.tensor([], dtype=torch.uint8).element_size()
+        )
         return int(
-            capacity * torch.tensor([], dtype=torch.int32).element_size()
+            prefill_bytes + capacity * torch.tensor([], dtype=torch.int32).element_size()
             + torch.tensor([], dtype=torch.int32).element_size()
             + 2 * state_elements * torch.tensor([], dtype=torch.float32).element_size()
             + capacity * torch.tensor([], dtype=torch.float32).element_size()
@@ -558,6 +604,11 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         summary_cache._step5_csa_active_token_valid = torch.zeros(
             (capacity, self.region_size), device=device, dtype=torch.uint8
         )
+        if self.use_runner_prefill_slots:
+            summary_cache._step5_csa_prefill_state = CSAPrefillState.allocate(
+                CSA_SLOTS_PER_REQUEST * int(self.max_num_seqs), total_regions,
+                proxy_dim, self.region_size, device,
+            )
 
     def bind_summary_cache(
         self,
@@ -591,24 +642,25 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             self._get_dsa_tensor_buffer_at_least(
                 name, (max_layout_rows,), device=device, dtype=dtype
             )
-        self._get_dsa_tensor_buffer_at_least(
-            "csa_prefill_scratch_region_ids",
-            (max_layout_rows,),
-            device=device,
-            dtype=torch.int32,
-        )
-        self._get_dsa_tensor_buffer_at_least(
-            "csa_prefill_scratch_row_map",
-            (max_layout_rows * self.region_size,),
-            device=device,
-            dtype=torch.int32,
-        )
-        self._get_dsa_tensor_buffer_at_least(
-            "csa_prefill_scratch_reset_map",
-            (max_layout_rows,),
-            device=device,
-            dtype=torch.int32,
-        )
+        if not self.use_runner_prefill_slots:
+            self._get_dsa_tensor_buffer_at_least(
+                "csa_prefill_scratch_region_ids",
+                (max_layout_rows,),
+                device=device,
+                dtype=torch.int32,
+            )
+            self._get_dsa_tensor_buffer_at_least(
+                "csa_prefill_scratch_row_map",
+                (max_layout_rows * self.region_size,),
+                device=device,
+                dtype=torch.int32,
+            )
+            self._get_dsa_tensor_buffer_at_least(
+                "csa_prefill_scratch_reset_map",
+                (max_layout_rows,),
+                device=device,
+                dtype=torch.int32,
+            )
         # Decode indexer-score workspace, shared by all layers (they run
         # sequentially on one stream and each consumes its scores before the
         # next layer overwrites them). With MTP verify batches every decode
@@ -717,10 +769,10 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
     ) -> None:
         """Fold this step's indexer K/Z tokens into the paged summary state.
 
-        Mirrors upstream: a pure decode batch (single token per request)
-        stages tokens and flushes completed regions; any batch containing
-        prefill tokens (mixed included) runs the ordered two-pass update over
-        all tokens of the batch. MTP verify batches (uniform K+1 rows per
+        Pure decode retains the original stage/flush path. Prefill defaults
+        to model-side allocation; runner mode uses independent state and
+        hands off the unfinished prompt tail.
+        MTP verify batches (uniform K+1 rows per
         decode request) stage their rows without flushing and materialize
         fully-committed regions through the deferred flush, so rejected
         tokens never pollute the fp8 page cache.
@@ -782,48 +834,107 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 live_rows=int(layout.token_flat_slot.numel()),
                 **common,
             )
+        elif not self.use_runner_prefill_slots:
+            self._update_prefill_default(summary_cache, layout, index_k, index_z,
+                                         allocation_success, mean_cache, common, 0, num_tokens)
         else:
-            device = index_k.device
-            padded_rows = self._round_up(num_tokens, 64)
-            scratch_region_ids = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_region_ids",
-                (padded_rows,),
-                device=device,
-                dtype=torch.int32,
-            )
-            scratch_row_map = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_row_map",
-                (padded_rows * self.region_size,),
-                device=device,
-                dtype=torch.int32,
-            )
-            scratch_reset_map = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_reset_map",
-                (padded_rows,),
-                device=device,
-                dtype=torch.int32,
-            )
+            # Mixed ordinary decode/prefill uses the same split as verify:
+            # decode keeps staged-token semantics and prefill consumes its plan.
+            decode_rows = int(md.num_decode_tokens)
+            if md.num_decodes:
+                csa_compact_decode_update(
+                    mean_cache,
+                    summary_cache._step5_csa_active_region_ids,
+                    summary_cache._step5_csa_active_slot_by_region,
+                    allocation_success,
+                    summary_cache._step5_csa_numerator_cache,
+                    summary_cache._step5_csa_denominator_cache,
+                    summary_cache._step5_csa_max_cache,
+                    summary_cache._step5_csa_active_token_k,
+                    summary_cache._step5_csa_active_token_z,
+                    summary_cache._step5_csa_active_token_valid,
+                    layout.token_flat_slot[:decode_rows], layout.reset_slots[:decode_rows],
+                    layout.token_valid[:decode_rows], layout.token_positions[:decode_rows],
+                    index_k[:decode_rows], index_z[:decode_rows],
+                    live_rows=decode_rows,
+                    **common,
+                )
+            num_requests = md.num_prefills
+            prefill_rows = num_tokens - decode_rows
+            prefill_state = summary_cache._step5_csa_prefill_state
             csa_compact_prefill_update(
                 mean_cache,
-                summary_cache._step5_csa_active_region_ids,
-                summary_cache._step5_csa_active_slot_by_region,
+                prefill_state.region_ids,
+                prefill_state.slot_by_region,
                 allocation_success,
-                summary_cache._step5_csa_numerator_cache,
-                summary_cache._step5_csa_denominator_cache,
-                summary_cache._step5_csa_max_cache,
-                summary_cache._step5_csa_active_token_valid,
-                scratch_region_ids,
-                scratch_row_map,
-                scratch_reset_map,
-                layout.token_flat_slot,
-                layout.reset_slots,
-                layout.token_valid,
-                layout.token_positions,
-                index_k,
-                index_z,
-                live_rows=num_tokens,
+                prefill_state.numerator,
+                prefill_state.denominator,
+                prefill_state.max_logits,
+                prefill_state.staging_valid,
+                layout.token_flat_slot[decode_rows:],
+                layout.reset_slots[decode_rows:],
+                layout.token_valid[decode_rows:],
+                layout.token_positions[decode_rows:],
+                index_k[decode_rows:],
+                index_z[decode_rows:],
+                query_start_loc=md.query_start_loc[md.num_decodes:md.num_decodes + num_requests + 1],
+                seq_lens=md.seq_lens[md.num_decodes:md.num_decodes + num_requests],
+                live_rows=prefill_rows,
+                slot_plan=md.csa_prefill_plan,
                 **common,
             )
+            self._handoff_prefill_state(summary_cache, md.csa_prefill_plan, allocation_success)
+        if md.num_decodes or not self.use_runner_prefill_slots:
+            self._assert_csa_allocation_success(allocation_success)
+
+    def _update_prefill_default(
+        self, summary_cache: AscendStep5SparseSummaryCache,
+        layout: AscendStep5DSARuntimeLayout, index_k: torch.Tensor, index_z: torch.Tensor,
+        allocation_success: torch.Tensor, mean_cache: torch.Tensor,
+        common: dict, start: int, num_tokens: int,
+    ) -> None:
+        padded_rows = self._round_up(num_tokens, 64)
+        scratch_region_ids = self._get_dsa_tensor_buffer_at_least(
+            "csa_prefill_scratch_region_ids", (padded_rows,), device=index_k.device, dtype=torch.int32,
+        )
+        scratch_row_map = self._get_dsa_tensor_buffer_at_least(
+            "csa_prefill_scratch_row_map", (padded_rows * self.region_size,),
+            device=index_k.device, dtype=torch.int32,
+        )
+        scratch_reset_map = self._get_dsa_tensor_buffer_at_least(
+            "csa_prefill_scratch_reset_map", (padded_rows,), device=index_k.device, dtype=torch.int32,
+        )
+        csa_compact_prefill_update_default(
+            mean_cache, summary_cache._step5_csa_active_region_ids,
+            summary_cache._step5_csa_active_slot_by_region, allocation_success,
+            summary_cache._step5_csa_numerator_cache,
+            summary_cache._step5_csa_denominator_cache, summary_cache._step5_csa_max_cache,
+            summary_cache._step5_csa_active_token_valid,
+            scratch_region_ids, scratch_row_map, scratch_reset_map,
+            layout.token_flat_slot[start:], layout.reset_slots[start:],
+            layout.token_valid[start:], layout.token_positions[start:],
+            index_k[start:], index_z[start:], live_rows=num_tokens, **common,
+        )
+
+    def _handoff_prefill_state(
+        self, summary_cache: AscendStep5SparseSummaryCache,
+        metadata: CSAMetadata, allocation_success: torch.Tensor,
+    ) -> None:
+        if not metadata.needs_handoff:
+            return
+        state = summary_cache._step5_csa_prefill_state
+        csa_prefill_handoff(
+            state.region_ids, state.slot_by_region, state.numerator,
+            state.denominator, state.max_logits,
+            summary_cache._step5_csa_active_region_ids,
+            summary_cache._step5_csa_active_slot_by_region,
+            summary_cache._step5_csa_numerator_cache,
+            summary_cache._step5_csa_denominator_cache,
+            summary_cache._step5_csa_max_cache,
+            summary_cache._step5_csa_active_token_valid,
+            allocation_success, metadata,
+            proxy_dim=int(self.proxy_dim), region_size=int(self.region_size),
+        )
         self._assert_csa_allocation_success(allocation_success)
 
     def _update_summary_cache_verify(
@@ -846,7 +957,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         only staged, so the next round's rewrite of rejected positions
         replaces their contribution exactly (the Ascend equivalent of the
         upstream MTP transaction's rollback-to-accepted-prefix). In a mixed
-        batch, the prefill tail still runs the ordinary ordered fold over
+        batch, the prefill tail uses its independent runner-owned state for
         its own rows; a request never contributes rows to both segments.
         """
         d = md.decode
@@ -896,52 +1007,39 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             query_len=query_len,
             **common,
         )
-        # 3) Mixed batch: fold the prefill tail with the ordinary ordered
-        #    two-pass update (prefill requests own private pages; their
+        # 3) Mixed batch: update the prefill tail using the configured allocator.
+        #    (prefill requests own private pages; their
         #    regions never collide with the verify requests' regions).
         if md.num_prefills > 0:
-            device = index_k.device
             prefill_rows = int(md.num_actual_tokens) - nv
-            padded_rows = self._round_up(prefill_rows, 64)
-            scratch_region_ids = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_region_ids",
-                (padded_rows,),
-                device=device,
-                dtype=torch.int32,
-            )
-            scratch_row_map = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_row_map",
-                (padded_rows * self.region_size,),
-                device=device,
-                dtype=torch.int32,
-            )
-            scratch_reset_map = self._get_dsa_tensor_buffer_at_least(
-                "csa_prefill_scratch_reset_map",
-                (padded_rows,),
-                device=device,
-                dtype=torch.int32,
-            )
-            csa_compact_prefill_update(
-                mean_cache,
-                summary_cache._step5_csa_active_region_ids,
-                summary_cache._step5_csa_active_slot_by_region,
-                allocation_success,
-                summary_cache._step5_csa_numerator_cache,
-                summary_cache._step5_csa_denominator_cache,
-                summary_cache._step5_csa_max_cache,
-                summary_cache._step5_csa_active_token_valid,
-                scratch_region_ids,
-                scratch_row_map,
-                scratch_reset_map,
-                layout.token_flat_slot[nv:],
-                layout.reset_slots[nv:],
-                layout.token_valid[nv:],
-                layout.token_positions[nv:],
-                index_k[nv:],
-                index_z[nv:],
-                live_rows=prefill_rows,
-                **common,
-            )
+            if not self.use_runner_prefill_slots:
+                self._update_prefill_default(summary_cache, layout, index_k, index_z,
+                                             allocation_success, mean_cache, common, nv, prefill_rows)
+            else:
+                prefill_state = summary_cache._step5_csa_prefill_state
+                csa_compact_prefill_update(
+                    mean_cache,
+                    prefill_state.region_ids,
+                    prefill_state.slot_by_region,
+                    allocation_success,
+                    prefill_state.numerator,
+                    prefill_state.denominator,
+                    prefill_state.max_logits,
+                    prefill_state.staging_valid,
+                    layout.token_flat_slot[nv:],
+                    layout.reset_slots[nv:],
+                    layout.token_valid[nv:],
+                    layout.token_positions[nv:],
+                    index_k[nv:],
+                    index_z[nv:],
+                    # 边界仍是全批次行号；kernel 减去首项，与 [nv:] 的输入对齐。
+                    query_start_loc=md.query_start_loc[n:n + md.num_prefills + 1],
+                    seq_lens=md.seq_lens[n:n + md.num_prefills],
+                    live_rows=prefill_rows,
+                    slot_plan=md.csa_prefill_plan,
+                    **common,
+                )
+                self._handoff_prefill_state(summary_cache, md.csa_prefill_plan, allocation_success)
         self._assert_csa_allocation_success(allocation_success)
 
     # -- sparse attention ------------------------------------------------------

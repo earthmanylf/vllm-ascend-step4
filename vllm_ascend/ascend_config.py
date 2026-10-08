@@ -250,6 +250,7 @@ class AscendConfig:
         {
             "refresh": false,
             "enable_cpu_binding": true,
+            "step5_prefill_mnd_slot_allocator": "default",
             "multistream_dsv4_dsa_overlap": true,
             "enable_prefill_mc2": false,
             "multistream_overlap_shared_expert": false,
@@ -384,6 +385,8 @@ class AscendConfig:
     model_config = ConfigDict(extra="forbid")
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
+    # Step5 prefill m/N/D slot 分配：default 使用模型内分配，runner 使用独立预留池。
+    step5_prefill_mnd_slot_allocator: Literal["default", "runner"] = "default"
     enable_cpu_binding: bool = True
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False

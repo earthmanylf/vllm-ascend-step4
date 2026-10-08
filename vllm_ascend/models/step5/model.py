@@ -91,6 +91,7 @@ from vllm.models.step5.model import (
 
 import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
 from vllm_ascend import envs
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.step5.dsa_attention import (
     AscendStep5DSABackend,
@@ -401,6 +402,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             ),
             decode_out_dtype=vllm_config.model_config.dtype,
             num_speculative_tokens=num_speculative_tokens,
+            prefill_mnd_slot_allocator=get_ascend_config().step5_prefill_mnd_slot_allocator,
         )
         compilation_config = vllm_config.compilation_config
         if self.layer_name in compilation_config.static_forward_context:
