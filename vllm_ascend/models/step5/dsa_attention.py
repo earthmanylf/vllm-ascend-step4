@@ -19,7 +19,11 @@ attention runs in the aclnn ``GenericBlockSparseAttention`` operator
 consumes the indexer's logical region ids directly (current-region append
 and per-token causal truncation happen inside the operator), so the
 physical-page pack kernels and the Triton attention kernels of
-``dsa_kernels.py`` are no longer on the serving path.
+``dsa_kernels.py`` are no longer on the serving path. The operator's AICPU
+scheduling metadata is generated once per step in the metadata builder --
+outside the model graph, like the FA3 scheduler tiling -- and shared across
+all layers, because it schedules from position-derived block counts that
+are identical layer to layer.
 
 Spec-decode verify batches (multi-token decode rows, ``query_len = K+1``)
 follow the upstream ``Step5DSAMTP`` contract with an equivalent Ascend
@@ -57,7 +61,9 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 
 from vllm_ascend.models.step5.generic_block_sparse_attention import (
+    gbsa_expected_counts,
     gbsa_sparse_attention,
+    gbsa_sparse_attention_metadata,
 )
 from vllm_ascend.worker.step5_csa_slot_manager import (
     CSA_SLOTS_PER_REQUEST,
@@ -180,6 +186,11 @@ class AscendStep5DSAPrefillMetadata:
     """CPU copies produced by the builder's existing seq_lens transfer; the
     impl reads these instead of calling ``.tolist()`` on device tensors."""
 
+    gbsa_metadata: torch.Tensor = None
+    """Per-step AICPU GenericBlockSparseAttention scheduling tensor, built
+    once in the builder from the query positions and shared across all
+    layers (the scheduled counts are position-derived, layer-independent)."""
+
     @property
     def query_lens(self) -> torch.Tensor:
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
@@ -200,6 +211,10 @@ class AscendStep5DSADecodeMetadata:
     query_len: int = 1
     """Uniform decode query length K (1 for plain decode, 1+num_spec for
     MTP verify batches)."""
+
+    gbsa_metadata: torch.Tensor = None
+    """Per-step AICPU scheduling tensor for the (possibly flattened verify)
+    decode path, built once in the builder and shared across all layers."""
 
 
 @dataclass
@@ -248,6 +263,47 @@ class AscendStep5DSAMetadataBuilder(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
             device=device,
+        )
+        # DSA selector geometry, read from the layer impls (all layers share
+        # one config) -- the GBSA AICPU metadata is scheduled once per step
+        # here in the builder, outside the model graph (FA3 tiling pattern).
+        impl = vllm_config.compilation_config.static_forward_context[
+            layer_names[0]
+        ].impl
+        self.gbsa_num_heads = impl.num_heads
+        self.gbsa_num_kv_groups = impl.num_kv_groups
+        self.gbsa_head_size = impl.head_size
+        self.gbsa_region_size = impl.region_size
+        self.gbsa_topk = impl.topk_regions
+        self.gbsa_block_size = kv_cache_spec.block_size
+
+    def _build_gbsa_metadata(
+        self,
+        positions: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_kv: torch.Tensor,
+        block_table: torch.Tensor,
+        max_query_len: int,
+    ) -> torch.Tensor:
+        """One AICPU scheduling pass per step for these query positions."""
+        counts = gbsa_expected_counts(
+            positions,
+            groups=self.gbsa_num_kv_groups,
+            region_size=self.gbsa_region_size,
+            topk=self.gbsa_topk,
+        )
+        return gbsa_sparse_attention_metadata(
+            counts,
+            num_heads=self.gbsa_num_heads,
+            num_kv_groups=self.gbsa_num_kv_groups,
+            head_dim=self.gbsa_head_size,
+            region_size=self.gbsa_region_size,
+            topk=self.gbsa_topk,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_kv=seqused_kv,
+            max_query_len=max_query_len,
+            max_pages=int(block_table.shape[1]),
+            page_size=self.gbsa_block_size,
         )
 
     def build_csa_slot_plans(
@@ -331,6 +387,30 @@ class AscendStep5DSAMetadataBuilder(
                 seq_lens_host=seq_lens_host_t.tolist(),
                 context_lens_host=context_lens_host_t.tolist(),
             )
+            # GBSA AICPU scheduling, once per step outside the model graph.
+            # Per-token positions: context + in-chunk offset, straight from
+            # the (rebased) start-loc; the scheduled counts depend on these
+            # positions only, so every layer reuses this one tensor.
+            qsl = prefill_metadata.query_start_loc.to(torch.int64)
+            num_query_tokens = prefill_metadata.num_query_tokens
+            token_idx = torch.arange(
+                num_query_tokens, device=seq_lens.device, dtype=torch.int64
+            )
+            reqs = (torch.searchsorted(qsl, token_idx, right=True) - 1).to(
+                torch.long
+            )
+            prefill_positions = (
+                prefill_context_lens.to(torch.int64)[reqs]
+                + token_idx
+                - qsl[reqs]
+            )
+            prefill_metadata.gbsa_metadata = self._build_gbsa_metadata(
+                prefill_positions,
+                prefill_metadata.query_start_loc,
+                prefill_seq_lens,
+                block_table,
+                prefill_metadata.max_query_len,
+            )
 
         decode_metadata: AscendStep5DSADecodeMetadata | None = None
         active_decodes = 0
@@ -340,10 +420,43 @@ class AscendStep5DSAMetadataBuilder(
             active_decodes = _active_decode_num_reqs(
                 num_decodes, num_decode_tokens, decode_query_len
             )
+            gbsa_metadata = None
+            if active_decodes > 0:
+                decode_seq_lens = seq_lens[:active_decodes]
+                if decode_query_len == 1:
+                    # Plain decode: one query per request at its own position.
+                    positions = decode_seq_lens.to(torch.int64) - 1
+                    cu_seq_lens = torch.arange(
+                        active_decodes + 1, device=seq_lens.device, dtype=torch.int64
+                    )
+                    seqused_kv = decode_seq_lens
+                else:
+                    # MTP verify flattened: row r of request i is a
+                    # single-token request at position ctx + (r mod q_len).
+                    total = active_decodes * decode_query_len
+                    row_base = (
+                        decode_seq_lens.to(torch.int64) - decode_query_len
+                    ).repeat_interleave(decode_query_len)
+                    positions = row_base + (
+                        torch.arange(total, device=seq_lens.device, dtype=torch.int64)
+                        % decode_query_len
+                    )
+                    cu_seq_lens = torch.arange(
+                        total + 1, device=seq_lens.device, dtype=torch.int64
+                    )
+                    seqused_kv = positions + 1
+                gbsa_metadata = self._build_gbsa_metadata(
+                    positions,
+                    cu_seq_lens,
+                    seqused_kv,
+                    block_table,
+                    1,
+                )
             decode_metadata = AscendStep5DSADecodeMetadata(
                 seq_lens=seq_lens[:active_decodes],
                 block_table=block_table[:active_decodes],
                 query_len=decode_query_len,
+                gbsa_metadata=gbsa_metadata,
             )
 
         return AscendStep5DSAMetadata(
@@ -1091,10 +1204,10 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             d.block_table,
             cu_seq_lens,
             seq_lens_i32,
+            d.gbsa_metadata,
             num_kv_groups=groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            max_query_len=1,
         )
         output[:n] = out.to(output.dtype)
 
@@ -1170,10 +1283,10 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             row_block_table,
             cu_seq_lens,
             row_kv_seqlens,
+            d.gbsa_metadata,
             num_kv_groups=groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            max_query_len=1,
         )
         output[:total] = out.to(output.dtype)
 
@@ -1251,10 +1364,10 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             p.block_table[:num_reqs],
             cu_seq_lens,
             p.seq_lens[:num_reqs].to(torch.int32),
+            p.gbsa_metadata,
             num_kv_groups=self.num_kv_groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            max_query_len=p.max_query_len,
         )
         output[token_offset : token_offset + num_query_tokens] = out.to(output.dtype)
 

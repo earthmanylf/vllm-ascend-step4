@@ -25,6 +25,14 @@ Contract parity with the previous pack + Triton chain:
   ``PA_BBND`` layout, so the 4-D views are passed through untouched and the
   operator resolves logical region -> physical page through ``block_table``.
 
+The AICPU metadata op is split out (``gbsa_sparse_attention_metadata``): it
+schedules from the per-row block COUNTS and the seq-len tensors only and
+never reads the id values, and the counts are a function of the query
+positions alone (``min(topk, floor(pos / region_size)) + 1``), identical for
+every layer in a step. So the metadata is generated once per step in the
+attention metadata builder -- outside the model graph, cf. the FA3 scheduler
+tiling -- and the per-layer forward passes it straight through.
+
 ``is_consistent_topk`` is fixed to ``False``: live counts vary per row in
 serving, and the operator's consistent-count fast path does not apply.
 """
@@ -81,6 +89,77 @@ def _append_current_region(
     return wide, counts + 1
 
 
+def gbsa_expected_counts(
+    positions: torch.Tensor,
+    *,
+    groups: int,
+    region_size: int,
+    topk: int,
+) -> torch.Tensor:
+    """Live block counts the fused path yields for these positions.
+
+    The fused indexer fills exactly ``min(top_k, floor(pos / region_size))``
+    slots per row (its mask3 pool is the regions strictly below the current
+    one) and the current-region append adds one more, so the per-row count is
+    ``min(topk, floor(pos / region_size)) + 1`` -- a function of the position
+    only. This is what ``_append_current_region`` produces from the real ids,
+    and it is identical for every layer in a step, which is what lets the
+    AICPU metadata be built once per step outside the model.
+
+    Returns ``counts [G, T]`` int32 (contiguous, group-major).
+    """
+    live = (positions.to(torch.int32) // region_size).clamp(max=topk)
+    return (live + 1).unsqueeze(0).expand(groups, -1).contiguous()
+
+
+def gbsa_sparse_attention_metadata(
+    counts: torch.Tensor,
+    *,
+    num_heads: int,
+    num_kv_groups: int,
+    head_dim: int,
+    region_size: int,
+    topk: int,
+    cu_seqlens_q: torch.Tensor,
+    seqused_kv: torch.Tensor,
+    max_query_len: int,
+    max_pages: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Run the AICPU scheduling op once per step, outside the model graph.
+
+    The AICPU kernel schedules from ``sparse_block_count`` (values), the
+    seq-len tensors and the idx SHAPE (block capacity ``topk + 1``); the id
+    values themselves are only resolved by the AI Core attention kernel at
+    run time, so a zero-filled idx of the right shape is sufficient here.
+    Must be called with the same layout / mask / quant attributes as the
+    subsequent ``gbsa_sparse_attention`` calls that consume the result.
+    """
+    groups, tokens = counts.shape
+    idx_shape = torch.zeros(
+        (groups, tokens, topk + 1), dtype=torch.int32, device=counts.device
+    )
+    return generic_block_sparse_attention_metadata(
+        idx_shape,
+        counts,
+        num_heads,
+        num_kv_groups,
+        head_dim,
+        [1, region_size],
+        cu_seqlens_q=cu_seqlens_q.to(torch.int64),
+        seqused_kv=seqused_kv.to(torch.int32),
+        max_seqlen_q=max_query_len,
+        max_seqlen_kv=max_pages * page_size,
+        layout_q="TND",
+        layout_kv="PA_BBND",
+        layout_sparse_pattern=_SPARSE_PATTERN_PER_GROUP_PER_TOKEN,
+        mask_mode=_MASK_CAUSAL,
+        quant_mode=_QUANT_NONE,
+        softmax_precision=_SOFTMAX_PRECISION_FP32,
+        is_consistent_topk=False,
+    )
+
+
 def gbsa_sparse_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -90,11 +169,11 @@ def gbsa_sparse_attention(
     block_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     seqused_kv: torch.Tensor,
+    metadata: torch.Tensor,
     *,
     num_kv_groups: int,
     region_size: int,
     softmax_scale: float,
-    max_query_len: int,
 ) -> torch.Tensor:
     """Sparse attention over per-(group, token) selected logical regions.
 
@@ -110,30 +189,24 @@ def gbsa_sparse_attention(
         cu_seqlens_q: ``[num_reqs + 1]`` cumulative query lengths.
         seqused_kv: ``[num_reqs]`` used KV length per request (right-aligned
             causal anchor; must be ``>=`` the request's query length).
+        metadata: per-step AICPU scheduling tensor from
+            ``gbsa_sparse_attention_metadata`` (built once in the attention
+            metadata builder and shared across layers; the counts it was
+            scheduled from are the ``gbsa_expected_counts`` of ``positions``).
         num_kv_groups: G, the number of KV head groups.
         region_size: tokens per region (sparse block height).
         softmax_scale: attention softmax scale.
-        max_query_len: max per-request query length (1 for the flattened
-            decode / verify paths).
 
     Returns:
         ``out`` shaped ``[total_q, num_heads, head_dim]``, same dtype as
         ``query``.
     """
-    total_q, num_heads, head_dim = query.shape
     idx, counts = _append_current_region(
         ids, positions, groups=num_kv_groups, region_size=region_size
     )
-    block_shape = [1, region_size]
-    cu_q = cu_seqlens_q.to(torch.int64)
-    used_kv = seqused_kv.to(torch.int32)
-    # Static upper bound from the table width: keeps the launch shapes
-    # graph-capturable (no device max reduction, no host sync).
-    max_seqlen_kv = int(block_table.shape[1]) * int(key_cache.shape[1])
-
     common = dict(
-        cu_seqlens_q=cu_q,
-        seqused_kv=used_kv,
+        cu_seqlens_q=cu_seqlens_q.to(torch.int64),
+        seqused_kv=seqused_kv.to(torch.int32),
         layout_q="TND",
         layout_kv="PA_BBND",
         layout_sparse_pattern=_SPARSE_PATTERN_PER_GROUP_PER_TOKEN,
@@ -142,24 +215,13 @@ def gbsa_sparse_attention(
         softmax_precision=_SOFTMAX_PRECISION_FP32,
         is_consistent_topk=False,
     )
-    metadata = generic_block_sparse_attention_metadata(
-        idx,
-        counts,
-        num_heads,
-        num_kv_groups,
-        head_dim,
-        block_shape,
-        max_seqlen_q=max_query_len,
-        max_seqlen_kv=max_seqlen_kv,
-        **common,
-    )
     out, _lse = generic_block_sparse_attention(
         query,
         key_cache,
         value_cache,
         idx,
         counts,
-        block_shape,
+        [1, region_size],
         metadata=metadata,
         block_table=block_table,
         softmax_scale=softmax_scale,
