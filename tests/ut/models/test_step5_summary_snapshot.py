@@ -79,9 +79,18 @@ def test_mtp_snapshot_keeps_exact_hidden_tail_across_prefill_chunks():
     pool = MTPPrefixSnapshotAdapter(4, 2)
     first = torch.arange(24, dtype=torch.float32).view(6, 4)
     pool.capture("p", 7, torch.arange(6), torch.arange(6), first)
+    with pytest.raises(KeyError):
+        pool.get("p")
+    with pytest.raises(RuntimeError, match="boundary"):
+        pool.export("p", [], 7)
+    with pytest.raises(KeyError):
+        pool.get("p")
     last = torch.arange(24, 28, dtype=torch.float32).view(1, 4)
     pool.capture("p", 7, torch.tensor([6]), torch.tensor([6]), last)
     pool.export("p", [], 7)
+    published = pool.get("p")
+    pool.capture("p", 7, torch.tensor([7]), torch.tensor([7]), last)
+    assert pool.get("p") == published
     first.zero_()
     last.zero_()
     pool.restore_for_request("d", pool.get("p"), 7)

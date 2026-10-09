@@ -255,11 +255,21 @@ class MTPPrefixSnapshotAdapter:
         self.num_pages = num_pages
         self.tail_tokens = tail_tokens
         self._payloads: dict[str, bytes] = {}
+        self._exported: set[str] = set()
         self._received: dict[str, dict] = {}
         self._lock = threading.Lock()
 
-    get = SummaryCacheSnapshotAdapter.get
-    release = SummaryCacheSnapshotAdapter.release
+    def get(self, request_id):
+        with self._lock:
+            if request_id not in self._exported:
+                raise KeyError(request_id)
+            return self._payloads[request_id]
+
+    def release(self, request_id):
+        with self._lock:
+            self._payloads.pop(request_id, None)
+            self._exported.discard(request_id)
+
     get_kv_cache_side_storage_snapshot = get
     release_kv_cache_side_storage_snapshot = release
 
@@ -274,6 +284,8 @@ class MTPPrefixSnapshotAdapter:
         row_bytes = width * rows.element_size()
         data = rows.view(torch.uint8).cpu().numpy().tobytes()
         with self._lock:
+            if request_id in self._exported:
+                return
             if request_id not in self._payloads and len(self._payloads) >= self.num_pages:
                 raise RuntimeError("MTP prefix snapshot pool is full.")
             previous = self._payloads.get(request_id)
@@ -300,11 +312,12 @@ class MTPPrefixSnapshotAdapter:
     def export(self, request_id, block_ids, num_tokens):
         with self._lock:
             payload = self._payloads.get(request_id)
-        if payload is None and num_tokens <= 1:
-            return
-        if payload is None:
-            raise RuntimeError(f"Missing MTP prefix snapshot for request {request_id}")
-        self._validate(msgspec.msgpack.decode(payload), num_tokens)
+            if payload is None and num_tokens <= 1:
+                return
+            if payload is None:
+                raise RuntimeError(f"Missing MTP prefix snapshot for request {request_id}")
+            self._validate(msgspec.msgpack.decode(payload), num_tokens)
+            self._exported.add(request_id)
 
     def _validate(self, state, boundary):
         count = min(self.tail_tokens, boundary)
@@ -314,7 +327,10 @@ class MTPPrefixSnapshotAdapter:
             or state["positions"] != list(range(boundary - count, boundary))
             or len(state["tokens"]) != count
         ):
-            raise RuntimeError("MTP prefix snapshot token boundary mismatch.")
+            raise RuntimeError(
+                "MTP prefix snapshot token boundary mismatch: "
+                f"expected={boundary}, captured={state['boundary']}, positions={state['positions']}."
+            )
         sizes = {"torch.float32": 4, "torch.float16": 2, "torch.bfloat16": 2}
         if state["dtype"] not in sizes or len(state["hidden"]) != count * state["width"] * sizes[state["dtype"]]:
             raise RuntimeError("Invalid MTP prefix hidden-state snapshot.")
@@ -1047,6 +1063,17 @@ class KVCacheRecvingThread(threading.Thread):
                     remote_host_ = remote_port_send_num[remote_port]["host"]
                     self._send_done_recv_signal(request_id, remote_host_, remote_port, remote_port_send_num)
 
+    def _get_pp_layer_indices(
+        self, layer_indices: list[int], prefill_pp_rank: int, group_spec: dict[str, Any]
+    ) -> list[int]:
+        """Use the same source-stage ownership for KV and side snapshots."""
+        first_layer_index, end_layer_index = self.pp_layer_indices[prefill_pp_rank]
+        if self.vllm_config.speculative_config is not None and prefill_pp_rank == self._prefill_pp_size - 1:
+            end_layer_index += self.num_draft_layers
+        is_index_cache_plane = any(".index_cache" in name for name in group_spec.get("layer_names", []))
+        plane_base = self.index_cache_plane_base if is_index_cache_plane else 0
+        return [index for index in layer_indices if first_layer_index <= index - plane_base < end_layer_index]
+
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
         remote_request_id = req_meta["remote_request_id"]
@@ -1098,20 +1125,6 @@ class KVCacheRecvingThread(threading.Thread):
                 local_block_ids_replicate_k[0],
             )
 
-        def pp_layer_indices(layer_indices: list[int], prefill_pp_rank: int, group_spec: dict[str, Any]) -> list[int]:
-            first_layer_index, end_layer_index = self.pp_layer_indices[prefill_pp_rank]
-            if self.vllm_config.speculative_config is not None and prefill_pp_rank == self._prefill_pp_size - 1:
-                end_layer_index += self.num_draft_layers
-            is_index_cache_plane = any(".index_cache" in name for name in group_spec.get("layer_names", []))
-
-            def in_partition(metadata_layer_idx: int) -> bool:
-                transformer_layer = (
-                    metadata_layer_idx - self.index_cache_plane_base if is_index_cache_plane else metadata_layer_idx
-                )
-                return first_layer_index <= transformer_layer < end_layer_index
-
-            return [layer_idx for layer_idx in layer_indices if in_partition(layer_idx)]
-
         use_transfer_group_block_ids = transfer_groups_need_independent_block_ids(
             self.kv_group2layeridx,
             self.block_size_scale,
@@ -1138,7 +1151,7 @@ class KVCacheRecvingThread(threading.Thread):
             group_spec, layer_indices = self.kv_group2layeridx[group_idx]
             kv_cache_group_id = group_spec.get("kv_cache_group_id", group_idx)
             raw_layer_indices = layer_indices
-            layer_indices = pp_layer_indices(layer_indices, group_pull.prefill_pp_rank, group_spec)
+            layer_indices = self._get_pp_layer_indices(layer_indices, group_pull.prefill_pp_rank, group_spec)
 
             if not layer_indices:
                 continue
@@ -1307,10 +1320,15 @@ class KVCacheRecvingThread(threading.Thread):
             )
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
-        snapshot_names = []
+        snapshot_names: set[str] = set()
         for pull in group_pulls:
-            spec, _ = self.kv_group2layeridx[pull.group_id]
-            names = [name for name in spec.get("layer_names", ()) if name in self.snapshot_layers]
+            spec, indices = self.kv_group2layeridx[pull.group_id]
+            owned_indices = set(self._get_pp_layer_indices(indices, pull.prefill_pp_rank, spec))
+            names = [
+                name
+                for name, index in zip(spec.get("layer_names", ()), indices)
+                if index in owned_indices and name in self.snapshot_layers
+            ]
             if (
                 names
                 and pull.num_group_pulls != 1
@@ -1319,9 +1337,11 @@ class KVCacheRecvingThread(threading.Thread):
                 raise RuntimeError("Snapshot side storage requires one source shard per owner KV group.")
             if pull.num_group_pulls != 1 and pull.remote_tp_offset != 0:
                 continue
-            snapshot_names.extend(names)
+            snapshot_names.update(names)
         if snapshot_names:
-            payloads = self._get_remote_snapshots(remote_host, remote_handshake_port, remote_request_id, snapshot_names)
+            payloads = self._get_remote_snapshots(
+                remote_host, remote_handshake_port, remote_request_id, sorted(snapshot_names)
+            )
             full_blocks = req_meta["snapshot_block_ids"]
             staged = {
                 name: (
@@ -1332,7 +1352,11 @@ class KVCacheRecvingThread(threading.Thread):
                 for name in snapshot_names
             }
             with self.pending_snapshots_lock:
-                self.pending_snapshots.setdefault(req_meta["request_id"], {}).update(staged)
+                pending = self.pending_snapshots.setdefault(req_meta["request_id"], {})
+                duplicate = pending.keys() & staged.keys()
+                if duplicate:
+                    raise RuntimeError(f"Duplicate side-storage snapshot owners: {sorted(duplicate)}")
+                pending.update(staged)
             logger.info(
                 "Received side-storage snapshots for request %s: layers=%d bytes=%d",
                 remote_request_id,
@@ -2155,6 +2179,7 @@ class MooncakeConnectorScheduler:
         self._reqs_need_send: dict[str, float] = {}
         self._snapshots_need_send: dict[str, tuple[BlockIds, int]] = {}
         self._prefill_handoff_tokens: dict[str, tuple[int, int]] = {}
+        self._pipeline_prefill_requests: dict[str, Request] = {}
         self._reqs_in_batch: set[str] = set()
 
         # master-slave meta information for cross-nodes
@@ -2171,8 +2196,13 @@ class MooncakeConnectorScheduler:
         if self.requires_summary_snapshots:
             if vllm_config.cache_config.enable_prefix_caching:
                 raise ValueError("Summary snapshot P/D currently requires prefix caching to be disabled.")
-            if self.pcp_size * self.dcp_size * vllm_config.parallel_config.pipeline_parallel_size != 1:
-                raise ValueError("Summary snapshot P/D requires PP=PCP=DCP=1.")
+            if self.pcp_size * self.dcp_size != 1:
+                raise ValueError("Summary snapshot P/D requires PCP=DCP=1.")
+            if (
+                vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+                and vllm_config.parallel_config.pipeline_parallel_size != 1
+            ):
+                raise ValueError("Summary snapshot P/D currently requires decode PP=1.")
             # The scheduler constructs its KVCacheManager after this connector.
             # Change only its remote-serving replay contract; the model specs
             # and the non-P/D local prefix-cache behavior stay as supplied.
@@ -2334,6 +2364,8 @@ class MooncakeConnectorScheduler:
             request.update_block_hashes()
             request.max_tokens = 1
             params["_p_side_truncated"] = True
+            if self.requires_summary_snapshots and self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+                self._pipeline_prefill_requests[request.request_id] = request
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         """
@@ -2408,6 +2440,21 @@ class MooncakeConnectorScheduler:
     ) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata()
 
+        # The scheduler invokes this before advancing computed-token counters.
+        # Fence only a completed P prompt while its one-token placeholder is
+        # in flight: a queued PP decode would mutate the state being handed off.
+        # Intermediate prefill chunks remain schedulable; cache ownership and
+        # release still belong to the scheduler/model.
+        if self._pipeline_prefill_requests:
+            for request_id in scheduler_output.preempted_req_ids or ():
+                request = self._pipeline_prefill_requests.get(request_id)
+                if request is not None:
+                    request.next_decode_eligible_step = 0
+            for request_id, count in scheduler_output.num_scheduled_tokens.items():
+                request = self._pipeline_prefill_requests.get(request_id)
+                if request is not None and request.num_computed_tokens + count >= request.num_prompt_tokens:
+                    request.next_decode_eligible_step = 1 << 60
+
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids, full_block_ids, num_external_tokens) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
@@ -2453,6 +2500,8 @@ class MooncakeConnectorScheduler:
             "MooncakeConnector request_finished, request_status=%s, kv_transfer_params=%s", request.status, params
         )
         self._prefill_handoff_tokens.pop(request.request_id, None)
+        if self._pipeline_prefill_requests.pop(request.request_id, None) is not None:
+            request.next_decode_eligible_step = 0
 
         if params is None:
             return False, None
@@ -2982,6 +3031,10 @@ class MooncakeConnectorWorker:
             "direction": direction,
             "source_id": source_id,
             "rank": self.tp_rank,
+            "pp_rank": self.pp_rank,
+            "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
+            "host": self.side_channel_host,
+            "handshake_port": self.handshake_port,
             "num_tokens": num_tokens,
             "kv": {},
             "snapshots": {},
@@ -2990,10 +3043,19 @@ class MooncakeConnectorWorker:
             group_id = self._snapshot_audit_groups[name]
             spec = self._get_layer_spec(name)
             page_size = int(spec.block_size)
+            prompt_pages = cdiv(num_tokens, page_size)
+            audit_blocks = block_ids[group_id][:prompt_pages]
+            # P sends a compact SWA tail, while D's full block table retains
+            # virtual prefix pages. Hash the same logical token range on both.
+            first_logical = (
+                max(0, prompt_pages - len(audit_blocks))
+                if direction == "send" and isinstance(spec, SlidingWindowSpec)
+                else 0
+            )
             layers = []
             for tensor in self._as_kv_cache_tuple(tensors):
                 pages = []
-                for logical, physical in enumerate(block_ids[group_id][: cdiv(num_tokens, page_size)]):
+                for logical, physical in enumerate(audit_blocks, start=first_logical):
                     if physical == 0:
                         continue
                     count = min(page_size, num_tokens - logical * page_size)
@@ -3042,7 +3104,10 @@ class MooncakeConnectorWorker:
         directory = Path(self._snapshot_audit_dir) / direction
         directory.mkdir(parents=True, exist_ok=True)
         key = hashlib.sha256(source_id.encode()).hexdigest()[:24]
-        (directory / f"{key}-rank{self.tp_rank}.json").write_text(json.dumps(record, indent=2))
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        (directory / f"{key}-dp{dp_rank}-pp{self.pp_rank}-rank{self.tp_rank}.json").write_text(
+            json.dumps(record, indent=2)
+        )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         owner_groups = {
@@ -3080,7 +3145,13 @@ class MooncakeConnectorWorker:
             for name in group.layer_names
             if "mtp" in name and ".index_cache" not in name
         ]
-        if self.snapshot_layers and len(mtp_layers) > 1:
+        if (
+            any(group.kv_cache_spec.extra_budget_page_size_bytes > 0 for group in self.kv_cache_config.kv_cache_groups)
+            and len(mtp_layers) > 1
+            and self.pp_rank == self.pp_size - 1
+            and self.vllm_config.speculative_config is not None
+            and self.vllm_config.speculative_config.method == "mtp"
+        ):
             self.mtp_prefix_adapter = MTPPrefixSnapshotAdapter(self.num_blocks, len(mtp_layers) - 1)
             owner = mtp_layers[0]
             self.snapshot_layers[owner] = (self.mtp_prefix_adapter, owner_groups[owner])
@@ -4366,6 +4437,15 @@ class MooncakeConnectorWorker:
     ):
         if remote_multi_nodes_meta_mapping is None:
             return remote_host, remote_engine_id
+
+        # Actual ports disambiguate DP-relative offsets and differing P/D base
+        # ports. Each PP worker advertises its own host, including remote stages.
+        for info in remote_multi_nodes_meta_mapping.values():
+            if info.get("handshake_port") == remote_handshake_port:
+                return info.get("host", remote_host), info.get("engine_id", remote_engine_id)
+
+        if self.snapshot_layers and self._prefill_pp_size > 1:
+            raise RuntimeError(f"Missing P pipeline endpoint for handshake port {remote_handshake_port}")
 
         kv_port = self.vllm_config.kv_transfer_config.kv_port
         rank = str(remote_handshake_port - kv_port)
