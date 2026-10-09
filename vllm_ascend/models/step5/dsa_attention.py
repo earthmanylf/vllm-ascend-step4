@@ -276,6 +276,14 @@ class AscendStep5DSAMetadataBuilder(
         self.gbsa_region_size = impl.region_size
         self.gbsa_topk = impl.topk_regions
         self.gbsa_block_size = kv_cache_spec.block_size
+        self.capture_sizes = set(
+            vllm_config.compilation_config.cudagraph_capture_sizes or []
+        )
+        # Graph-replay metadata buffers: on capture-sized steps the AICPU
+        # tensor must live at a stable address (baked into the captured
+        # graph) and be refreshed in place each step -- the FA3
+        # scheduler_buffers pattern.
+        self.gbsa_meta_buffers: dict[tuple, torch.Tensor] = {}
 
     def _build_gbsa_metadata(
         self,
@@ -284,15 +292,23 @@ class AscendStep5DSAMetadataBuilder(
         seqused_kv: torch.Tensor,
         block_table: torch.Tensor,
         max_query_len: int,
+        *,
+        path: str,
+        graph_shape: bool,
     ) -> torch.Tensor:
-        """One AICPU scheduling pass per step for these query positions."""
+        """One AICPU scheduling pass per step for these query positions.
+
+        On capture-sized shapes the fresh tensor is copied into a persistent
+        buffer keyed by the shape signature, so a captured graph replays
+        against a stable address whose content is refreshed every step.
+        """
         counts = gbsa_expected_counts(
             positions,
             groups=self.gbsa_num_kv_groups,
             region_size=self.gbsa_region_size,
             topk=self.gbsa_topk,
         )
-        return gbsa_sparse_attention_metadata(
+        metadata = gbsa_sparse_attention_metadata(
             counts,
             num_heads=self.gbsa_num_heads,
             num_kv_groups=self.gbsa_num_kv_groups,
@@ -305,6 +321,20 @@ class AscendStep5DSAMetadataBuilder(
             max_pages=int(block_table.shape[1]),
             page_size=self.gbsa_block_size,
         )
+        if not graph_shape:
+            return metadata
+        buffer_key = (
+            path,
+            tuple(counts.shape),
+            int(cu_seqlens_q.shape[0]) - 1,
+            max_query_len,
+        )
+        buffer = self.gbsa_meta_buffers.get(buffer_key)
+        if buffer is None:
+            self.gbsa_meta_buffers[buffer_key] = metadata
+            return metadata
+        buffer.copy_(metadata)
+        return buffer
 
     def build_csa_slot_plans(
         self, manager: CSASlotManager, req_ids: list[str | None],
@@ -342,6 +372,13 @@ class AscendStep5DSAMetadataBuilder(
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
         qsl_cpu = common_attn_metadata.query_start_loc_cpu
+        # Capture-sized steps hand the graph a persistent metadata buffer;
+        # all other shapes run eager on fresh tensors (FA3 tiling pattern).
+        num_input_tokens = (
+            getattr(common_attn_metadata, "num_input_tokens", 0)
+            or common_attn_metadata.num_actual_tokens
+        )
+        graph_shape = num_input_tokens in self.capture_sizes
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -410,6 +447,8 @@ class AscendStep5DSAMetadataBuilder(
                 prefill_seq_lens,
                 block_table,
                 prefill_metadata.max_query_len,
+                path="prefill",
+                graph_shape=graph_shape,
             )
 
         decode_metadata: AscendStep5DSADecodeMetadata | None = None
@@ -451,6 +490,8 @@ class AscendStep5DSAMetadataBuilder(
                     seqused_kv,
                     block_table,
                     1,
+                    path="decode",
+                    graph_shape=graph_shape,
                 )
             decode_metadata = AscendStep5DSADecodeMetadata(
                 seq_lens=seq_lens[:active_decodes],
