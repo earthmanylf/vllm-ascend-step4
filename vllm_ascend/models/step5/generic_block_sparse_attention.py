@@ -186,7 +186,9 @@ def gbsa_sparse_attention(
         positions: ``[total_q]`` absolute position of each query token; the
             current region is derived per token and appended internally.
         block_table: ``[num_reqs, max_pages]`` int32 logical-to-physical map.
-        cu_seqlens_q: ``[num_reqs + 1]`` cumulative query lengths.
+        cu_seqlens_q: ``[num_reqs + 1]`` cumulative query lengths (1 per
+            request for decode, ``K+1`` per request for the multi-token MTP
+            verify path).
         seqused_kv: ``[num_reqs]`` used KV length per request (right-aligned
             causal anchor; must be ``>=`` the request's query length).
         metadata: per-step AICPU scheduling tensor from

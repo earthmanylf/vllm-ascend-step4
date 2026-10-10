@@ -32,8 +32,10 @@ of folded (staging is last-write-wins per (region, offset), so the next
 round's rewrite of rejected positions is an exact rollback to the accepted
 prefix), and completed regions are only materialized into the fp8 page
 cache by the deferred flush once their last position is below the request's
-committed context. The verify attention flattens every row to a
-single-token decode request whose causal bound is its own position.
+committed context. The verify attention keeps each request as one
+multi-token varlen request (``query_len = K+1``): the fused indexer's
+per-token mask3 bound and the attention operator's right-aligned causal
+truncation hold every row to its own position as causal bound.
 """
 
 from __future__ import annotations
@@ -226,9 +228,17 @@ class AscendStep5DSAMetadata(AttentionMetadata):
     num_prefill_tokens: int
     slot_mapping: torch.Tensor
     query_start_loc: torch.Tensor
-    """(num_reqs + 1,) full-batch token start locations, including padding."""
+    """(num_reqs + 1,) int32 full-batch token start locations, including
+    padding (the worker's persistent int32 start-loc buffer, so slices are
+    zero-copy and directly usable as the fused indexer's cu_seq_lens)."""
+    query_start_loc_int64: torch.Tensor
+    """(num_reqs + 1,) int64 copy of ``query_start_loc``, refreshed in
+    place into a persistent builder buffer each build: the aclnn
+    GenericBlockSparseAttention operator requires ``cu_seqlens_q`` in
+    int64 (the fused indexer consumes the int32 original)."""
     seq_lens: torch.Tensor
-    """(num_reqs,) full-batch sequence lengths, including padding rows."""
+    """(num_reqs,) int32 full-batch sequence lengths, including padding
+    rows (the worker's persistent int32 seq-len buffer)."""
     csa_prefill_plan: CSAMetadata | None = None
     prefill: AscendStep5DSAPrefillMetadata | None = None
     decode: AscendStep5DSADecodeMetadata | None = None
@@ -284,6 +294,17 @@ class AscendStep5DSAMetadataBuilder(
         # graph) and be refreshed in place each step -- the FA3
         # scheduler_buffers pattern.
         self.gbsa_meta_buffers: dict[tuple, torch.Tensor] = {}
+        # Persistent int64 staging for query_start_loc: the aclnn
+        # GenericBlockSparseAttention operator requires cu_seqlens_q in
+        # int64. build() refreshes it in place so captured verify graphs
+        # observe the current step's start locations at a stable address
+        # (a fresh .to(int64) tensor per step would leave the graph reading
+        # a stale allocation).
+        self.query_start_loc_int64_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens + 1,
+            dtype=torch.int64,
+            device=device,
+        )
 
     def _build_gbsa_metadata(
         self,
@@ -369,6 +390,10 @@ class AscendStep5DSAMetadataBuilder(
         fast_build: bool = False,
     ) -> AscendStep5DSAMetadata:
         query_start_loc = common_attn_metadata.query_start_loc
+        query_start_loc_int64 = self.query_start_loc_int64_buffer[
+            : query_start_loc.shape[0]
+        ]
+        query_start_loc_int64.copy_(query_start_loc)
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
         qsl_cpu = common_attn_metadata.query_start_loc_cpu
@@ -469,9 +494,15 @@ class AscendStep5DSAMetadataBuilder(
                         active_decodes + 1, device=seq_lens.device, dtype=torch.int64
                     )
                     seqused_kv = decode_seq_lens
+                    max_query_len = 1
                 else:
-                    # MTP verify flattened: row r of request i is a
-                    # single-token request at position ctx + (r mod q_len).
+                    # MTP verify multi-token varlen: each request stays one
+                    # query_len=K+1 request spanning kv positions
+                    # ctx..ctx+K (ctx = seq_len - q_len). The per-token
+                    # positions drive the scheduled counts; the
+                    # request-level start-loc head (decode rows lead the
+                    # batch) and the full seq lens anchor the right-aligned
+                    # causal bound.
                     total = active_decodes * decode_query_len
                     row_base = (
                         decode_seq_lens.to(torch.int64) - decode_query_len
@@ -480,16 +511,15 @@ class AscendStep5DSAMetadataBuilder(
                         torch.arange(total, device=seq_lens.device, dtype=torch.int64)
                         % decode_query_len
                     )
-                    cu_seq_lens = torch.arange(
-                        total + 1, device=seq_lens.device, dtype=torch.int64
-                    )
-                    seqused_kv = positions + 1
+                    cu_seq_lens = query_start_loc[: active_decodes + 1]
+                    seqused_kv = decode_seq_lens
+                    max_query_len = decode_query_len
                 gbsa_metadata = self._build_gbsa_metadata(
                     positions,
                     cu_seq_lens,
                     seqused_kv,
                     block_table,
-                    1,
+                    max_query_len,
                     path="decode",
                     graph_shape=graph_shape,
                 )
@@ -508,6 +538,7 @@ class AscendStep5DSAMetadataBuilder(
             num_prefill_tokens=num_prefill_tokens,
             slot_mapping=common_attn_metadata.slot_mapping,
             query_start_loc=query_start_loc,
+            query_start_loc_int64=query_start_loc_int64,
             seq_lens=seq_lens,
             prefill=prefill_metadata,
             decode=decode_metadata,
@@ -1267,48 +1298,45 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
     ) -> None:
         """Sparse attention for an MTP verify batch (K+1 rows per request).
 
-        Follows the reference flow's flattened-decode design (its
-        ``_flatten_decode_q_le4_metadata`` path): every verify row becomes a
-        single-token decode request, runs its own indexer top-k selection,
-        and the exact attention goes through the aclnn
-        ``GenericBlockSparseAttention`` operator. Each row's ``kv_seqlen``
-        is its own absolute position + 1, so the operator's right-aligned
-        causal bound reproduces the per-row causal mask the prefill kernel
-        used to express through per-region ``valid`` counts, while the
-        fused indexer's mask3 bound keeps the row's current region out of
-        top-k competition and the attention operator appends it causally
-        -- the same contract the single-token decode path guarantees.
+        Each verify request stays one multi-token varlen request of
+        ``query_len = K+1`` rows spanning kv positions ``ctx..ctx+K`` with
+        ``ctx = seq_len - K - 1``. The exact attention goes through the
+        aclnn ``GenericBlockSparseAttention`` operator: its right-aligned
+        causal bound (``seqused_kv = seq_len``, ``q_len = K+1``) places
+        query row ``i`` at kv position ``ctx + i`` and truncates it to its
+        own position, and the operator appends each row's current region
+        ``floor((ctx + i) / region_size)`` with causal truncation. The
+        fused indexer's per-token mask3 bound ``floor((ctx + j) /
+        region_size)`` keeps the row's current region out of top-k
+        competition -- the same contract the single-token decode path
+        guarantees, evaluated once per request instead of once per row.
         Everything is device-driven on static per-bucket shapes, so uniform
         verify batches stay ACL-graph capturable.
         """
-        d = md.decode
-        n = md.num_decodes
-        k = int(d.query_len)
-        total = n * k
+        decode_md = md.decode
+        num_decodes = md.num_decodes
+        query_len = int(decode_md.query_len)
+        total_tokens = num_decodes * query_len
         groups = self.num_kv_groups
-        # Flatten the verify rows to single-token decode requests: row r of
-        # request i carries its own context end, i.e. kv_seqlen = position +
-        # 1. Each row is an independent single-token "request" for the fused
-        # operator; its causal bound floor(position / region_size) keeps the
-        # current region out of top-k competition, and the attention
-        # operator appends and causally truncates it.
-        row_kv_seqlens = positions[:total].to(torch.int32) + 1
-        token_to_req = (
-            torch.arange(total, device=index_q.device, dtype=torch.int32) // k
-        )
-        # Per-row block-table rows, gathered on device so the flatten stays
-        # graph-capturable; this mirrors the reference's metadata-flatten
-        # kernel expanding per-request rows to per-token rows.
-        row_block_table = d.block_table[:n][token_to_req.to(torch.long)]
-        cu_seq_lens = torch.arange(
-            total + 1, device=index_q.device, dtype=torch.int32
-        )
-        actual_kv_lengths = row_kv_seqlens - 1
+        # Request-level varlen metadata: the committed context
+        # ctx = seq_len - query_len anchors both operators. seqused_kv is
+        # the full seq_len (right-aligned causal anchor), actual_kv_lengths
+        # is ctx (the indexer's mask3 bound floor((ctx + j)/region_size) is
+        # each row's own current region). cu_seq_lens reuses the builder's
+        # start-loc copies -- int32 for the fused indexer, int64 for the
+        # GenericBlockSparseAttention operator's cu_seqlens_q contract --
+        # zero-kernel views refreshed in place by the builder. Static
+        # shapes, all device tensors: ACL-graph capturable.
+        seq_lens = decode_md.seq_lens[:num_decodes]
+        cu_seq_lens = md.query_start_loc[: num_decodes + 1]
+        cu_seqlens_q = md.query_start_loc_int64[: num_decodes + 1]
+        # TODO(realliujiaxu) use seq_lens after indexer_score_topk adjust its api
+        actual_kv_lengths = seq_lens - query_len
         _scores, ids = indexer_score_topk(
-            index_q[:total],
-            weights[:total],
+            index_q[:total_tokens],
+            weights[:total_tokens],
             summary_cache.mean_cache.view(torch.float8_e4m3fn),
-            row_block_table,
+            decode_md.block_table[:num_decodes],
             cu_seq_lens,
             actual_kv_lengths,
             max_region_len=self._max_regions,
@@ -1320,16 +1348,16 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             key_cache,
             value_cache,
             ids,
-            actual_kv_lengths,
-            row_block_table,
-            cu_seq_lens,
-            row_kv_seqlens,
-            d.gbsa_metadata,
+            positions[:total_tokens],
+            decode_md.block_table[:num_decodes],
+            cu_seqlens_q,
+            seq_lens,
+            decode_md.gbsa_metadata,
             num_kv_groups=groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
         )
-        output[:total] = out.to(output.dtype)
+        output[:total_tokens] = out.to(output.dtype)
 
     def _forward_sparse_gqa_prefill(
         self,
