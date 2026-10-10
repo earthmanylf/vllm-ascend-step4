@@ -21,6 +21,13 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 
 
+_KV_POOL_BLOCKS = None
+
+
+def set_kv_pool_blocks(n: int) -> None:
+    global _KV_POOL_BLOCKS
+    _KV_POOL_BLOCKS = int(n)
+
 class AscendFlashAttentionBackend(AscendAttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["AscendFlashAttentionImpl"]:
@@ -117,6 +124,7 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
         graph_shape = num_input_tokens in self.capture_sizes
         max_query_len = num_input_tokens if graph_shape else common.max_query_len
         scheduler_metadata = {}
+        num_blocks = int(_KV_POOL_BLOCKS or block_tables.shape[1])
         for spec in self.scheduler_specs:
             num_heads, num_kv_heads, head_size, dtype, scale, window_size = spec
             # AICPU tiling runs once per layout, before entering the model graph.
@@ -134,6 +142,8 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
                 qkv_dtype=dtype,
                 cu_seqlens_q=query_start_loc,
                 page_size=self.block_size,
+                num_blocks=num_blocks,
+                max_num_blocks_per_seq=block_tables.shape[1],
                 causal=common.causal,
                 softmax_scale=scale,
                 num_splits=0,

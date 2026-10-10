@@ -3972,6 +3972,11 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        try:
+            from vllm_ascend.attention.flash_attention_v3 import set_kv_pool_blocks
+            set_kv_pool_blocks(kv_cache_config.num_blocks)
+        except Exception:
+            pass
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
