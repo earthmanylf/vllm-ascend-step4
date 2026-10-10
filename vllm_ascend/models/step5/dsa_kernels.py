@@ -818,94 +818,41 @@ def indexer_logits_paged(
 ) -> torch.Tensor:
     """Score Q[T,G,H,D] against paged e4m3 summaries, with signed weights[T,G,H].
 
-    Cache: [physical_pages, summaries_per_page, 1, D], arbitrary page stride.
+    Uses the aclnn IndexerRegionScore operator. Cache:
+    [physical_pages, summaries_per_page, 1, D], arbitrary page stride.
     Page table: [requests, logical_pages], -1 means unmapped. token_to_req[T]
-    selects each token's request. Output is group-major [G*T, R] by default,
-    with row g*out_q_stride+t (out_q_stride defaults to T).
-
-    Q is quantized to e4m3 and packed with weights in [G,T,H] order so score
-    tiles can be stored contiguously. A Vector preprocessing kernel resolves
-    logical pages, widens to BF16 and zeros missing/tail rows once. The prepared
-    cache is padded to whole K tiles and loaded directly into L1. A second
-    preparation pass records consecutive request segments within each Q chunk,
-    without moving Q rows or synchronizing with the host. All requests use the
-    same segment/K-tile loops, reusing K across Q. Q widening stays on Vector,
-    preserving the ssbuffer Vector->Cube->Vector stage structure.
-    H/D input padding makes the CV loads full and aligned; output masks retain
-    only real score rows and columns. K is prepared separately per request.
-    There is no causal mask; the downstream selector bounds valid candidates.
+    selects each token's request. Output is group-major [G*T, R] by default.
     """
-    total_tokens, groups, heads_per_group, proxy_dim = index_q.shape
+    total_tokens, groups = index_q.shape[0], index_q.shape[1]
     seq_k = int(out.shape[1])
-    out_q_stride = total_tokens if out_q_stride is None else out_q_stride
     if total_tokens == 0 or seq_k == 0:
         return out
-    if block_k <= 0 or block_k & (block_k - 1):
-        raise ValueError("block_k must be a positive power of two")
-    if summaries_per_page <= 0:
-        raise ValueError("summaries_per_page must be positive")
-    block_m = 64
-    block_h = triton.next_power_of_2(heads_per_group)
-    block_m = max(block_m, block_h)
-    block_d = max(16, triton.next_power_of_2(proxy_dim))
-    block_k = max(16, block_k)
+
     num_requests = int(block_table.shape[0])
-    properties = triton.runtime.driver.active.utils.get_device_properties("npu")
-    compute_heads = block_h
-    compute_dim = block_d
-    block_k = min(block_k, max(16, triton.next_power_of_2(seq_k)))
-    num_k_blocks = triton.cdiv(seq_k, block_k)
-    num_q_tiles = triton.cdiv(total_tokens * groups * compute_heads, block_m)
-    num_cores = properties["num_aicore"]
-    q_chunks = min(num_cores // math.gcd(num_cores, num_k_blocks), num_q_tiles)
-    chunk_rows = triton.cdiv(num_q_tiles, q_chunks) * (block_m // compute_heads)
-    q_chunks = triton.cdiv(total_tokens * groups, chunk_rows)
-    grid = (num_k_blocks * q_chunks,)
-    index_q = quantize_activations_e4m3(index_q).permute(1, 0, 2, 3).contiguous()
+    req_ids = torch.arange(
+        num_requests + 1, dtype=torch.int64, device=token_to_req.device
+    )
+    cu_seqlens_q = torch.searchsorted(
+        token_to_req.to(torch.int64), req_ids
+    ).to(torch.int32)
+
+    q_e4m3 = index_q.to(torch.float8_e4m3fn).permute(1, 0, 2, 3).contiguous()
     weights = weights.permute(1, 0, 2).contiguous()
-    if compute_heads != heads_per_group or compute_dim != proxy_dim:
-        index_q = torch.nn.functional.pad(
-            index_q.view(torch.uint8),
-            (0, compute_dim - proxy_dim, 0, compute_heads - heads_per_group),
-        ).view(torch.float8_e4m3fn)
-    if compute_heads != heads_per_group:
-        weights = torch.nn.functional.pad(weights, (0, compute_heads - heads_per_group))
-    extra_rows = block_m - compute_heads
-    if extra_rows:
-        index_q = torch.nn.functional.pad(
-            index_q.view(torch.uint8).reshape(-1, compute_dim), (0, 0, 0, extra_rows),
-        ).view(torch.float8_e4m3fn)
-        weights = torch.nn.functional.pad(weights.reshape(-1), (0, extra_rows))
-    padded_rows = triton.cdiv(seq_k, block_k) * block_k
-    prepared_cache = torch.empty(
-        (num_requests, padded_rows, block_d), device=mean_cache.device, dtype=torch.bfloat16,
+
+    from cann_ops_transformer.ops import indexer_region_score
+
+    score = indexer_region_score(
+        q_e4m3,
+        weights,
+        paged_key_summary=mean_cache,
+        block_table=block_table,
+        cu_seq_lens=cu_seqlens_q,
+        mask_mode=0,
+        head_scale=0.5,
+        cache_mode=1,
+        seq_k=seq_k,
     )
-    key_valid = torch.empty((num_requests, padded_rows), device=mean_cache.device, dtype=torch.int32)
-    _prepare_indexer_cache[(triton.cdiv(padded_rows, 256), num_requests)](
-        mean_cache, block_table, prepared_cache, key_valid,
-        seq_k, padded_rows, int(block_table.shape[1]),
-        mean_cache.stride(0), mean_cache.stride(1), mean_cache.stride(3),
-        block_table.stride(0), block_table.stride(1),
-        SUMMARIES_PER_PAGE=int(summaries_per_page), PROXY_DIM=proxy_dim,
-        HAS_CACHE=mean_cache.shape[0] > 0, BLOCK_R=256, BLOCK_D=block_d,
-        compile_mode = "simd",
-    )
-    segment_stride = triton.next_power_of_2(chunk_rows + 1)
-    segments = torch.empty((q_chunks, segment_stride), device=index_q.device, dtype=torch.int32)
-    segment_counts = torch.empty((q_chunks,), device=index_q.device, dtype=torch.int32)
-    _prepare_indexer_segments[(q_chunks,)](
-        token_to_req, segments, segment_counts, total_tokens, token_to_req.stride(0),
-        GROUPS=groups, CHUNK_ROWS=chunk_rows, SEGMENT_STRIDE=segment_stride, BLOCK_SCAN=min(512, segment_stride),
-    )
-    _indexer_logits_kernel[grid](
-        index_q, prepared_cache, weights, out, key_valid, token_to_req,
-        segments, segment_counts, total_tokens, seq_k, padded_rows,
-        token_to_req.stride(0), out.stride(0), out.stride(1),
-        OUT_GROUP_GAP=out_q_stride - total_tokens, SEGMENT_STRIDE=segment_stride,
-        BLOCK_M=block_m, BLOCK_H=compute_heads, BLOCK_K=block_k, BLOCK_D=block_d,
-        enable_auto_bind_sub_block=False,
-        multibuffer=False,
-    )
+    out[: groups * total_tokens, :seq_k] = score.reshape(groups * total_tokens, seq_k)
     return out
 
 
