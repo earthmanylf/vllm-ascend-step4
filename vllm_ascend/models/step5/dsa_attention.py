@@ -35,7 +35,7 @@ from typing import ClassVar
 import torch
 
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.models.step5.sparse_summary_cache import Step5DSAScratchWorkspace
 from vllm.v1.attention.backend import (
@@ -97,6 +97,14 @@ class AscendStep5DSARuntimeLayout:
     token_positions: torch.Tensor
     reset_slots: torch.Tensor
     token_valid: torch.Tensor
+
+
+
+@dataclass
+class AscendStep5DSAStepMetadata:
+    """Step-scoped payload shared by all DSA layers in one forward pass."""
+
+    runtime_layout: AscendStep5DSARuntimeLayout | None = None
 
 
 class AscendStep5DSABackend(AttentionBackend):
@@ -702,6 +710,30 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
 
     # -- summary cache update --------------------------------------------------
 
+    def _get_step_metadata(
+        self, md: AscendStep5DSAMetadata
+    ) -> AscendStep5DSAStepMetadata:
+        """Get the payload shared by this forward pass's DSA layers.
+
+        Mirrors upstream ``Step5DSAAttentionImpl._get_step_metadata``: the
+        per-step artifacts live on the forward context (recreated every
+        step) keyed by the metadata object identity. All layers of the
+        attention group share one metadata instance per step, so the
+        first layer's layout is reused by the rest, and in-place
+        slot_mapping/seq_lens refreshes can never observe a stale layout.
+        """
+        if not is_forward_context_available():
+            return AscendStep5DSAStepMetadata()
+        cache = get_forward_context().additional_kwargs.setdefault(
+            "ascend_step5_dsa_step_metadata", {}
+        )
+        key = id(md)
+        step_metadata = cache.get(key)
+        if step_metadata is None:
+            step_metadata = AscendStep5DSAStepMetadata()
+            cache[key] = step_metadata
+        return step_metadata
+
     def _get_or_build_runtime_layout(
         self,
         *,
@@ -780,11 +812,14 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         num_tokens = int(md.num_actual_tokens)
         if num_tokens <= 0:
             return
-        layout = self._get_or_build_runtime_layout(
-            summary_cache=summary_cache,
-            md=md,
-            num_actual_tokens=num_tokens,
-        )
+        step_metadata = self._get_step_metadata(md)
+        if step_metadata.runtime_layout is None:
+            step_metadata.runtime_layout = self._get_or_build_runtime_layout(
+                summary_cache=summary_cache,
+                md=md,
+                num_actual_tokens=num_tokens,
+            )
+        layout = step_metadata.runtime_layout
         index_k = index_k[:num_tokens].contiguous()
         index_z = index_z[:num_tokens].contiguous()
         allocation_success = self._begin_csa_allocation_check(summary_cache)
