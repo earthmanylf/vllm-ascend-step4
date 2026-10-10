@@ -113,8 +113,8 @@ def gbsa_sparse_attention(
         num_kv_groups: G, the number of KV head groups.
         region_size: tokens per region (sparse block height).
         softmax_scale: attention softmax scale.
-        max_query_len: max per-request query length (1 for the flattened
-            decode / verify paths).
+        max_query_len: max per-request query length (1 for the decode path,
+            K+1 for the MTP verify path).
 
     Returns:
         ``out`` shaped ``[total_q, num_heads, head_dim]``, same dtype as
