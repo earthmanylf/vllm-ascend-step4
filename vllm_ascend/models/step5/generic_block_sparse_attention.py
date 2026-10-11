@@ -40,6 +40,8 @@ serving, and the operator's consistent-count fast path does not apply.
 from __future__ import annotations
 
 import torch
+import triton
+import triton.language as tl
 
 from cann_ops_transformer.ops.attention.generic_block_sparse_attention import (
     generic_block_sparse_attention,
@@ -50,6 +52,52 @@ _SPARSE_PATTERN_PER_GROUP_PER_TOKEN = 4
 _MASK_CAUSAL = 1
 _QUANT_NONE = 0
 _SOFTMAX_PRECISION_FP32 = 1
+
+
+@triton.jit
+def _append_current_region_kernel(
+    ids_ptr,
+    positions_ptr,
+    wide_ptr,
+    counts_ptr,
+    tokens,
+    region_size,
+    topk: tl.constexpr,
+    block_k: tl.constexpr,
+    block_t: tl.constexpr,
+):
+    """Pack ``block_t`` rows of one group, streaming ``topk`` in chunks."""
+    group = tl.program_id(0)
+    tile = tl.program_id(1)
+    row = tile * block_t + tl.arange(0, block_t)
+    row_mask = row < tokens
+    rows = group * tokens + row
+
+    live = tl.zeros((block_t,), dtype=tl.int32)
+    for k0 in range(0, topk, block_k):
+        col = k0 + tl.arange(0, block_k)
+        mask = row_mask[:, None] & (col < topk)[None, :]
+        ids = tl.load(
+            ids_ptr + rows[:, None] * topk + col[None, :],
+            mask=mask,
+            other=-1,
+        )
+        live += tl.sum((ids != -1).to(tl.int32), axis=1)
+        tl.store(
+            wide_ptr + rows[:, None] * (topk + 1) + col[None, :],
+            ids,
+            mask=mask,
+        )
+
+    pad = tl.full((block_t,), -1, dtype=tl.int32)
+    tl.store(wide_ptr + rows * (topk + 1) + topk, pad, mask=row_mask)
+
+    positions = tl.load(positions_ptr + row, mask=row_mask, other=0)
+    current = (positions // region_size).to(tl.int32)
+    slot = tl.minimum(live, topk)
+    tl.store(wide_ptr + rows * (topk + 1) + slot, current, mask=row_mask)
+
+    tl.store(counts_ptr + rows, live + 1, mask=row_mask)
 
 
 def _append_current_region(
@@ -68,25 +116,34 @@ def _append_current_region(
     column when the selection is full), matching the Triton pack kernels'
     current-region append. Counts become ``live + 1``.
 
+    The whole pack (count + copy + append) runs as a single fused Triton
+    kernel.
+
     Returns ``(idx [G, T, topk + 1], counts [G, T])`` ready for the operator.
     """
     rows, topk = ids.shape
     tokens = rows // groups
-    ids3 = ids.view(groups, tokens, topk)
-    counts = (ids3 != -1).sum(dim=-1, dtype=torch.int32)
-    wide = torch.cat(
-        [
-            ids3,
-            torch.full(
-                (groups, tokens, 1), -1, device=ids.device, dtype=ids.dtype
-            ),
-        ],
-        dim=-1,
+    wide = torch.empty(
+        (groups, tokens, topk + 1), device=ids.device, dtype=ids.dtype
     )
-    current = (positions.to(torch.int32) // region_size).view(1, tokens, 1)
-    slot = counts.clamp(max=topk).to(torch.int64).unsqueeze(-1)
-    wide.scatter_(-1, slot, current.expand(groups, tokens, 1))
-    return wide, counts + 1
+    counts = torch.empty(
+        (groups, tokens), device=ids.device, dtype=torch.int32
+    )
+    block_k = triton.next_power_of_2(min(topk, 512))
+    block_t = max(1, min(64, 8192 // block_k))
+    grid = (groups, triton.cdiv(tokens, block_t))
+    _append_current_region_kernel[grid](
+        ids,
+        positions,
+        wide,
+        counts,
+        tokens,
+        region_size,
+        topk=topk,
+        block_k=block_k,
+        block_t=block_t,
+    )
+    return wide, counts
 
 
 def gbsa_expected_counts(
