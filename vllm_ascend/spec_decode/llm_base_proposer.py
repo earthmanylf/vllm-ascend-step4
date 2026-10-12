@@ -123,6 +123,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
             "Step3p7ForConditionalGeneration",
+            "Step5ForConditionalGeneration",
+            "AscendStep5ForConditionalGeneration",
             "Gemma4ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
             "Glm5NextForConditionalGeneration",

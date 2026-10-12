@@ -14,6 +14,10 @@ def register_model():
         "Step5MTP",
         "vllm_ascend.models.step5.mtp:AscendStep5MTP",
     )
+    ModelRegistry.register_model(
+        "Step5ForConditionalGeneration",
+        "vllm_ascend.models.step5.vl:AscendStep5ForConditionalGeneration",
+    )
     # Keep the release-branch text architecture as a compatibility alias for
     # checkpoints whose config predates vLLM's KimiLinear rename.
     ModelRegistry.register_model(

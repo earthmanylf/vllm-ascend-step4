@@ -12,6 +12,7 @@ from vllm_ascend.models.step5.model import (
     AscendStep5Model,
 )
 from vllm_ascend.models.step5.mtp import AscendStep5MTP
+from vllm_ascend.models.step5.vl import AscendStep5ForConditionalGeneration
 
 __all__ = [
     "AscendStep5DSABackend",
@@ -21,4 +22,5 @@ __all__ = [
     "AscendStep5ForCausalLM",
     "AscendStep5Model",
     "AscendStep5MTP",
+    "AscendStep5ForConditionalGeneration",
 ]

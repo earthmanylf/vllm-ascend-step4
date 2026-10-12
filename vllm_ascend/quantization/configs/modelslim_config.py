@@ -871,7 +871,7 @@ class AscendModelSlimConfig(QuantizationConfig):
             # separate quantized q/k/v and floating-point gate projections.
             return True
 
-        if self.model_type == "step5_mtp":
+        if self.model_type in ("step5_mtp", "step5_vl"):
             # The ModelSlim tool does not emit quant entries for Step5 MTP
             # draft layers (they stay in bf16), so a prefix with no
             # description coverage at all is treated as FLOAT, i.e.
@@ -884,6 +884,7 @@ class AscendModelSlimConfig(QuantizationConfig):
                 ]
             else:
                 probe_prefixes = [prefix]
+            probe_prefixes.append(prefix)
             if not any(f"{probe_prefix}.weight" in self.quant_description for probe_prefix in probe_prefixes):
                 return True
 
@@ -900,7 +901,19 @@ class AscendModelSlimConfig(QuantizationConfig):
                 # k_eq_v case where v_proj is replicated from k_proj.
                 if shard_key not in self.quant_description and _is_missing_v_shard(shard_key, self.quant_description):
                     continue
-                is_shard_skipped = self.quant_description[shard_key] == "FLOAT"
+                if shard_key in self.quant_description:
+                    is_shard_skipped = self.quant_description[shard_key] == "FLOAT"
+                elif f"{prefix}.weight" in self.quant_description:
+                    # ModelSlim keys some fused projections by the fused
+                    # module name instead of per-shard entries: the step5_vl
+                    # vision tower stores QKV as one "in_proj_weight" tensor
+                    # which the wrapper's weight mapper renames to
+                    # "...qkv_proj.weight".  Use the fused entry for the
+                    # skip decision; partial per-shard coverage keeps the
+                    # original KeyError behavior.
+                    is_shard_skipped = self.quant_description[f"{prefix}.weight"] == "FLOAT"
+                else:
+                    raise KeyError(shard_key)
 
                 if is_skipped is None:
                     is_skipped = is_shard_skipped
