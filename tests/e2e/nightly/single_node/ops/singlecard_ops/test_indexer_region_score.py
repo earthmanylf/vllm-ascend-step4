@@ -13,7 +13,8 @@ Three-layer verification strategy:
 
 1. Formula-free invariants (exact): output shapes/dtypes; per-row ids strictly
    ascending, duplicate-free, in ``[0, bound)`` with
-   ``bound = floor((actual_kv_lengths[n] + j) / region_size)`` (the current
+   ``bound = floor((actual_kv_lengths[n] - q_len + 1 + j) / region_size)``
+   (actual_kv_lengths is the zero-based tail token position; the current
    region never competes, mask_mode=3); ``-1`` only as tail padding with
    exactly ``max(0, topk - bound)`` pads. Rows with ``bound <= topk`` select
    *every* candidate, so their ids must equal ``arange(bound)`` exactly.
@@ -67,8 +68,10 @@ def _build_inputs(
 ):
     """Build a self-consistent input bundle for ``indexer_score_topk``.
 
-    Every block-table entry is mapped to a distinct physical page (no -1), so
-    all ``bound`` causal-candidate regions are valid candidates.
+    ``actual_kv_lens`` holds zero-based tail token positions
+    (``ctx + q_len - 1`` per request). Every block-table entry is mapped to
+    a distinct physical page (no -1), so all ``bound`` causal-candidate
+    regions are valid candidates.
     """
     torch.manual_seed(seed)
     num_reqs = len(actual_kv_lens)
@@ -92,14 +95,21 @@ def _build_inputs(
 
 
 def _token_bounds(cu_seq_lens, actual_kv_lengths, total_tokens):
-    """Causal bound per output row: floor((actual_kv_lengths[n] + j) / 8)."""
+    """Causal bound per output row.
+
+    ``actual_kv_lengths`` holds the zero-based tail token position; the
+    operator restores the first query position as
+    ``actual_kv_lengths[n] - q_len + 1``, so token j of request n sits at
+    ``floor((actual_kv_lengths[n] - q_len + 1 + j) / 8)`` visible regions.
+    """
     cu = cu_seq_lens.cpu()
     akl = actual_kv_lengths.cpu()
     bounds = torch.empty(total_tokens, dtype=torch.int64)
     for n in range(akl.numel()):
+        q_len = int(cu[n + 1]) - int(cu[n])
         for t in range(int(cu[n]), int(cu[n + 1])):
             j = t - int(cu[n])
-            bounds[t] = (int(akl[n]) + j) // REGION_SIZE
+            bounds[t] = (int(akl[n]) - q_len + 1 + j) // REGION_SIZE
     return bounds
 
 
@@ -293,10 +303,11 @@ def test_decode_rows_contract():
 def test_prefill_rows_contract():
     """Prefill form: multi-token requests driven by query_start_loc.
 
-    Includes a zero-context request (every token's bound is 0 -> all -1) and
-    per-token causal drift inside a request (bound grows with j).
+    Includes a zero-context request (tail = q_len - 1, every token's bound
+    is 0 -> all -1) and per-token causal drift inside a request (bound
+    grows with j). kv_lens are tail positions: ctx + q_len - 1.
     """
-    kv_lens = [0, 100, 65528]
+    kv_lens = [3, 103, 65535]
     tokens_per_req = [4, 4, 8]
     total = sum(tokens_per_req)
     inputs = _build_inputs(kv_lens, tokens_per_req, max_region_len=WIDE_REGION_LEN)
@@ -325,8 +336,11 @@ def test_scores_and_ids_vs_triton_reference():
 
 
 def test_prefill_vs_triton_reference():
-    """Same comparison for the multi-token (prefill) input form."""
-    kv_lens = [1000, 65500]
+    """Same comparison for the multi-token (prefill) input form.
+
+    kv_lens are tail positions (ctx + q_len - 1) for ctx = 1000, 65500.
+    """
+    kv_lens = [1003, 65503]
     tokens_per_req = [4, 4]
     inputs = _build_inputs(kv_lens, tokens_per_req,
                            max_region_len=WIDE_REGION_LEN, seed=11)

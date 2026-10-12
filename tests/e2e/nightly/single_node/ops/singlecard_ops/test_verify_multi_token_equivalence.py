@@ -92,10 +92,13 @@ def _run(bundle, multi_token: bool):
     seq_lens = torch.tensor(SEQ_LENS, dtype=torch.int64, device=DEVICE)
     if multi_token:
         # One varlen request per verify request (the serving path).
+        # actual_kv_lengths holds the zero-based tail token position
+        # (seq_len - 1); the operator restores the first query position as
+        # seq_len - q_len.
         bt = block_table[:N]
         cu_seq_lens = torch.arange(N + 1, device=DEVICE, dtype=torch.int32) * K
         seq_lens_i32 = seq_lens[:N].to(torch.int32)
-        actual_kv_lengths = seq_lens_i32 - K
+        actual_kv_lengths = seq_lens_i32 - 1
         max_query_len = K
         seqused_kv = seq_lens_i32
     else:
