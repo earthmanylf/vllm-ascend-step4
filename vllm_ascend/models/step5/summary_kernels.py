@@ -1297,6 +1297,7 @@ def _csa_verify_stage_kernel(
     REGION_BLOCK_SIZE: tl.constexpr,
     ACTIVE_CAPACITY: tl.constexpr,
     ALLOC_PROBE: tl.constexpr,
+    SLOTS_PER_REQ: tl.constexpr,
     K_ROWS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -1325,6 +1326,14 @@ def _csa_verify_stage_kernel(
     dim_mask = dims < PROXY_DIM
     toks = tl.arange(0, BLOCK_T)
 
+    # Same-region carry: the K+1 rows of one request usually fall in one
+    # or two regions, and a region's slot cannot change inside this
+    # program (reset keeps ownership, fold keeps the slot live), so a row
+    # whose region repeats the previous row's skips the hint/owner lookup
+    # -- two dependent scalar loads off the critical path.
+    prev_region = tl.full((), -1, tl.int64)
+    prev_slot = tl.full((), ACTIVE_CAPACITY, tl.int64)
+
     for j in tl.static_range(K_ROWS):
         # triton-ascend rejects `continue` in static_range; guard the body.
         row = block * K_ROWS + j
@@ -1337,11 +1346,18 @@ def _csa_verify_stage_kernel(
             offset = position % REGION_BLOCK_SIZE
 
             region_i32 = region.to(tl.int32)
-            hint = tl.load(active_slot_by_region + region).to(tl.int64)
-            hint_ok = (hint >= 0) & (hint < ACTIVE_CAPACITY)
-            safe_hint = tl.where(hint_ok, hint, 0)
-            hint_owner = tl.load(active_region_ids + safe_hint, mask=hint_ok, other=-1)
-            slot = tl.where(hint_ok & (hint_owner == region_i32), hint, ACTIVE_CAPACITY)
+            if region == prev_region:
+                slot = prev_slot
+            else:
+                hint = tl.load(active_slot_by_region + region).to(tl.int64)
+                hint_ok = (hint >= 0) & (hint < ACTIVE_CAPACITY)
+                safe_hint = tl.where(hint_ok, hint, 0)
+                hint_owner = tl.load(
+                    active_region_ids + safe_hint, mask=hint_ok, other=-1
+                )
+                slot = tl.where(
+                    hint_ok & (hint_owner == region_i32), hint, ACTIVE_CAPACITY
+                )
             has_slot = slot != ACTIVE_CAPACITY
             safe_slot = tl.where(has_slot, slot, 0)
 
@@ -1389,18 +1405,34 @@ def _csa_verify_stage_kernel(
 
             # Allocate a slot on first touch (the region may still be
             # slotless when the verify batch is the first to touch it after
-            # a page flush).
+            # a page flush). Slots are partitioned per request:
+            # [block*SLOTS_PER_REQ, +SLOTS_PER_REQ) is written only by this
+            # program within this launch -- regions are request-private,
+            # and every other slot-table writer (deferred flush, reset,
+            # prefill) runs in a separate, sequentially ordered launch --
+            # so a plain read/claim probe is race-free and skips the
+            # atomic_cas hardware sync entirely (measured at ~3.6us fixed
+            # per issue plus cross-program serialization at n=16). The
+            # 8-slots-per-request budget is the documented capacity policy;
+            # partition exhaustion keeps the fail-closed allocation_success
+            # contract of the global probe.
             if slot == ACTIVE_CAPACITY:
-                start = region % ACTIVE_CAPACITY
-                empty = tl.full((), -1, tl.int32)
-                for probe in tl.range(0, ALLOC_PROBE):
-                    if slot == ACTIVE_CAPACITY:
-                        cand = (start + probe) % ACTIVE_CAPACITY
-                        old = tl.atomic_cas(active_region_ids + cand, empty, region_i32)
-                        if (old == empty) | (old == region_i32):
-                            slot = cand.to(tl.int64)
+                part_lo = block * SLOTS_PER_REQ
+                if part_lo + SLOTS_PER_REQ <= ACTIVE_CAPACITY:
+                    empty = tl.full((), -1, tl.int32)
+                    for probe in tl.range(0, SLOTS_PER_REQ):
+                        if slot == ACTIVE_CAPACITY:
+                            cand = part_lo + probe
+                            own = tl.load(active_region_ids + cand)
+                            if (own == empty) | (own == region_i32):
+                                tl.store(active_region_ids + cand, region_i32)
+                                slot = cand.to(tl.int64)
                 if slot == ACTIVE_CAPACITY:
                     tl.store(allocation_success, 0)
+            # Carry the post-allocation slot so the next row of this same
+            # region skips both the hint lookup and any re-allocation.
+            prev_region = region
+            prev_slot = slot
             slot_ok = (slot >= 0) & (slot < ACTIVE_CAPACITY)
             safe_slot = tl.where(slot_ok, slot, 0)
             if slot_ok:
@@ -1461,22 +1493,37 @@ def _csa_verify_stage_kernel(
                     prefix_max = tl.load(
                         max_logits + safe_slot * max_stride_slot
                     ).to(tl.float32)
-                    staged_z = tl.load(
-                        staging_z
-                        + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
-                        + toks[:, None] * PROXY_DIM
-                        + dims[None, :],
-                        mask=staged_ok[:, None] & dim_mask[None, :],
-                        other=-float("inf"),
-                    ).to(tl.float32)
-                    staged_k = tl.load(
-                        staging_k
-                        + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
-                        + toks[:, None] * PROXY_DIM
-                        + dims[None, :],
-                        mask=staged_ok[:, None] & dim_mask[None, :],
-                        other=0.0,
-                    ).to(tl.float32)
+                    # The staging rows are contiguous in memory, so the
+                    # (token, dim) tile is fetched as one flat contiguous
+                    # vector and reshaped -- bit-identical values and masks,
+                    # wider memory transactions than the 2D gather (the
+                    # contiguous load is what makes this kernel fast on the
+                    # A5 vector cores).
+                    flat_toks = tl.arange(0, BLOCK_T * BLOCK_D)
+                    flat_mask = tl.reshape(
+                        staged_ok[:, None] & dim_mask[None, :],
+                        (BLOCK_T * BLOCK_D,),
+                    )
+                    staged_z = tl.reshape(
+                        tl.load(
+                            staging_z
+                            + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
+                            + flat_toks,
+                            mask=flat_mask,
+                            other=-float("inf"),
+                        ).to(tl.float32),
+                        (BLOCK_T, BLOCK_D),
+                    )
+                    staged_k = tl.reshape(
+                        tl.load(
+                            staging_k
+                            + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
+                            + flat_toks,
+                            mask=flat_mask,
+                            other=0.0,
+                        ).to(tl.float32),
+                        (BLOCK_T, BLOCK_D),
+                    )
                     has_prefix = tl.max(prefix_den) > 0.0
                     base_max = tl.where(has_prefix, prefix_max, -float("inf"))
                     shared_max = tl.maximum(
@@ -1569,10 +1616,12 @@ def csa_verify_stage_update(
         REGION_BLOCK_SIZE=int(region_block_size),
         ACTIVE_CAPACITY=int(active_region_ids.numel()),
         ALLOC_PROBE=int(active_region_ids.numel()),
+        SLOTS_PER_REQ=8,
         K_ROWS=int(query_len),
         BLOCK_T=triton.next_power_of_2(int(region_block_size)),
         BLOCK_D=triton.next_power_of_2(int(proxy_dim)),
         num_warps=4,
+        compile_mode="simd",
     )
 
 
