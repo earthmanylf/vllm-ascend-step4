@@ -44,6 +44,124 @@ _QUANT_NONE = 0
 _SOFTMAX_PRECISION_FP32 = 1
 
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
+_TRITON_DEVICE_TYPES = ("cuda", "npu", "xpu")
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _append_current_region_kernel(
+        ids_ptr,
+        positions_ptr,
+        wide_ptr,
+        counts_ptr,
+        tokens,
+        region_size,
+        topk: tl.constexpr,
+        block_k: tl.constexpr,
+        block_t: tl.constexpr,
+    ):
+        """Pack ``block_t`` rows of one group, streaming ``topk`` in chunks."""
+        group = tl.program_id(0)
+        tile = tl.program_id(1)
+        row = tile * block_t + tl.arange(0, block_t)
+        row_mask = row < tokens
+        rows = group * tokens + row
+
+        live = tl.zeros((block_t,), dtype=tl.int32)
+        for k0 in range(0, topk, block_k):
+            col = k0 + tl.arange(0, block_k)
+            mask = row_mask[:, None] & (col < topk)[None, :]
+            ids = tl.load(
+                ids_ptr + rows[:, None] * topk + col[None, :],
+                mask=mask,
+                other=-1,
+            )
+            live += tl.sum((ids != -1).to(tl.int32), axis=1)
+            tl.store(
+                wide_ptr + rows[:, None] * (topk + 1) + col[None, :],
+                ids,
+                mask=mask,
+            )
+
+        pad = tl.full((block_t,), -1, dtype=tl.int32)
+        tl.store(wide_ptr + rows * (topk + 1) + topk, pad, mask=row_mask)
+
+        positions = tl.load(positions_ptr + row, mask=row_mask, other=0)
+        current = (positions // region_size).to(tl.int32)
+        slot = tl.minimum(live, topk)
+        tl.store(wide_ptr + rows * (topk + 1) + slot, current, mask=row_mask)
+
+        tl.store(counts_ptr + rows, live + 1, mask=row_mask)
+
+
+def _append_current_region_torch(
+    ids: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    groups: int,
+    region_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference implementation used for CPU tensors."""
+    rows, topk = ids.shape
+    tokens = rows // groups
+    ids3 = ids.view(groups, tokens, topk)
+    counts = (ids3 != -1).sum(dim=-1, dtype=torch.int32)
+    wide = torch.cat(
+        [
+            ids3,
+            torch.full(
+                (groups, tokens, 1), -1, device=ids.device, dtype=ids.dtype
+            ),
+        ],
+        dim=-1,
+    )
+    current = (positions.to(torch.int32) // region_size).view(1, tokens, 1)
+    slot = counts.clamp(max=topk).to(torch.int64).unsqueeze(-1)
+    wide.scatter_(-1, slot, current.expand(groups, tokens, 1))
+    return wide, counts + 1
+
+
+def _append_current_region_triton(
+    ids: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    groups: int,
+    region_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch the fused Triton pack kernel on device tensors."""
+    rows, topk = ids.shape
+    tokens = rows // groups
+    wide = torch.empty(
+        (groups, tokens, topk + 1), device=ids.device, dtype=ids.dtype
+    )
+    counts = torch.empty(
+        (groups, tokens), device=ids.device, dtype=torch.int32
+    )
+    block_k = triton.next_power_of_2(min(topk, 512))
+    block_t = max(1, min(64, 8192 // block_k))
+    grid = (groups, triton.cdiv(tokens, block_t))
+    _append_current_region_kernel[grid](
+        ids,
+        positions,
+        wide,
+        counts,
+        tokens,
+        region_size,
+        topk=topk,
+        block_k=block_k,
+        block_t=block_t,
+    )
+    return wide, counts
+
+
 def _append_current_region(
     ids: torch.Tensor,
     positions: torch.Tensor,
@@ -62,23 +180,13 @@ def _append_current_region(
 
     Returns ``(idx [G, T, topk + 1], counts [G, T])`` ready for the operator.
     """
-    rows, topk = ids.shape
-    tokens = rows // groups
-    ids3 = ids.view(groups, tokens, topk)
-    counts = (ids3 != -1).sum(dim=-1, dtype=torch.int32)
-    wide = torch.cat(
-        [
-            ids3,
-            torch.full(
-                (groups, tokens, 1), -1, device=ids.device, dtype=ids.dtype
-            ),
-        ],
-        dim=-1,
+    if _HAS_TRITON and ids.device.type in _TRITON_DEVICE_TYPES:
+        return _append_current_region_triton(
+            ids, positions, groups=groups, region_size=region_size
+        )
+    return _append_current_region_torch(
+        ids, positions, groups=groups, region_size=region_size
     )
-    current = (positions.to(torch.int32) // region_size).view(1, tokens, 1)
-    slot = counts.clamp(max=topk).to(torch.int64).unsqueeze(-1)
-    wide.scatter_(-1, slot, current.expand(groups, tokens, 1))
-    return wide, counts + 1
 
 
 def gbsa_sparse_attention(
