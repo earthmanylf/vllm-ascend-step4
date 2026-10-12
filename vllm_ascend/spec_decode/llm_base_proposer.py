@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
 import inspect as _inspect
-import os as _os
-
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
@@ -13,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
@@ -1641,6 +1640,66 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
 
+    def _prepend_mtp_prefix_replay(self, replay, token_ids, positions, hidden_states, token_indices, cad):
+        """Replay only draft-cache tails; the target forward has already finished."""
+        assert self.runner is not None
+        if positions.ndim != 1 or not hasattr(self, "set_per_group_attn_metadata"):
+            raise RuntimeError("MTP prefix replay requires independent cache groups and one-dimensional positions.")
+        query_starts = cad.query_start_loc_cpu.tolist()
+        seq_lens_cpu = cad.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = cad.seq_lens.cpu()
+        ids, pos, hidden, new_starts, offsets = [], [], [], [0], []
+        added = 0
+        for index, request_id in enumerate(self.runner.input_batch.req_ids):
+            begin, end = query_starts[index : index + 2]
+            prefix = replay.get(request_id)
+            if prefix is not None:
+                if end - begin != 1 or prefix["boundary"] + 1 != int(seq_lens_cpu[index]):
+                    raise RuntimeError("MTP prefix replay does not match the target's one-token handoff.")
+                dtype = getattr(torch, prefix["dtype"].split(".")[-1])
+                if dtype != hidden_states.dtype or prefix["width"] != hidden_states.shape[-1]:
+                    raise RuntimeError("MTP prefix replay hidden-state layout mismatch.")
+                rows = len(prefix["positions"])
+                ids.append(torch.tensor(prefix["tokens"], dtype=token_ids.dtype, device=token_ids.device))
+                pos.append(torch.tensor(prefix["positions"], dtype=positions.dtype, device=positions.device))
+                hidden.append(
+                    torch.frombuffer(bytearray(prefix["hidden"]), dtype=dtype)
+                    .view(rows, prefix["width"])
+                    .to(hidden_states.device)
+                )
+                added += rows
+            ids.append(token_ids[begin:end])
+            pos.append(positions[begin:end])
+            hidden.append(hidden_states[begin:end])
+            offsets.append(added)
+            new_starts.append(end + added)
+        token_ids, positions, hidden_states = torch.cat(ids), torch.cat(pos), torch.cat(hidden)
+        if token_indices is None:
+            token_indices = cad.query_start_loc[1:] - 1
+        token_indices = token_indices + torch.tensor(offsets, dtype=token_indices.dtype, device=token_indices.device)
+        cad = copy.copy(cad)
+        if cad.seq_lens_cpu is None:
+            cad.seq_lens_cpu = seq_lens_cpu
+        cad._seq_lens_cpu = seq_lens_cpu
+        cad.query_start_loc_cpu = torch.tensor(new_starts, dtype=cad.query_start_loc_cpu.dtype)
+        cad.query_start_loc = cad.query_start_loc_cpu.to(positions.device)
+        cad._num_computed_tokens_cpu = None
+        cad.num_actual_tokens = token_ids.shape[0]
+        cad.num_input_tokens = token_ids.shape[0]
+        cad.max_query_len = max(b - a for a, b in zip(new_starts, new_starts[1:]))
+        for group in self.draft_attn_groups:
+            table = self.runner.input_batch.block_table[group.kv_cache_group_id]
+            table.compute_slot_mapping(cad.num_reqs, cad.query_start_loc, positions)
+            self.set_per_group_attn_metadata(
+                group.kv_cache_group_id,
+                table.get_device_tensor()[: cad.num_reqs],
+                table.slot_mapping.gpu[: cad.num_actual_tokens],
+            )
+        cad.slot_mapping = self._per_group_slot_mappings[self.draft_attn_groups[0].kv_cache_group_id]
+        logger.info("Replayed MTP prefix inputs for %d requests: extra_draft_rows=%d", len(replay), added)
+        return token_ids, positions, hidden_states, token_indices, cad
+
     def set_inputs_first_pass(
         self,
         target_token_ids: torch.Tensor,
@@ -1655,6 +1714,33 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_prefill_reqs=0,
         num_decode_reqs=0,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata, tuple[Any, Any] | None]:
+        if self.method == "mtp" and has_kv_transfer_group():
+            prepare_handoff = getattr(get_kv_transfer_group(), "prepare_prefill_draft_tokens", None)
+            if prepare_handoff is not None:
+                assert self.runner is not None
+                next_token_ids = prepare_handoff(
+                    self.runner.input_batch.req_ids,
+                    cad,
+                    next_token_ids,
+                    target_token_ids,
+                    target_positions,
+                    target_hidden_states,
+                )
+            take_replay = getattr(get_kv_transfer_group(), "take_mtp_prefix_replay", None)
+            if take_replay is not None:
+                replay = take_replay(self.runner.input_batch.req_ids)
+                if replay:
+                    target_token_ids, target_positions, target_hidden_states, token_indices_to_sample, cad = (
+                        self._prepend_mtp_prefix_replay(
+                            replay,
+                            target_token_ids,
+                            target_positions,
+                            target_hidden_states,
+                            token_indices_to_sample,
+                            cad,
+                        )
+                    )
+
         if not self.needs_extra_input_slots:
             # Default EAGLE pathway: no reshaping of input tensors needed.
             # Simply rotate the input ids and leave the positions unchanged,

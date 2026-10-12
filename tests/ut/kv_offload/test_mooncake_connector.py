@@ -2,11 +2,13 @@ import os
 import queue
 import socket
 import sys
+import tempfile
 import threading
 import time
 import types
 import unittest
 from collections import OrderedDict, defaultdict, deque
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import RequestStatus
@@ -1118,6 +1121,40 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertEqual(len(call_args[1]), len(call_args[3]))
         mock_get_meta.assert_not_called()
 
+    def test_snapshot_pulls_follow_pp_owner_and_merge_disjoint_stages(self):
+        names = ["model.layers.0.attn", "model.layers.1.attn"]
+        spec = {"kv_cache_spec_type": "FullAttentionSpec", "layer_names": names}
+        self.thread.kv_group2layeridx = {0: (spec, [0, 1])}
+        self.thread._prefill_pp_size = 2
+        self.thread.pp_layer_indices = {0: (0, 1), 1: (1, 2)}
+        self.thread.snapshot_layers = {name: (MagicMock(), 0) for name in names}
+        self.thread.kv_caches_base_addr["local_engine"][5555] = [[0x1000], [0x2000]]
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000], [0x4000]]}
+        self.thread.block_len_per_addr = [[1024], [1024]]
+        self.thread.block_stride_per_addr = [[1024], [1024]]
+        self.thread.remote_block_stride_per_addr["remote_engine"][6666] = [[1024], [1024]]
+        self.thread.remote_block_size_scale["remote_engine"] = {6666: [[1], [1]]}
+        request = dict(self.test_req, snapshot_block_ids=([1, 2],), snapshot_num_tokens=7)
+        with patch.object(self.thread, "_get_remote_snapshots") as get_snapshots:
+            for stage, name in enumerate(names):
+                request["remote_host"] = f"stage-{stage}"
+                request["group_pulls"] = [GroupPull(0, 0, 1, prefill_pp_rank=stage)]
+                get_snapshots.return_value = {name: name.encode()}
+                self.thread._transfer_kv_cache_all_groups(request)
+                get_snapshots.assert_called_with(f"stage-{stage}", 6666, "req1", [name])
+            self.assertEqual(set(self.thread.pending_snapshots["req1"]), set(names))
+            with self.assertRaisesRegex(RuntimeError, "Duplicate side-storage"):
+                self.thread._transfer_kv_cache_all_groups(request)
+
+    def test_pp_owner_filter_places_mtp_only_on_last_stage(self):
+        self.thread._prefill_pp_size = 2
+        self.thread.pp_layer_indices = {0: (0, 2), 1: (2, 4)}
+        self.thread.vllm_config.speculative_config = types.SimpleNamespace(method="mtp")
+        self.thread.num_draft_layers = 3
+        spec = {"layer_names": ["model.layers.0.attn"]}
+        self.assertEqual(self.thread._get_pp_layer_indices(list(range(7)), 0, spec), [0, 1])
+        self.assertEqual(self.thread._get_pp_layer_indices(list(range(7)), 1, spec), [2, 3, 4, 5, 6])
+
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_mamba_uses_normalized_prompt_state_block(self, mock_get_meta):
         # Pure metadata/address arithmetic: no NPU tensor or torch.npu call.
@@ -1686,7 +1723,7 @@ class MockRequest:
 class MockKVCacheGroup:
     def __init__(self, layer_names=None, kv_cache_spec=None):
         self.layer_names = layer_names or ["model.layers.0.self_attn"]
-        self.kv_cache_spec = kv_cache_spec or MagicMock()
+        self.kv_cache_spec = kv_cache_spec or MagicMock(remote_decode_recompute_tokens=0)
 
 
 class MockKVCacheConfig:
@@ -2047,6 +2084,146 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
             kv_transfer_params={"do_remote_decode": True},
             status=RequestStatus.FINISHED_LENGTH_CAPPED,
         )
+
+    def test_model_declared_remote_decode_suffix(self):
+        self.scheduler.remote_decode_recompute_tokens = 1
+        self.scheduler.need_truncate = True
+        self.assertEqual(self.scheduler._state_prefill_token_count(10), 9)
+        request = types.SimpleNamespace(
+            kv_transfer_params={"do_remote_decode": True},
+            num_prompt_tokens=10,
+            prompt_token_ids=list(range(10)),
+            prompt_embeds=None,
+            _all_token_ids=list(range(10)),
+            max_tokens=8,
+            block_hashes=["stale"],
+            update_block_hashes=MagicMock(),
+        )
+        self.scheduler._truncate_request_for_prefill(request)
+        self.assertEqual(request.prompt_token_ids, list(range(9)))
+        self.assertEqual(request.num_prompt_tokens, 9)
+        self.assertEqual(request.max_tokens, 1)
+        self.assertEqual(request.block_hashes, [])
+        request.update_block_hashes.assert_called_once()
+
+    def test_snapshot_remote_replay_contract_preserves_original_model_spec(self):
+        config = MockVllmConfig()
+        config.cache_config.enable_prefix_caching = False
+        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=16, dtype=torch.float16).with_side_storage(
+            extra_budget_page_size_bytes=4096, prefix_cache_recompute_tokens=16
+        )
+        groups = MockKVCacheConfig([MockKVCacheGroup(kv_cache_spec=spec)])
+        scheduler = MooncakeConnectorScheduler(config, "snapshot", groups)
+        self.assertTrue(scheduler.requires_summary_snapshots)
+        self.assertEqual(groups.kv_cache_groups[0].kv_cache_spec.prefix_cache_recompute_tokens, 0)
+        self.assertEqual(spec.prefix_cache_recompute_tokens, 16)
+        self.assertEqual(scheduler._state_prefill_token_count(10), 9)
+
+    def test_summary_snapshot_prefill_pp_keeps_decode_pp_guard(self):
+        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=16, dtype=torch.float16).with_side_storage(
+            extra_budget_page_size_bytes=4096, prefix_cache_recompute_tokens=16
+        )
+        for role, pp_size, allowed in [("kv_producer", 2, True), ("kv_consumer", 1, True), ("kv_consumer", 2, False)]:
+            with self.subTest(role=role, pp_size=pp_size):
+                config = MockVllmConfig()
+                config.cache_config.enable_prefix_caching = False
+                config.kv_transfer_config.kv_role = role
+                config.parallel_config.pipeline_parallel_size = pp_size
+                groups = MockKVCacheConfig([MockKVCacheGroup(kv_cache_spec=spec)])
+                if allowed:
+                    scheduler = MooncakeConnectorScheduler(config, "pipeline", groups)
+                    self.assertEqual(scheduler._state_prefill_token_count(10), 9)
+                else:
+                    with self.assertRaisesRegex(ValueError, "decode PP=1"):
+                        MooncakeConnectorScheduler(config, "pipeline", groups)
+
+    def test_mtp_prefill_handoff_preserves_known_prompt_suffix(self):
+        self.scheduler.vllm_config.speculative_config = types.SimpleNamespace(method="mtp")
+        self.scheduler.remote_decode_recompute_tokens = 1
+        self.scheduler.need_truncate = True
+        request = types.SimpleNamespace(
+            request_id="handoff",
+            kv_transfer_params={"do_remote_decode": True},
+            num_prompt_tokens=8,
+            prompt_token_ids=list(range(8)),
+            prompt_embeds=None,
+            _all_token_ids=list(range(8)),
+            max_tokens=1,
+            block_hashes=[],
+            update_block_hashes=MagicMock(),
+        )
+        self.scheduler._truncate_request_for_prefill(request)
+        self.assertEqual(self.scheduler._prefill_handoff_tokens, {"handoff": (7, 7)})
+        self.scheduler._truncate_request_for_prefill(request)
+        self.assertEqual(request.prompt_token_ids, list(range(7)))
+
+    def test_prepare_prefill_draft_tokens_only_overrides_final_p_chunk(self):
+        connector = MooncakeConnector.__new__(MooncakeConnector)
+        connector.connector_worker = types.SimpleNamespace(
+            prefill_handoff_tokens={"p": (7, 7)}, mtp_prefix_adapter=None
+        )
+        sampled = torch.tensor([264, 1234])
+        partial = connector.prepare_prefill_draft_tokens(
+            ["p", "d"], types.SimpleNamespace(seq_lens_cpu=torch.tensor([4, 8])), sampled
+        )
+        self.assertIs(partial, sampled)
+        final = connector.prepare_prefill_draft_tokens(
+            ["p", "d"], types.SimpleNamespace(seq_lens_cpu=torch.tensor([7, 8])), sampled
+        )
+        self.assertEqual(final.tolist(), [7, 1234])
+        self.assertEqual(sampled.tolist(), [264, 1234])
+        final_async = connector.prepare_prefill_draft_tokens(
+            ["p", "d"], types.SimpleNamespace(seq_lens_cpu=None, seq_lens=torch.tensor([7, 8])), sampled
+        )
+        self.assertEqual(final_async.tolist(), [7, 1234])
+
+    def test_pipeline_snapshot_prefill_fences_only_final_chunk_and_resets_on_preemption(self):
+        self.scheduler.vllm_config.parallel_config.pipeline_parallel_size = 2
+        self.scheduler.requires_summary_snapshots = True
+        self.scheduler.need_truncate = True
+        self.scheduler.remote_decode_recompute_tokens = 1
+        request = types.SimpleNamespace(
+            request_id="handoff",
+            kv_transfer_params={"do_remote_decode": True},
+            num_prompt_tokens=8,
+            prompt_token_ids=list(range(8)),
+            prompt_embeds=None,
+            _all_token_ids=list(range(8)),
+            max_tokens=1,
+            block_hashes=[],
+            update_block_hashes=lambda: None,
+            num_computed_tokens=0,
+            next_decode_eligible_step=0,
+            status=RequestStatus.FINISHED_ABORTED,
+        )
+        self.scheduler._truncate_request_for_prefill(request)
+        output = types.SimpleNamespace(preempted_req_ids=set(), num_scheduled_tokens={"handoff": 4})
+        self.scheduler.build_connector_meta(output)
+        self.assertEqual(request.next_decode_eligible_step, 0, "intermediate chunks must fill the pipeline")
+        request.num_computed_tokens = 4
+        output.num_scheduled_tokens = {"handoff": 3}
+        self.scheduler.build_connector_meta(output)
+        self.assertGreater(request.next_decode_eligible_step, 100, "P must not queue decode past its handoff")
+        request.num_computed_tokens = 0
+        output.preempted_req_ids = {"handoff"}
+        output.num_scheduled_tokens = {"handoff": 2}
+        self.scheduler.build_connector_meta(output)
+        self.assertEqual(request.next_decode_eligible_step, 0, "preemption must permit prompt replay")
+        request.kv_transfer_params = None
+        self.scheduler.request_finished(request, tuple())
+        self.assertNotIn("handoff", self.scheduler._pipeline_prefill_requests)
+
+    def test_mtp_transfer_partition_covers_separate_cache_layers(self):
+        receiver = KVCacheRecvingThread.__new__(KVCacheRecvingThread)
+        receiver.num_layers = 92
+        receiver.kv_group2layeridx = {
+            0: ({"layer_names": ["model.layers.0.attn", "model.layers.92.mtp_block.attn"]}, [0, 92]),
+            1: ({"layer_names": ["model.layers.93.mtp_block.attn"]}, [93]),
+            2: ({"layer_names": ["model.layers.94.mtp_block.attn"]}, [94]),
+        }
+        self.assertEqual(receiver._get_num_mtp_cache_layers(), 3)
+        receiver.kv_group2layeridx = {0: receiver.kv_group2layeridx[0]}
+        self.assertEqual(receiver._get_num_mtp_cache_layers(), 1)
 
     def test_get_num_new_matched_tokens_no_remote_prefill(self):
         request = MockRequest("req1")
@@ -3656,6 +3833,50 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             worker._get_remote_host_info_by_port(30008, 30015, "localhost", "remote_engine", remote_mapping),
             ("host-15", "engine-15"),
         )
+
+    def test_snapshot_pp_endpoint_uses_advertised_port_not_decode_base(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.vllm_config = self.vllm_config
+        worker.vllm_config.kv_transfer_config.kv_port = 30004
+        worker._prefill_pp_size = 2
+        worker.snapshot_layers = {"owner": object()}
+        mapping = {
+            "0": {"host": "p-stage0", "engine_id": "p", "handshake_port": 30000},
+            "4": {"host": "p-stage1", "engine_id": "p", "handshake_port": 30004},
+        }
+        self.assertEqual(
+            worker._get_remote_host_info_by_port(30000, 30004, "p-stage0", "p", mapping),
+            ("p-stage1", "p"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "Missing P pipeline endpoint"):
+            worker._get_remote_host_info_by_port(30000, 30005, "p-stage0", "p", mapping)
+
+    def test_snapshot_audit_matches_compact_swa_tail_to_full_decode_table(self):
+        import json
+
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.vllm_config = self.vllm_config
+        worker.tp_rank = worker.pp_rank = 0
+        worker.side_channel_host = "localhost"
+        worker.handshake_port = 30000
+        worker.snapshot_layers = {}
+        worker._snapshot_audit_groups = {"owner": 0}
+        worker.kv_caches = {"owner": torch.arange(128, dtype=torch.uint8).view(4, 16, 1, 2)}
+        worker._get_layer_spec = MagicMock(
+            return_value=SlidingWindowSpec(
+                block_size=16, num_kv_heads=1, head_size=2, dtype=torch.uint8, sliding_window=32
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            worker._snapshot_audit_dir = directory
+            worker._audit_snapshot_handoff("send", "request", ([1, 2, 3],), 58)
+            worker._audit_snapshot_handoff("receive", "request", ([0, 1, 2, 3],), 58)
+            send = json.loads(next((Path(directory) / "send").glob("*.json")).read_text())
+            receive = json.loads(next((Path(directory) / "receive").glob("*.json")).read_text())
+            self.assertEqual(send["kv"], receive["kv"])
+            pages = send["kv"]["owner"][0]["pages"]
+            self.assertEqual([page["logical"] for page in pages], [1, 2, 3])
+            self.assertEqual([page["count"] for page in pages], [16, 16, 10])
 
     def test_get_sfa_replicated_indexer_block_ids_uses_full_blocks_for_prefix(self):
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)

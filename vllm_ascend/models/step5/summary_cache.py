@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.models.step5.sparse_summary_cache import (
     Step5SparseSummaryCache,
@@ -206,7 +205,7 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
         owner layer holds ``(k_cache, v_cache)`` with per-tensor shape
         ``(num_blocks, block_size, num_kv_heads, head_size)``.
         """
-        from vllm.distributed.kv_transfer import has_kv_transfer_group
+        from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 
         if has_kv_transfer_group():
             from vllm.config import get_current_vllm_config
@@ -216,7 +215,10 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
                 and _cfg.kv_transfer_config.kv_connector
                 in ("DecodeBenchConnector", "PreFilledDecodeBenchConnector")
             )
-            if not _is_decode_bench:
+            supports_snapshot = bool(
+                getattr(get_kv_transfer_group(), "supports_kv_cache_side_storage_snapshots", False)
+            )
+            if not (_is_decode_bench or supports_snapshot):
                 raise RuntimeError(
                     "Step5 DSA sparse summary side storage is not compatible with "
                     "v1 KV transfer/offload yet. Disable kv_transfer_config for "

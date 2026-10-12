@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import hashlib
+import json
 import logging
 import math
 import os
@@ -13,7 +14,8 @@ import time
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import msgspec
@@ -49,6 +51,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -85,6 +88,7 @@ if TYPE_CHECKING:
 # isort: on
 
 GET_META_MSG = b"get_meta_msg"
+GET_SNAPSHOT_MSG = b"get_snapshot_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
 
 
@@ -98,6 +102,255 @@ KV_CACHE_BUFFER_ALIGNMENT = 2 * 1024 * 1024
 class RemotePortInfo(TypedDict):
     num: int
     host: str
+
+
+_STATE_FIELDS = (
+    "_step5_csa_numerator_cache",
+    "_step5_csa_denominator_cache",
+    "_step5_csa_max_cache",
+    "_step5_csa_active_token_k",
+    "_step5_csa_active_token_z",
+    "_step5_csa_active_token_valid",
+)
+_SNAPSHOT_VERSION = 1
+
+
+class SummaryCacheSnapshotAdapter:
+    """Own CPU handoff payloads until the transport reports completion.
+
+    Slots remain node-local. A snapshot identifies regions by their logical
+    page and fragment, and preserves the numerical representation of every
+    accumulator and staged token. Storage is allocated only for live handoffs;
+    each pending request pins a KV page, bounding the pool by num_pages.
+    """
+
+    def __init__(self, cache):
+        self.cache = cache
+        self._payloads: dict[str, bytes] = {}
+        self._lock = threading.Lock()
+
+    def _layout(self) -> tuple:
+        cache = self.cache
+        return (
+            _SNAPSHOT_VERSION,
+            int(cache.page_size),
+            int(cache.region_block_size),
+            int(cache.proxy_dim),
+            str(cache._step5_csa_active_token_k.dtype),
+        )
+
+    def export(self, request_id: str, block_ids: list[int], num_tokens: int) -> None:
+        with self._lock:
+            if request_id in self._payloads:
+                return
+            if len(self._payloads) >= int(self.cache.num_pages):
+                raise RuntimeError("Step5 summary snapshot pool is full.")
+        cache = self.cache
+        pages = {int(block): index for index, block in enumerate(block_ids)}
+        fragments = int(cache.summaries_per_page)
+        slots, positions = [], []
+        # This synchronization happens only at the P handoff boundary, before
+        # the request's active slots are released.
+        for slot, region in enumerate(cache._step5_csa_active_region_ids.cpu().tolist()):
+            page, fragment = divmod(region, fragments)
+            if region < 0 or page not in pages:
+                continue
+            logical_page = pages[page]
+            start = logical_page * int(cache.page_size) + fragment * int(cache.region_block_size)
+            if start >= num_tokens:
+                continue
+            slots.append(slot)
+            positions.append((logical_page, fragment))
+        indices = torch.tensor(slots, device=cache.mean_cache.device, dtype=torch.long)
+        tensors = []
+        for name in _STATE_FIELDS:
+            rows = getattr(cache, name).index_select(0, indices).contiguous()
+            if name == "_step5_csa_active_token_valid":
+                for row, (page, fragment) in enumerate(positions):
+                    start = page * int(cache.page_size) + fragment * int(cache.region_block_size)
+                    valid_tokens = min(int(cache.region_block_size), num_tokens - start)
+                    rows[row, valid_tokens:] = 0
+            tensors.append(rows.view(torch.uint8).cpu().numpy().tobytes())
+        payload = msgspec.msgpack.encode(
+            {
+                "layout": self._layout(),
+                "num_tokens": num_tokens,
+                "positions": positions,
+                "tensors": tensors,
+                "mean_pages": len(block_ids),
+                "mean_sha256": self._mean_digest(block_ids),
+            }
+        )
+        with self._lock:
+            self._payloads[request_id] = payload
+
+    def get(self, request_id: str) -> bytes:
+        with self._lock:
+            return self._payloads[request_id]
+
+    def _mean_digest(self, block_ids):
+        mean = self.cache.mean_cache
+        indices = torch.tensor(block_ids, device=mean.device, dtype=torch.long)
+        data = mean.index_select(0, indices).contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        return hashlib.sha256(data).hexdigest()
+
+    def release(self, request_id: str) -> None:
+        with self._lock:
+            self._payloads.pop(request_id, None)
+
+    def restore(self, payload: bytes, block_ids: list[int], num_tokens: int) -> None:
+        state = msgspec.msgpack.decode(payload)
+        if tuple(state["layout"]) != self._layout() or state["num_tokens"] != num_tokens:
+            raise RuntimeError("Step5 summary snapshot layout or token boundary mismatch.")
+        positions = state["positions"]
+        if len(state["tensors"]) != len(_STATE_FIELDS):
+            raise RuntimeError("Incomplete Step5 summary snapshot.")
+        cache = self.cache
+        if self._mean_digest(block_ids[: state["mean_pages"]]) != state["mean_sha256"]:
+            raise RuntimeError("Transferred committed summary pages do not match the snapshot.")
+        fragments = int(cache.summaries_per_page)
+        regions = []
+        for page, fragment in positions:
+            if not 0 <= page < len(block_ids) or not 0 <= fragment < fragments:
+                raise RuntimeError("Step5 summary snapshot region is outside the received KV pages.")
+            regions.append(int(block_ids[page]) * fragments + fragment)
+        if len(set(regions)) != len(regions):
+            raise RuntimeError("Duplicate regions in Step5 summary snapshot.")
+        ids = cache._step5_csa_active_region_ids
+        free_slots = torch.nonzero(ids < 0).flatten()[: len(regions)]
+        if free_slots.numel() != len(regions):
+            raise RuntimeError("Step5 CSA active-slot pool is full during snapshot restore.")
+        # Validate every field before changing any live state.
+        rows = []
+        for name, data in zip(_STATE_FIELDS, state["tensors"]):
+            target = getattr(cache, name)
+            shape = (len(regions), *target.shape[1:])
+            elements = 1
+            for dim in shape:
+                elements *= dim
+            if len(data) != elements * target.element_size():
+                raise RuntimeError(f"Invalid Step5 snapshot tensor size: {name}")
+            if regions:
+                rows.append(torch.frombuffer(bytearray(data), dtype=target.dtype).view(shape).to(target.device))
+        if not regions:
+            return
+        region_ids = torch.tensor(regions, dtype=torch.int32, device=ids.device)
+        reverse = cache._step5_csa_active_slot_by_region
+        if torch.any(reverse[region_ids.long()] >= 0).item():
+            raise RuntimeError("Step5 snapshot would overwrite a live active region.")
+        for name, data in zip(_STATE_FIELDS, rows):
+            getattr(cache, name).index_copy_(0, free_slots, data)
+        ids.index_copy_(0, free_slots, region_ids)
+        reverse.index_copy_(0, region_ids.long(), free_slots.to(torch.int32))
+
+    get_kv_cache_side_storage_snapshot = get
+    restore_kv_cache_side_storage_snapshot = restore
+    release_kv_cache_side_storage_snapshot = release
+
+
+class MTPPrefixSnapshotAdapter:
+    """Transport the target hidden tail needed by independent MTP layers."""
+
+    def __init__(self, num_pages: int, tail_tokens: int):
+        self.num_pages = num_pages
+        self.tail_tokens = tail_tokens
+        self._payloads: dict[str, bytes] = {}
+        self._exported: set[str] = set()
+        self._received: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def get(self, request_id):
+        with self._lock:
+            if request_id not in self._exported:
+                raise KeyError(request_id)
+            return self._payloads[request_id]
+
+    def release(self, request_id):
+        with self._lock:
+            self._payloads.pop(request_id, None)
+            self._exported.discard(request_id)
+
+    get_kv_cache_side_storage_snapshot = get
+    release_kv_cache_side_storage_snapshot = release
+
+    def capture(self, request_id, boundary, token_ids, positions, hidden_states):
+        count = min(self.tail_tokens, positions.numel())
+        if count == 0:
+            return
+        positions_cpu = positions[-count:].cpu().tolist()
+        tokens_cpu = token_ids[-count:].cpu().tolist()
+        rows = hidden_states[-count:].contiguous()
+        width = rows.shape[-1]
+        row_bytes = width * rows.element_size()
+        data = rows.view(torch.uint8).cpu().numpy().tobytes()
+        with self._lock:
+            if request_id in self._exported:
+                return
+            if request_id not in self._payloads and len(self._payloads) >= self.num_pages:
+                raise RuntimeError("MTP prefix snapshot pool is full.")
+            previous = self._payloads.get(request_id)
+            if previous is not None:
+                old = msgspec.msgpack.decode(previous)
+                if old["width"] != width or old["dtype"] != str(rows.dtype):
+                    raise RuntimeError("MTP prefix snapshot layout changed between chunks.")
+                keep = sum(position < positions_cpu[0] for position in old["positions"])
+                positions_cpu = old["positions"][:keep] + positions_cpu
+                tokens_cpu = old["tokens"][:keep] + tokens_cpu
+                data = old["hidden"][: keep * row_bytes] + data
+            self._payloads[request_id] = msgspec.msgpack.encode(
+                {
+                    "version": _SNAPSHOT_VERSION,
+                    "boundary": boundary,
+                    "width": width,
+                    "dtype": str(rows.dtype),
+                    "positions": positions_cpu[-self.tail_tokens :],
+                    "tokens": tokens_cpu[-self.tail_tokens :],
+                    "hidden": data[-self.tail_tokens * row_bytes :],
+                }
+            )
+
+    def export(self, request_id, block_ids, num_tokens):
+        with self._lock:
+            payload = self._payloads.get(request_id)
+            if payload is None and num_tokens <= 1:
+                return
+            if payload is None:
+                raise RuntimeError(f"Missing MTP prefix snapshot for request {request_id}")
+            self._validate(msgspec.msgpack.decode(payload), num_tokens)
+            self._exported.add(request_id)
+
+    def _validate(self, state, boundary):
+        count = min(self.tail_tokens, boundary)
+        if (
+            state["version"] != _SNAPSHOT_VERSION
+            or state["boundary"] != boundary
+            or state["positions"] != list(range(boundary - count, boundary))
+            or len(state["tokens"]) != count
+        ):
+            raise RuntimeError(
+                "MTP prefix snapshot token boundary mismatch: "
+                f"expected={boundary}, captured={state['boundary']}, positions={state['positions']}."
+            )
+        sizes = {"torch.float32": 4, "torch.float16": 2, "torch.bfloat16": 2}
+        if state["dtype"] not in sizes or len(state["hidden"]) != count * state["width"] * sizes[state["dtype"]]:
+            raise RuntimeError("Invalid MTP prefix hidden-state snapshot.")
+
+    def restore_for_request(self, request_id, payload, num_tokens):
+        state = msgspec.msgpack.decode(payload)
+        self._validate(state, num_tokens)
+        with self._lock:
+            self._received[request_id] = state
+
+    def take_received(self, request_ids):
+        with self._lock:
+            return {
+                request_id: self._received.pop(request_id) for request_id in request_ids if request_id in self._received
+            }
+
+    def release_received(self, request_ids):
+        with self._lock:
+            for request_id in request_ids:
+                self._received.pop(request_id, None)
 
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
@@ -263,6 +516,7 @@ class KVCacheSendingThread(threading.Thread):
         ready_event: threading.Event,
         kv_caches: dict[str, Any],
         pcp_rank: int,
+        snapshot_layers: dict[str, Any] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingThread")
         self.tp_rank = tp_rank
@@ -279,6 +533,7 @@ class KVCacheSendingThread(threading.Thread):
         self.kv_caches = kv_caches
         self.pcp_rank = pcp_rank
         self.port_send_num: dict[str, int] = {}
+        self.snapshot_layers = snapshot_layers or {}
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -367,6 +622,17 @@ class KVCacheSendingThread(threading.Thread):
                 msg = decoder.decode(payload[0])
                 if msg[0] == GET_META_MSG:
                     sock.send_multipart((identity, b"", encoded_data))
+                elif msg[0] == GET_SNAPSHOT_MSG:
+                    request_id, names = msg[1], msg[2]
+                    try:
+                        snapshots = {
+                            name: self.snapshot_layers[name][0].get_kv_cache_side_storage_snapshot(request_id)
+                            for name in names
+                        }
+                        response = {"ready": True, "payloads": snapshots}
+                    except KeyError:
+                        response = {"ready": False}
+                    sock.send_multipart((identity, b"", encoder.encode(response)))
                 elif msg[0] == DONE_RECVING_MSG:
                     logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
                     request_id = msg[1]
@@ -434,6 +700,7 @@ class KVCacheRecvingThread(threading.Thread):
         prefill_pp_layer_partition: str | None = None,
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] | None = None,
         block_size_scale: list[list[int]] | None = None,
+        snapshot_layers: dict[str, Any] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -478,6 +745,9 @@ class KVCacheRecvingThread(threading.Thread):
             defaultdict(dict)
         )
         self.pending_reformat_lock = threading.Lock()
+        self.snapshot_layers = snapshot_layers or {}
+        self.pending_snapshots: dict[str, dict[str, tuple[bytes, list[int], int]]] = {}
+        self.pending_snapshots_lock = threading.Lock()
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         first_kv_cache = next(iter(self.kv_caches.values()))
@@ -547,8 +817,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.num_draft_layers = 0
         if self.vllm_config.speculative_config is not None:
             if self.vllm_config.speculative_config.method == "mtp":
-                # all MTP layer use the same kv cache layer, so only need to transfer once
-                self.num_draft_layers = 1
+                self.num_draft_layers = self._get_num_mtp_cache_layers()
             elif (
                 hasattr(self.vllm_config.speculative_config.draft_model_config, "hf_config")
                 and getattr(self.vllm_config.speculative_config.draft_model_config.hf_config, "num_hidden_layers", None)
@@ -557,6 +826,17 @@ class KVCacheRecvingThread(threading.Thread):
                 self.num_draft_layers = (
                     self.vllm_config.speculative_config.draft_model_config.hf_config.num_hidden_layers
                 )
+
+    def _get_num_mtp_cache_layers(self) -> int:
+        # Some predictors share one cache; others register separate layers.
+        # Use the actual transfer layout to extend the final PP partition.
+        indices = [
+            layer_idx
+            for spec, layer_indices in self.kv_group2layeridx.values()
+            for name, layer_idx in zip(spec.get("layer_names", []), layer_indices)
+            if "mtp" in name and ".index_cache" not in name
+        ]
+        return max(1, max(indices, default=self.num_layers) - self.num_layers + 1)
 
     def add_request(
         self,
@@ -575,6 +855,8 @@ class KVCacheRecvingThread(threading.Thread):
         shard_idx: int = 0,
         local_block_ids_replicate_k: BlockIds | None = None,
         remote_block_ids_replicate_k: BlockIds | None = None,
+        snapshot_block_ids: BlockIds = tuple(),
+        snapshot_num_tokens: int = 0,
     ):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
@@ -595,6 +877,8 @@ class KVCacheRecvingThread(threading.Thread):
             "all_task_done": all_task_done,
             "shard_idx": shard_idx,
             "remote_block_size": remote_block_size,
+            "snapshot_block_ids": snapshot_block_ids,
+            "snapshot_num_tokens": snapshot_num_tokens,
         }
         logger.debug("Adding request %s to the queue.Trans info:%s", request_id, trans_info)
         self.request_queue.put(trans_info)
@@ -779,6 +1063,17 @@ class KVCacheRecvingThread(threading.Thread):
                     remote_host_ = remote_port_send_num[remote_port]["host"]
                     self._send_done_recv_signal(request_id, remote_host_, remote_port, remote_port_send_num)
 
+    def _get_pp_layer_indices(
+        self, layer_indices: list[int], prefill_pp_rank: int, group_spec: dict[str, Any]
+    ) -> list[int]:
+        """Use the same source-stage ownership for KV and side snapshots."""
+        first_layer_index, end_layer_index = self.pp_layer_indices[prefill_pp_rank]
+        if self.vllm_config.speculative_config is not None and prefill_pp_rank == self._prefill_pp_size - 1:
+            end_layer_index += self.num_draft_layers
+        is_index_cache_plane = any(".index_cache" in name for name in group_spec.get("layer_names", []))
+        plane_base = self.index_cache_plane_base if is_index_cache_plane else 0
+        return [index for index in layer_indices if first_layer_index <= index - plane_base < end_layer_index]
+
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
         remote_request_id = req_meta["remote_request_id"]
@@ -830,20 +1125,6 @@ class KVCacheRecvingThread(threading.Thread):
                 local_block_ids_replicate_k[0],
             )
 
-        def pp_layer_indices(layer_indices: list[int], prefill_pp_rank: int, group_spec: dict[str, Any]) -> list[int]:
-            first_layer_index, end_layer_index = self.pp_layer_indices[prefill_pp_rank]
-            if self.vllm_config.speculative_config is not None and prefill_pp_rank == self._prefill_pp_size - 1:
-                end_layer_index += self.num_draft_layers
-            is_index_cache_plane = any(".index_cache" in name for name in group_spec.get("layer_names", []))
-
-            def in_partition(metadata_layer_idx: int) -> bool:
-                transformer_layer = (
-                    metadata_layer_idx - self.index_cache_plane_base if is_index_cache_plane else metadata_layer_idx
-                )
-                return first_layer_index <= transformer_layer < end_layer_index
-
-            return [layer_idx for layer_idx in layer_indices if in_partition(layer_idx)]
-
         use_transfer_group_block_ids = transfer_groups_need_independent_block_ids(
             self.kv_group2layeridx,
             self.block_size_scale,
@@ -870,7 +1151,7 @@ class KVCacheRecvingThread(threading.Thread):
             group_spec, layer_indices = self.kv_group2layeridx[group_idx]
             kv_cache_group_id = group_spec.get("kv_cache_group_id", group_idx)
             raw_layer_indices = layer_indices
-            layer_indices = pp_layer_indices(layer_indices, group_pull.prefill_pp_rank, group_spec)
+            layer_indices = self._get_pp_layer_indices(layer_indices, group_pull.prefill_pp_rank, group_spec)
 
             if not layer_indices:
                 continue
@@ -1038,6 +1319,50 @@ class KVCacheRecvingThread(threading.Thread):
                 ret,
             )
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+
+        snapshot_names: set[str] = set()
+        for pull in group_pulls:
+            spec, indices = self.kv_group2layeridx[pull.group_id]
+            owned_indices = set(self._get_pp_layer_indices(indices, pull.prefill_pp_rank, spec))
+            names = [
+                name
+                for name, index in zip(spec.get("layer_names", ()), indices)
+                if index in owned_indices and name in self.snapshot_layers
+            ]
+            if (
+                names
+                and pull.num_group_pulls != 1
+                and any(not isinstance(self.snapshot_layers[name][0], MTPPrefixSnapshotAdapter) for name in names)
+            ):
+                raise RuntimeError("Snapshot side storage requires one source shard per owner KV group.")
+            if pull.num_group_pulls != 1 and pull.remote_tp_offset != 0:
+                continue
+            snapshot_names.update(names)
+        if snapshot_names:
+            payloads = self._get_remote_snapshots(
+                remote_host, remote_handshake_port, remote_request_id, sorted(snapshot_names)
+            )
+            full_blocks = req_meta["snapshot_block_ids"]
+            staged = {
+                name: (
+                    payloads[name],
+                    list(full_blocks[self.snapshot_layers[name][1]]),
+                    req_meta["snapshot_num_tokens"],
+                )
+                for name in snapshot_names
+            }
+            with self.pending_snapshots_lock:
+                pending = self.pending_snapshots.setdefault(req_meta["request_id"], {})
+                duplicate = pending.keys() & staged.keys()
+                if duplicate:
+                    raise RuntimeError(f"Duplicate side-storage snapshot owners: {sorted(duplicate)}")
+                pending.update(staged)
+            logger.info(
+                "Received side-storage snapshots for request %s: layers=%d bytes=%d",
+                remote_request_id,
+                len(staged),
+                sum(len(payloads[name]) for name in snapshot_names),
+            )
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -1454,6 +1779,25 @@ class KVCacheRecvingThread(threading.Thread):
         )
         torch_npu.npu_scatter_pa_kv_cache(k_buffer, v_buffer, k_cache_layer, v_cache_layer, slot_mapping)
 
+    def _get_remote_snapshots(self, host: str, port: int, request_id: str, names: list[str]) -> dict[str, bytes]:
+        deadline = time.monotonic() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+        while time.monotonic() < deadline:
+            sock = self._get_remote_socket(host, port)
+            try:
+                ensure_zmq_send(sock, self.encoder.encode((GET_SNAPSHOT_MSG, request_id, names)), f"{host}:{port}")
+                response = msgspec.msgpack.decode(ensure_zmq_recv(sock, f"{host}:{port}"))
+            except Exception:
+                sock.close()
+                raise
+            else:
+                self._return_remote_socket(sock, host, port)
+            if response["ready"]:
+                if set(response["payloads"]) != set(names):
+                    raise RuntimeError("Incomplete remote side-storage snapshot response.")
+                return response["payloads"]
+            time.sleep(0.01)
+        raise RuntimeError(f"Timed out waiting for side-storage snapshot: {request_id}")
+
     def _get_remote_metadata(self, remote_host: str, remote_handshake_port: int) -> None:
         """Get the metadata from the remote host."""
         sock: zmq.Socket | None = None  # type: ignore
@@ -1566,6 +1910,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.requests: dict[str, ReqMeta] = {}
         self.requests_to_send: dict[str, float] = {}
+        self.snapshots_to_send: dict[str, tuple[BlockIds, int]] = {}
+        self.prefill_handoff_tokens: dict[str, tuple[int, int]] = {}
         self.reqs_in_batch: set[str] = set()
 
     def add_new_req(
@@ -1597,6 +1943,9 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
 
 
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
+    supports_kv_cache_side_storage_transfer = True
+    supports_kv_cache_side_storage_snapshots = True
+
     def __init__(  # type: ignore[misc]
         self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None
     ):
@@ -1621,6 +1970,78 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler._truncate_request_for_prefill(request)
+
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+        assert self.connector_worker is not None
+        assert isinstance(kv_connector_metadata, MooncakeConnectorMetadata)
+        self.connector_worker.prefill_handoff_tokens = kv_connector_metadata.prefill_handoff_tokens
+        if kv_connector_metadata.prefill_handoff_tokens:
+            logger.info(
+                "Received MTP prefill handoff boundaries: %s",
+                {request_id: value[1] for request_id, value in kv_connector_metadata.prefill_handoff_tokens.items()},
+            )
+        # The Ascend runner already invokes this hook before removing request
+        # state and zeroing reused pages. Preserve immutable transport copies
+        # here while the model's active slots still exist.
+        for request_id, (block_ids, num_tokens) in kv_connector_metadata.snapshots_to_send.items():
+            for adapter, group_id in self.connector_worker.snapshot_layers.values():
+                adapter.export(request_id, list(block_ids[group_id]), num_tokens)
+            self.connector_worker._audit_snapshot_handoff("send", request_id, block_ids, num_tokens)
+
+    def prepare_prefill_draft_tokens(
+        self,
+        request_ids,
+        attention_metadata,
+        next_token_ids,
+        target_token_ids=None,
+        target_positions=None,
+        target_hidden_states=None,
+    ):
+        """Seed the P draft prefix with the known next prompt token.
+
+        P's sampled token is an ignored handoff placeholder. MTP shifts it
+        into the final prompt position, so use the original prompt suffix
+        when constructing draft KV. Partial prefill chunks keep their own
+        next-token input; D keeps its sampled output unchanged.
+        """
+        assert self.connector_worker is not None
+        handoffs = self.connector_worker.prefill_handoff_tokens
+        if not handoffs:
+            return next_token_ids
+        seq_lens_cpu = attention_metadata.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = attention_metadata.seq_lens.cpu()
+        overrides = []
+        for index, request_id in enumerate(request_ids):
+            handoff = handoffs.get(request_id)
+            if handoff is not None and self.connector_worker.mtp_prefix_adapter is not None:
+                begin = int(attention_metadata.query_start_loc_cpu[index])
+                end = int(attention_metadata.query_start_loc_cpu[index + 1])
+                self.connector_worker.mtp_prefix_adapter.capture(
+                    request_id,
+                    handoff[1],
+                    target_token_ids[begin:end],
+                    target_positions[begin:end],
+                    target_hidden_states[begin:end],
+                )
+            if handoff is not None and int(seq_lens_cpu[index]) == handoff[1]:
+                overrides.append((index, handoff[0]))
+        if not overrides:
+            return next_token_ids
+        result = next_token_ids.clone()
+        for index, token_id in overrides:
+            result[index] = token_id
+        logger.info("Prepared MTP prefill handoff for requests: %s", [request_ids[index] for index, _ in overrides])
+        return result
+
+    def take_mtp_prefix_replay(self, request_ids):
+        assert self.connector_worker is not None
+        adapter = self.connector_worker.mtp_prefix_adapter
+        return {} if adapter is None else adapter.take_received(request_ids)
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         assert self.connector_scheduler is not None
@@ -1659,6 +2080,8 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
+        if self.connector_worker.mtp_prefix_adapter is not None:
+            self.connector_worker.mtp_prefix_adapter.release_received(finished_req_ids)
         return self.connector_worker.get_finished()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -1754,6 +2177,9 @@ class MooncakeConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, BlockIds, BlockIds, int]] = {}
         self._reqs_need_send: dict[str, float] = {}
+        self._snapshots_need_send: dict[str, tuple[BlockIds, int]] = {}
+        self._prefill_handoff_tokens: dict[str, tuple[int, int]] = {}
+        self._pipeline_prefill_requests: dict[str, Request] = {}
         self._reqs_in_batch: set[str] = set()
 
         # master-slave meta information for cross-nodes
@@ -1761,7 +2187,43 @@ class MooncakeConnectorScheduler:
         self.kv_cache_groups = kv_cache_config.kv_cache_groups
         self.use_compress = self._model_uses_compress()
         self.group_transfer_info = [self._get_group_transfer_info(group) for group in kv_cache_config.kv_cache_groups]
-        self.need_truncate = self.use_compress or any(info.is_state_group for info in self.group_transfer_info)
+        self.requires_summary_snapshots = any(
+            isinstance(group.kv_cache_spec, KVCacheSpec)
+            and group.kv_cache_spec.extra_budget_page_size_bytes > 0
+            and group.kv_cache_spec.prefix_cache_recompute_tokens > 0
+            for group in self.kv_cache_groups
+        )
+        if self.requires_summary_snapshots:
+            if vllm_config.cache_config.enable_prefix_caching:
+                raise ValueError("Summary snapshot P/D currently requires prefix caching to be disabled.")
+            if self.pcp_size * self.dcp_size != 1:
+                raise ValueError("Summary snapshot P/D requires PCP=DCP=1.")
+            if (
+                vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+                and vllm_config.parallel_config.pipeline_parallel_size != 1
+            ):
+                raise ValueError("Summary snapshot P/D currently requires decode PP=1.")
+            # The scheduler constructs its KVCacheManager after this connector.
+            # Change only its remote-serving replay contract; the model specs
+            # and the non-P/D local prefix-cache behavior stay as supplied.
+            for group in self.kv_cache_groups:
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    group.kv_cache_spec = replace(
+                        spec,
+                        kv_cache_specs={
+                            name: item.with_side_storage(prefix_cache_recompute_tokens=0)
+                            for name, item in spec.kv_cache_specs.items()
+                        },
+                    )
+                else:
+                    group.kv_cache_spec = spec.with_side_storage(prefix_cache_recompute_tokens=0)
+        self.remote_decode_recompute_tokens = int(
+            self.requires_summary_snapshots
+            or self.use_compress
+            or any(info.is_state_group for info in self.group_transfer_info)
+        )
+        self.need_truncate = self.remote_decode_recompute_tokens > 0
 
     def _model_uses_compress(self) -> bool:
         hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
@@ -1857,11 +2319,11 @@ class MooncakeConnectorScheduler:
         return tuple(transfer_block_ids)
 
     def _state_prefill_token_count(self, num_prompt_tokens: int) -> int:
-        """D-side only. Returns N-1 for Mamba models since the decoder
-        always recomputes the last token and must start from h(N-1)."""
-        if self.need_truncate and num_prompt_tokens > 1:
-            return num_prompt_tokens - 1
-        return num_prompt_tokens
+        """D-side count after the model-declared suffix is recomputed."""
+        return num_prompt_tokens - min(
+            self.remote_decode_recompute_tokens,
+            max(0, num_prompt_tokens - 1),
+        )
 
     def _truncate_request_for_prefill(self, request: "Request") -> None:
         """P-side only: drop the last prompt token so the prefiller computes
@@ -1873,21 +2335,37 @@ class MooncakeConnectorScheduler:
         params = request.kv_transfer_params
         if (
             params is not None
+            and params.get("do_remote_decode")
+            and self.need_truncate
             # Guard against repeated truncation after preemption/reschedule.
             and not params.get("_p_side_truncated")
             and request.num_prompt_tokens > 1
         ):
+            num_recompute = min(
+                self.remote_decode_recompute_tokens,
+                request.num_prompt_tokens - 1,
+            )
             if request.prompt_token_ids is not None:
-                request.prompt_token_ids.pop()
+                speculative = self.vllm_config.speculative_config
+                if speculative is not None and speculative.method == "mtp":
+                    self._prefill_handoff_tokens[request.request_id] = (
+                        request.prompt_token_ids[-num_recompute],
+                        request.num_prompt_tokens - num_recompute,
+                    )
+                del request.prompt_token_ids[-num_recompute:]
             elif request.prompt_embeds is not None:
-                request.prompt_embeds = request.prompt_embeds[:-1]
+                request.prompt_embeds = request.prompt_embeds[:-num_recompute]
             else:
                 return
 
-            request._all_token_ids.pop()
-            request.num_prompt_tokens -= 1
+            del request._all_token_ids[-num_recompute:]
+            request.num_prompt_tokens -= num_recompute
+            request.block_hashes.clear()
+            request.update_block_hashes()
             request.max_tokens = 1
             params["_p_side_truncated"] = True
+            if self.requires_summary_snapshots and self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+                self._pipeline_prefill_requests[request.request_id] = request
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         """
@@ -1962,6 +2440,21 @@ class MooncakeConnectorScheduler:
     ) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata()
 
+        # The scheduler invokes this before advancing computed-token counters.
+        # Fence only a completed P prompt while its one-token placeholder is
+        # in flight: a queued PP decode would mutate the state being handed off.
+        # Intermediate prefill chunks remain schedulable; cache ownership and
+        # release still belong to the scheduler/model.
+        if self._pipeline_prefill_requests:
+            for request_id in scheduler_output.preempted_req_ids or ():
+                request = self._pipeline_prefill_requests.get(request_id)
+                if request is not None:
+                    request.next_decode_eligible_step = 0
+            for request_id, count in scheduler_output.num_scheduled_tokens.items():
+                request = self._pipeline_prefill_requests.get(request_id)
+                if request is not None and request.num_computed_tokens + count >= request.num_prompt_tokens:
+                    request.next_decode_eligible_step = 1 << 60
+
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids, full_block_ids, num_external_tokens) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
@@ -1979,6 +2472,13 @@ class MooncakeConnectorScheduler:
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
         meta.requests_to_send = self._reqs_need_send
+        meta.snapshots_to_send = self._snapshots_need_send
+        meta.prefill_handoff_tokens = {
+            request_id: self._prefill_handoff_tokens[request_id]
+            for request_id in scheduler_output.num_scheduled_tokens
+            if request_id in self._prefill_handoff_tokens
+        }
+        self._snapshots_need_send = {}
         self._reqs_need_send = {}
         meta.reqs_in_batch = self._reqs_in_batch
         self._reqs_in_batch = set()
@@ -1999,6 +2499,9 @@ class MooncakeConnectorScheduler:
         logger.debug(
             "MooncakeConnector request_finished, request_status=%s, kv_transfer_params=%s", request.status, params
         )
+        self._prefill_handoff_tokens.pop(request.request_id, None)
+        if self._pipeline_prefill_requests.pop(request.request_id, None) is not None:
+            request.next_decode_eligible_step = 0
 
         if params is None:
             return False, None
@@ -2031,6 +2534,8 @@ class MooncakeConnectorScheduler:
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s", sum(computed_block_lens), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
+            if self.requires_summary_snapshots:
+                self._snapshots_need_send[request.request_id] = (computed_block_ids, len(request.prompt_token_ids))
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -2099,6 +2604,8 @@ class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
+        self.prefill_handoff_tokens: dict[str, tuple[int, int]] = {}
+        self.mtp_prefix_adapter: MTPPrefixSnapshotAdapter | None = None
         self._get_prefill_decode_size(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         if self._prefill_tp_size < self._decode_tp_size:
@@ -2120,6 +2627,10 @@ class MooncakeConnectorWorker:
         self.dp_size = vllm_config.parallel_config.data_parallel_size_local
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.kv_caches: dict[str, torch.Tensor] = {}
+        self.snapshot_layers: dict[str, Any] = {}
+        self._snapshot_receives: set[str] = set()
+        self._snapshot_audit_dir = vllm_config.kv_transfer_config.get_from_extra_config("snapshot_audit_dir", None)
+        self._snapshot_audit_receives: dict[str, tuple[str, BlockIds, int]] = {}
         self.side_channel_host = get_ip()
         self.pcp_size = get_pcp_group().world_size
         self.total_layers = vllm_config.model_config.get_total_num_hidden_layers()
@@ -2131,7 +2642,7 @@ class MooncakeConnectorWorker:
 
         self.max_device_id = self.tp_size * self.dp_size * self.pcp_size * self.pp_size
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-        self.num_key_value_heads = self.vllm_config.model_config.hf_text_config.num_key_value_heads
+        self.num_key_value_heads = self.vllm_config.model_config.get_total_num_kv_heads()
 
         # kv cache config
         self.kv_cache_config = kv_cache_config
@@ -2512,7 +3023,111 @@ class MooncakeConnectorWorker:
 
         return ptrs, lengths
 
+    def _audit_snapshot_handoff(self, direction, source_id, block_ids, num_tokens, snapshots=None):
+        """Opt-in byte audit of transferred pages and receiver-owned state."""
+        if not self._snapshot_audit_dir:
+            return
+        record = {
+            "direction": direction,
+            "source_id": source_id,
+            "rank": self.tp_rank,
+            "pp_rank": self.pp_rank,
+            "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
+            "host": self.side_channel_host,
+            "handshake_port": self.handshake_port,
+            "num_tokens": num_tokens,
+            "kv": {},
+            "snapshots": {},
+        }
+        for name, tensors in self.kv_caches.items():
+            group_id = self._snapshot_audit_groups[name]
+            spec = self._get_layer_spec(name)
+            page_size = int(spec.block_size)
+            prompt_pages = cdiv(num_tokens, page_size)
+            audit_blocks = block_ids[group_id][:prompt_pages]
+            # P sends a compact SWA tail, while D's full block table retains
+            # virtual prefix pages. Hash the same logical token range on both.
+            first_logical = (
+                max(0, prompt_pages - len(audit_blocks))
+                if direction == "send" and isinstance(spec, SlidingWindowSpec)
+                else 0
+            )
+            layers = []
+            for tensor in self._as_kv_cache_tuple(tensors):
+                pages = []
+                for logical, physical in enumerate(audit_blocks, start=first_logical):
+                    if physical == 0:
+                        continue
+                    count = min(page_size, num_tokens - logical * page_size)
+                    row = tensor[physical]
+                    if row.shape[0] == page_size:
+                        row = row[:count]
+                    elif name in self.snapshot_layers:
+                        adapter = self.snapshot_layers[name][0]
+                        if isinstance(adapter, SummaryCacheSnapshotAdapter):
+                            row = row[: count // int(adapter.cache.region_block_size)]
+                    raw = row.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                    pages.append(
+                        {
+                            "logical": logical,
+                            "count": count,
+                            "bytes": len(raw),
+                            "sha256": hashlib.sha256(raw).hexdigest(),
+                        }
+                    )
+                layers.append({"shape": list(tensor.shape[1:]), "dtype": str(tensor.dtype), "pages": pages})
+            record["kv"][name] = layers
+        for name, (adapter, group_id) in self.snapshot_layers.items():
+            payload = adapter.get(source_id) if snapshots is None else snapshots[name][0]
+            state = msgspec.msgpack.decode(payload)
+            detail = {"payload_sha256": hashlib.sha256(payload).hexdigest()}
+            if isinstance(adapter, SummaryCacheSnapshotAdapter):
+                regions = [
+                    int(block_ids[group_id][page]) * int(adapter.cache.summaries_per_page) + fragment
+                    for page, fragment in state["positions"]
+                ]
+                indices = torch.tensor(regions, device=adapter.cache.mean_cache.device, dtype=torch.long)
+                slots = adapter.cache._step5_csa_active_slot_by_region.index_select(0, indices).long()
+                detail["positions"] = state["positions"]
+                detail["fields"] = {}
+                for field, expected in zip(_STATE_FIELDS, state["tensors"]):
+                    rows = getattr(adapter.cache, field).index_select(0, slots).contiguous()
+                    raw = rows.view(torch.uint8).cpu().numpy().tobytes()
+                    detail["fields"][field] = {
+                        "expected": hashlib.sha256(expected).hexdigest(),
+                        "actual": hashlib.sha256(raw).hexdigest(),
+                    }
+            else:
+                detail["positions"] = state["positions"]
+                detail["hidden_sha256"] = hashlib.sha256(state["hidden"]).hexdigest()
+            record["snapshots"][name] = detail
+        directory = Path(self._snapshot_audit_dir) / direction
+        directory.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha256(source_id.encode()).hexdigest()[:24]
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        (directory / f"{key}-dp{dp_rank}-pp{self.pp_rank}-rank{self.tp_rank}.json").write_text(
+            json.dumps(record, indent=2)
+        )
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        owner_groups = {
+            name: group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for name in group.layer_names
+        }
+        self._snapshot_audit_groups = owner_groups
+        for layer in self.vllm_config.compilation_config.static_forward_context.values():
+            cache = getattr(layer, "_budget_only_cache", None)
+            # Discover the existing cache by its state capabilities, without a
+            # model_type branch or changes to the runner's KV registration.
+            if cache is None or not all(hasattr(cache, name) for name in _STATE_FIELDS):
+                continue
+            owner = layer.main_layer_name
+            if owner not in kv_caches:
+                raise RuntimeError(f"Summary snapshot owner KV layer is missing: {owner}")
+            tensors = self._as_kv_cache_tuple(kv_caches[owner])
+            kv_caches[owner] = (*tensors, layer._kv_cache)
+            self.snapshot_layers[owner] = (SummaryCacheSnapshotAdapter(cache), owner_groups[owner])
         """Register the KV Cache data."""
         self.use_mla = self.vllm_config.model_config.is_deepseek_mla
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config, "index_topk")
@@ -2524,8 +3139,25 @@ class MooncakeConnectorWorker:
         # Maps each KV cache group to its serialized group spec and physical
         # layer indices: {group_id: (group_spec, [layer_idx0, layer_idx1, ...])}.
         self.kv_group2layeridx = self._build_kv_group2layeridx()
+        mtp_layers = [
+            name
+            for group in self.kv_cache_config.kv_cache_groups
+            for name in group.layer_names
+            if "mtp" in name and ".index_cache" not in name
+        ]
+        if (
+            any(group.kv_cache_spec.extra_budget_page_size_bytes > 0 for group in self.kv_cache_config.kv_cache_groups)
+            and len(mtp_layers) > 1
+            and self.pp_rank == self.pp_size - 1
+            and self.vllm_config.speculative_config is not None
+            and self.vllm_config.speculative_config.method == "mtp"
+        ):
+            self.mtp_prefix_adapter = MTPPrefixSnapshotAdapter(self.num_blocks, len(mtp_layers) - 1)
+            owner = mtp_layers[0]
+            self.snapshot_layers[owner] = (self.mtp_prefix_adapter, owner_groups[owner])
         self._is_hma_required = self._is_hma_required or self._requires_group_aware_attention_transfer()
         has_mamba_group = self._has_mamba_group()
+        has_extra_layer_tensors = any(len(self._as_kv_cache_tuple(tensors)) > 2 for tensors in kv_caches.values())
         layer_name_to_idx = {
             layer_name: layer_idx
             for _, (group_spec, layer_indices) in self.kv_group2layeridx.items()
@@ -2565,13 +3197,13 @@ class MooncakeConnectorWorker:
         if has_mamba_group:
             ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
-        elif self.use_hybrid:
+        elif self.use_hybrid and not has_extra_layer_tensors:
             ptrs, lengths = self._get_registered_kv_tensor_buffers_hybrid(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         else:
-            # For normal attention / sparse-c8 KV cache, keep metadata at the
-            # logical tensor level but merge registration ranges by underlying
-            # storage to avoid exceeding the HCCL per-process region limit.
+            # Model-owned side storage may live outside the hybrid KV manager
+            # allocation. Register all storage while retaining per-tensor
+            # transfer metadata.
             register_regions = collect_storage_merged_register_regions(kv_caches)
 
         validate_register_region_count(register_regions)
@@ -2619,6 +3251,7 @@ class MooncakeConnectorWorker:
                 ready_event,
                 self.kv_caches,
                 self.pcp_rank,
+                self.snapshot_layers,
             )
             self.kv_send_thread.start()
         else:
@@ -2640,6 +3273,7 @@ class MooncakeConnectorWorker:
                 self._prefill_pp_layer_partition,
                 self.kv_group2layeridx,
                 self.block_size_scale,
+                self.snapshot_layers,
             )
             self.kv_recv_thread.start()
         start_wait_time = time.time()
@@ -2665,6 +3299,35 @@ class MooncakeConnectorWorker:
             if self.kv_role == "kv_consumer"
             else set()
         )
+        for request_id in done_sending:
+            for layer, _ in self.snapshot_layers.values():
+                layer.release_kv_cache_side_storage_snapshot(request_id)
+        if self.snapshot_layers and done_recving:
+            assert self.kv_recv_thread is not None
+            for request_id in done_recving:
+                with self.kv_recv_thread.pending_snapshots_lock:
+                    snapshots = self.kv_recv_thread.pending_snapshots.pop(request_id, {})
+                if not snapshots:
+                    if request_id in self._snapshot_receives:
+                        raise RuntimeError(f"Missing side-storage snapshots for request {request_id}")
+                    # Empty/virtual receives have no external state to restore.
+                    continue
+                if set(snapshots) != set(self.snapshot_layers):
+                    raise RuntimeError(f"Incomplete side-storage snapshots for request {request_id}")
+                for name, (payload, block_ids, num_tokens) in snapshots.items():
+                    adapter = self.snapshot_layers[name][0]
+                    if isinstance(adapter, MTPPrefixSnapshotAdapter):
+                        adapter.restore_for_request(request_id, payload, num_tokens)
+                    else:
+                        adapter.restore_kv_cache_side_storage_snapshot(payload, block_ids, num_tokens)
+                # Restoration runs on the model thread before reporting receive
+                # completion to the scheduler, which permits the first forward.
+                torch.npu.current_stream().synchronize()
+                if request_id in self._snapshot_audit_receives:
+                    source_id, full_blocks, boundary = self._snapshot_audit_receives.pop(request_id)
+                    self._audit_snapshot_handoff("receive", source_id, full_blocks, boundary, snapshots)
+                logger.info("Restored side-storage snapshots for request %s: layers=%d", request_id, len(snapshots))
+                self._snapshot_receives.discard(request_id)
         if self.tp_rank == 0:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -2787,6 +3450,8 @@ class MooncakeConnectorWorker:
         to the shorter one so remote/local stay aligned.
         """
         kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
+        if meta.num_external_tokens == 0:
+            return [], []
         if group_spec["kv_cache_spec_type"] == "MambaSpec":
             return list(meta.local_block_ids[kv_cache_group_id]), list(meta.remote_block_ids[kv_cache_group_id])
 
@@ -2800,6 +3465,14 @@ class MooncakeConnectorWorker:
         )
 
         remote_scale = remote_block_size // kernel_size
+        if kv_cache_group_id >= len(meta.local_block_ids) or kv_cache_group_id >= len(meta.remote_block_ids):
+            raise RuntimeError(
+                "KV transfer block group is absent from request metadata: "
+                f"transfer_group={group_idx}, kv_cache_group={kv_cache_group_id}, "
+                f"local_groups={len(meta.local_block_ids)}, "
+                f"remote_groups={len(meta.remote_block_ids)}, "
+                f"layers={group_spec.get('layer_names')}"
+            )
         kernel_local = self._expand_block_ids(list(meta.local_block_ids[kv_cache_group_id]), local_scale)
         kernel_remote = self._expand_block_ids(list(meta.remote_block_ids[kv_cache_group_id]), remote_scale)
         # Skip prefix-cached remote kernels (D-side already holds them). The token size of one
@@ -3632,6 +4305,14 @@ class MooncakeConnectorWorker:
                 self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
 
         for req_id, meta in metadata.requests.items():
+            if self.snapshot_layers and meta.num_external_tokens > 0:
+                self._snapshot_receives.add(req_id)
+                if self._snapshot_audit_dir:
+                    self._snapshot_audit_receives[req_id] = (
+                        meta.remote_request_id,
+                        meta.local_full_block_ids,
+                        meta.num_computed_tokens + meta.num_external_tokens,
+                    )
             if meta.do_virtual:
                 if self.kv_recv_thread is not None:
                     self.kv_recv_thread.task_tracker.add_not_transfer_request(req_id)
@@ -3716,6 +4397,8 @@ class MooncakeConnectorWorker:
                         remote_block_size=meta.remote_block_size,
                         local_block_ids_replicate_k=local_block_ids_replicate_k_for_port,
                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,
+                        snapshot_block_ids=meta.local_full_block_ids,
+                        snapshot_num_tokens=meta.num_computed_tokens + meta.num_external_tokens,
                     )
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:
@@ -3754,6 +4437,15 @@ class MooncakeConnectorWorker:
     ):
         if remote_multi_nodes_meta_mapping is None:
             return remote_host, remote_engine_id
+
+        # Actual ports disambiguate DP-relative offsets and differing P/D base
+        # ports. Each PP worker advertises its own host, including remote stages.
+        for info in remote_multi_nodes_meta_mapping.values():
+            if info.get("handshake_port") == remote_handshake_port:
+                return info.get("host", remote_host), info.get("engine_id", remote_engine_id)
+
+        if self.snapshot_layers and self._prefill_pp_size > 1:
+            raise RuntimeError(f"Missing P pipeline endpoint for handshake port {remote_handshake_port}")
 
         kv_port = self.vllm_config.kv_transfer_config.kv_port
         rank = str(remote_handshake_port - kv_port)
