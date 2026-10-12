@@ -39,7 +39,9 @@ def _build_cos_sin_cache(max_pos: int, pairs: int, theta: float, device):
 
 
 def _reference_indexer_norm_rope(
-    x_cat: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    index_z: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     k_bias: torch.Tensor,
@@ -54,28 +56,24 @@ def _reference_indexer_norm_rope(
     eps: float,
     q_norm_weight_bias: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    tokens = x_cat.shape[0]
-    q_len = num_q_heads * head_dim
-    k_len = num_k_heads * head_dim
-    q_seg = x_cat[:, :q_len]
-    k_seg = x_cat[:, q_len:q_len + k_len]
-    z_seg = x_cat[:, q_len + k_len:]
+    tokens = index_q.shape[0]
+    dtype = index_q.dtype
 
     def rms_norm(x_flat: torch.Tensor) -> torch.Tensor:
         x = x_flat.view(tokens, -1, head_dim).float()
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         normed = x * torch.rsqrt(variance + eps)
-        return (normed * (q_weight.float() + q_norm_weight_bias)).to(x_cat.dtype)
+        return (normed * (q_weight.float() + q_norm_weight_bias)).to(dtype)
 
     def layer_norm(x_flat: torch.Tensor) -> torch.Tensor:
         x = x_flat.view(tokens, -1, head_dim).float()
         mean = x.mean(dim=-1, keepdim=True)
         variance = x.var(dim=-1, unbiased=False, keepdim=True)
         normed = (x - mean) * torch.rsqrt(variance + eps)
-        return (normed * k_weight.float() + k_bias.float()).to(x_cat.dtype)
+        return (normed * k_weight.float() + k_bias.float()).to(dtype)
 
-    q = rms_norm(q_seg)
-    k = layer_norm(k_seg)
+    q = rms_norm(index_q)
+    k = layer_norm(index_k)
 
     half = rotary_dim // 2
 
@@ -88,17 +86,31 @@ def _reference_indexer_norm_rope(
         out = x.clone()
         out[..., :half] = x1 * cos_t - x2 * sin_t
         out[..., half:rotary_dim] = x1 * sin_t + x2 * cos_t
-        return out.to(x_cat.dtype).view(x_flat.shape)
+        return out.to(dtype).view(x_flat.shape)
 
-    return apply_rope(q).view(tokens, -1), apply_rope(k).view(tokens, -1), z_seg.clone()
+    return apply_rope(q).view(tokens, -1), apply_rope(k).view(tokens, -1), index_z.clone()
 
 
 @pytest.fixture(scope="module")
 def _import_kernel():
-    from vllm_ascend.models.step4.fused_qknorm_rope import (
-        fused_indexer_qkz_kv_norm_rope,
+    # Load the module file directly so the step5 package __init__ (which
+    # imports optional ops-transformer dependencies) is not executed.
+    import importlib.util
+    import pathlib
+
+    module_path = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / "vllm_ascend"
+        / "models"
+        / "step5"
+        / "fused_qknorm_rope.py"
     )
-    return fused_indexer_qkz_kv_norm_rope
+    spec = importlib.util.spec_from_file_location(
+        "vllm_ascend.models.step5.fused_qknorm_rope", module_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.fused_indexer_qkz_norm_rope
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 33])
@@ -126,8 +138,23 @@ def test_fused_indexer_norm_rope_accuracy(
     )
     cos, sin = _build_cos_sin_cache(max_pos, ROTARY_DIM // 2, THETA, device)
 
+    index_q, index_k, index_z = x_cat.split([q_len, k_len, k_len], dim=-1)
+    # Verify the inputs are views from a single tensor, not contiguous copies.
+    assert index_q is not x_cat
+    assert index_k is not x_cat
+    assert index_z is not x_cat
+    assert index_q.storage().data_ptr() == x_cat.storage().data_ptr()
+    assert index_k.storage().data_ptr() == x_cat.storage().data_ptr()
+    assert index_z.storage().data_ptr() == x_cat.storage().data_ptr()
+    if k_len > 0:
+        assert index_k.data_ptr() != x_cat.data_ptr()
+    if k_len > 0 or q_len > 0:
+        assert index_z.data_ptr() != x_cat.data_ptr()
+
     q_ref, k_ref, z_ref = _reference_indexer_norm_rope(
-        x_cat,
+        index_q,
+        index_k,
+        index_z,
         q_weight,
         k_weight,
         k_bias,
@@ -143,7 +170,9 @@ def test_fused_indexer_norm_rope_accuracy(
     )
 
     q_out, k_out, z_out = fused_fn(
-        x_cat,
+        index_q,
+        index_k,
+        index_z,
         q_weight,
         k_weight,
         cos,
@@ -194,13 +223,16 @@ def test_fused_indexer_norm_rope_pos0_is_identity(_import_kernel):
     positions = torch.zeros(num_tokens, device=device, dtype=torch.int32)
     cos, sin = _build_cos_sin_cache(8, ROTARY_DIM // 2, THETA, device)
 
+    index_q, index_k, index_z = x_cat.split([q_len, k_len, k_len], dim=-1)
+
     q_ref, k_ref, _ = _reference_indexer_norm_rope(
-        x_cat, q_weight, k_weight, k_bias, cos, sin, positions,
-        head_dim=HEAD_DIM, num_q_heads=num_q_heads, num_k_heads=num_k_heads,
-        rotary_dim=ROTARY_DIM, eps=EPS, q_norm_weight_bias=1.0,
+        index_q, index_k, index_z, q_weight, k_weight, k_bias, cos, sin,
+        positions, head_dim=HEAD_DIM, num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads, rotary_dim=ROTARY_DIM, eps=EPS,
+        q_norm_weight_bias=1.0,
     )
     q_out, k_out, _ = fused_fn(
-        x_cat, q_weight, k_weight, cos, sin, positions,
+        index_q, index_k, index_z, q_weight, k_weight, cos, sin, positions,
         q_norm_bias=None, k_norm_bias=k_bias,
         head_dim=HEAD_DIM, num_q_heads=num_q_heads, num_k_heads=num_k_heads,
         rotary_dim=ROTARY_DIM, eps=EPS,

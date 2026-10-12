@@ -104,7 +104,7 @@ from vllm_ascend.models.step5.dsa_attention import (
 
 from vllm_ascend.models.step5.fused_add_rms_norm import fused_add_rms_norm_cast
 from vllm_ascend.models.step5.fused_qknorm_rope import (
-    fused_indexer_qkz_kv_norm_rope,
+    fused_indexer_qkz_norm_rope,
     fused_qknorm_rope,
 )
 from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCacheLayer
@@ -519,9 +519,10 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         heads_per_group = num_index_q_heads // self.num_kv_heads
 
         if self.use_fused_indexer_norm_rope:
-            x_cat = torch.cat([index_q, index_k, index_z], dim=-1)
-            index_q, index_k, index_z = fused_indexer_qkz_kv_norm_rope(
-                x_cat,
+            index_q, index_k, index_z = fused_indexer_qkz_norm_rope(
+                index_q,
+                index_k,
+                index_z,
                 self.sparse_indexer_q_norm.weight,
                 self.sparse_indexer_k_norm.weight,
                 self._indexer_rope_cos,

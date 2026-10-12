@@ -516,8 +516,10 @@ def _norm_rope_tile_npu(
     key=["M_q", "M_k", "head_dim", "rotary_dim"],
 )
 @triton.jit
-def _indexer_qkz_kv_norm_rope_kernel(
-    x_cat_ptr,
+def _indexer_qkz_norm_rope_kernel(
+    x_q_ptr,
+    x_k_ptr,
+    x_z_ptr,
     out_q_ptr,
     out_k_ptr,
     out_z_ptr,
@@ -530,12 +532,12 @@ def _indexer_qkz_kv_norm_rope_kernel(
     positions_ptr,
     M_q,
     M_k,
-    stride_x_token,
+    stride_x_q,
+    stride_x_k,
+    stride_x_z,
     stride_out_q,
     stride_out_k,
     stride_cos,
-    q_seg_len,
-    z_seg_len,
     eps,
     weight_bias_q,
     weight_bias_k,
@@ -584,9 +586,9 @@ def _indexer_qkz_kv_norm_rope_kernel(
         token_idx = token_start + tl.arange(0, ROWS_PER_PROGRAM_Q)
         token_ok = token_idx < num_q_tokens
         _norm_rope_tile_npu(
-            x_cat_ptr, out_q_ptr, cos_ptr, sin_ptr, positions_ptr,
+            x_q_ptr, out_q_ptr, cos_ptr, sin_ptr, positions_ptr,
             token_idx, token_start, token_ok,
-            stride_x_token, stride_out_q, stride_cos, 0,
+            stride_x_q, stride_out_q, stride_cos, 0,
             w_all_q, w_real_q, w_imag_q, b_all_q, b_real_q, b_imag_q, eps, weight_bias_q,
             num_q_tokens,
             num_heads=num_q_heads, head_dim=head_dim, rotary_dim=rotary_dim,
@@ -613,9 +615,9 @@ def _indexer_qkz_kv_norm_rope_kernel(
         token_idx = token_start + tl.arange(0, ROWS_PER_PROGRAM_KZ)
         token_ok = token_idx < num_k_tokens
         _norm_rope_tile_npu(
-            x_cat_ptr, out_k_ptr, cos_ptr, sin_ptr, positions_ptr,
+            x_k_ptr, out_k_ptr, cos_ptr, sin_ptr, positions_ptr,
             token_idx, token_start, token_ok,
-            stride_x_token, stride_out_k, stride_cos, q_seg_len,
+            stride_x_k, stride_out_k, stride_cos, 0,
             w_all_k, w_real_k, w_imag_k, b_all_k, b_real_k, b_imag_k, eps, weight_bias_k,
             num_k_tokens,
             num_heads=num_k_heads, head_dim=head_dim, rotary_dim=rotary_dim,
@@ -624,9 +626,9 @@ def _indexer_qkz_kv_norm_rope_kernel(
             H_CHUNK=H_CHUNK_K, N_FULL=N_FULL_K, REM_HEADS=REM_K,
         )
         z_bp = tl.make_block_ptr(
-            base=x_cat_ptr + z_seg_len,
+            base=x_z_ptr,
             shape=(num_k_tokens, num_k_heads * head_dim),
-            strides=(stride_x_token, 1),
+            strides=(stride_x_z, 1),
             offsets=(token_start, 0),
             block_shape=(ROWS_PER_PROGRAM_KZ, num_k_heads * head_dim),
             order=(1, 0),
@@ -643,8 +645,10 @@ def _indexer_qkz_kv_norm_rope_kernel(
         tl.store(z_out_bp, z_vals.to(out_z_ptr.dtype.element_ty), boundary_check=(0,))
 
 
-def _fused_indexer_qkz_kv_norm_rope_impl(
-    x_cat: torch.Tensor,
+def _fused_indexer_qkz_norm_rope_impl(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    index_z: torch.Tensor,
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     cos: torch.Tensor,
@@ -673,16 +677,28 @@ def _fused_indexer_qkz_kv_norm_rope_impl(
     # position's angles. Convert dims -> pairs here.
     rotary_pairs = rotary_dim // 2
 
-    tokens = x_cat.shape[0]
-    out_q = torch.empty((tokens, num_q_heads * head_dim), device=x_cat.device, dtype=x_cat.dtype)
-    out_k = torch.empty((tokens, num_k_heads * head_dim), device=x_cat.device, dtype=x_cat.dtype)
-    out_z = torch.empty((tokens, num_k_heads * head_dim), device=x_cat.device, dtype=x_cat.dtype)
+    tokens = index_q.shape[0]
+    if index_k.shape[0] != tokens or index_z.shape[0] != tokens:
+        raise ValueError(
+            f"index_q/k/z must have the same number of tokens, got "
+            f"{index_q.shape[0]}, {index_k.shape[0]}, {index_z.shape[0]}"
+        )
+    if index_q.shape[1] != num_q_heads * head_dim:
+        raise ValueError(
+            f"index_q shape {tuple(index_q.shape)} does not match "
+            f"num_q_heads={num_q_heads} * head_dim={head_dim}"
+        )
+    if index_k.shape[1] != num_k_heads * head_dim or index_z.shape[1] != num_k_heads * head_dim:
+        raise ValueError(
+            f"index_k and index_z must have shape ({tokens}, {num_k_heads * head_dim}), "
+            f"got {tuple(index_k.shape)} and {tuple(index_z.shape)}"
+        )
+    out_q = torch.empty((tokens, num_q_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
+    out_k = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
+    out_z = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
 
     m_q = tokens * num_q_heads
     m_k = tokens * num_k_heads
-    q_seg_len = num_q_heads * head_dim
-    z_seg_len = (num_q_heads + num_k_heads) * head_dim
-    token_stride = (num_q_heads + 2 * num_k_heads) * head_dim
 
     grid = lambda meta: (
         min(
@@ -693,8 +709,10 @@ def _fused_indexer_qkz_kv_norm_rope_impl(
             _npu_vec_core_num(),
         ),
     )
-    _indexer_qkz_kv_norm_rope_kernel[grid](
-        x_cat,
+    _indexer_qkz_norm_rope_kernel[grid](
+        index_q,
+        index_k,
+        index_z,
         out_q,
         out_k,
         out_z,
@@ -707,12 +725,12 @@ def _fused_indexer_qkz_kv_norm_rope_impl(
         positions,
         m_q,
         m_k,
-        token_stride,
+        index_q.stride(0),
+        index_k.stride(0),
+        index_z.stride(0),
         out_q.stride(0),
         out_k.stride(0),
         cos.stride(0),
-        q_seg_len,
-        z_seg_len,
         eps,
         q_norm_weight_bias,
         k_norm_weight_bias,
@@ -736,8 +754,10 @@ def _fused_indexer_qkz_kv_norm_rope_impl(
     return out_q, out_k, out_z
 
 
-def _fused_indexer_qkz_kv_norm_rope_fake(
-    x_cat: torch.Tensor,
+def _fused_indexer_qkz_norm_rope_fake(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    index_z: torch.Tensor,
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     cos: torch.Tensor,
@@ -756,23 +776,25 @@ def _fused_indexer_qkz_kv_norm_rope_fake(
     subtract_mean_q: bool = False,
     subtract_mean_k: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    tokens = x_cat.shape[0]
-    q = torch.empty((tokens, num_q_heads * head_dim), device=x_cat.device, dtype=x_cat.dtype)
-    k = torch.empty((tokens, num_k_heads * head_dim), device=x_cat.device, dtype=x_cat.dtype)
-    z = torch.empty((tokens, num_k_heads * head_dim), device=x_cat.device, dtype=x_cat.dtype)
+    tokens = index_q.shape[0]
+    q = torch.empty((tokens, num_q_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
+    k = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
+    z = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
     return q, k, z
 
 
 direct_register_custom_op(
     op_name="ascend_step5_fused_indexer_norm_rope",
-    op_func=_fused_indexer_qkz_kv_norm_rope_impl,
+    op_func=_fused_indexer_qkz_norm_rope_impl,
     mutates_args=[],
-    fake_impl=_fused_indexer_qkz_kv_norm_rope_fake,
+    fake_impl=_fused_indexer_qkz_norm_rope_fake,
 )
 
 
-def fused_indexer_qkz_kv_norm_rope(
-    x_cat: torch.Tensor,
+def fused_indexer_qkz_norm_rope(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    index_z: torch.Tensor,
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     cos: torch.Tensor,
@@ -792,7 +814,9 @@ def fused_indexer_qkz_kv_norm_rope(
     subtract_mean_k: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return torch.ops.vllm.ascend_step5_fused_indexer_norm_rope(
-        x_cat,
+        index_q,
+        index_k,
+        index_z,
         q_norm_weight,
         k_norm_weight,
         cos,
