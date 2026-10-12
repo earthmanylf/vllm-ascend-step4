@@ -46,13 +46,13 @@ def indexer_score_topk(
         mean_cache: [P, S, 1, D] float8_e4m3fn — paged summary cache.
         block_table: [N, C] int32 — logical-to-physical page map.
         cu_seq_lens: [N+1] int32 — cumulative packed query lengths.
-        actual_kv_lengths: [N] int32 — zero-based tail token position of
-            each request (``seq_len - 1``; mask_mode=3 causal input). The
-            operator restores the first query position as
-            ``actual_kv_lengths[n] - q_len + 1`` (``q_len`` from
-            ``cu_seq_lens``) and selects only from regions strictly below
-            ``floor((ctx + j) / region_size)``, i.e. the current region
-            never competes for a slot.
+        actual_kv_lengths: [N] int32 — effective KV sequence length of
+            each request including the current queries (``seq_len``;
+            mask_mode=3 causal input). The operator restores the first
+            query position as ``actual_kv_lengths[n] - q_len`` (``q_len``
+            from ``cu_seq_lens``) and selects only from regions strictly
+            below ``floor((ctx + j) / region_size)``, i.e. the current
+            region never competes for a slot.
         max_region_len: number of logical regions to score.
         topk: history candidate count.
         region_size: tokens per region (8).

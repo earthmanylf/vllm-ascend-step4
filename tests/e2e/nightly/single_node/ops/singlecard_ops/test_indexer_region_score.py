@@ -13,9 +13,10 @@ Three-layer verification strategy:
 
 1. Formula-free invariants (exact): output shapes/dtypes; per-row ids strictly
    ascending, duplicate-free, in ``[0, bound)`` with
-   ``bound = floor((actual_kv_lengths[n] - q_len + 1 + j) / region_size)``
-   (actual_kv_lengths is the zero-based tail token position; the current
-   region never competes, mask_mode=3); ``-1`` only as tail padding with
+   ``bound = floor((actual_kv_lengths[n] - q_len + j) / region_size)``
+   (actual_kv_lengths is the effective KV length including the current
+   queries; the current region never competes, mask_mode=3); ``-1`` only
+   as tail padding with
    exactly ``max(0, topk - bound)`` pads. Rows with ``bound <= topk`` select
    *every* candidate, so their ids must equal ``arange(bound)`` exactly.
 2. Self-consistency (formula-free): torch.topk over the operator's own
@@ -68,10 +69,10 @@ def _build_inputs(
 ):
     """Build a self-consistent input bundle for ``indexer_score_topk``.
 
-    ``actual_kv_lens`` holds zero-based tail token positions
-    (``ctx + q_len - 1`` per request). Every block-table entry is mapped to
-    a distinct physical page (no -1), so all ``bound`` causal-candidate
-    regions are valid candidates.
+    ``actual_kv_lens`` holds effective KV lengths including the current
+    queries (``ctx + q_len`` per request). Every block-table entry is
+    mapped to a distinct physical page (no -1), so all ``bound``
+    causal-candidate regions are valid candidates.
     """
     torch.manual_seed(seed)
     num_reqs = len(actual_kv_lens)
@@ -97,10 +98,10 @@ def _build_inputs(
 def _token_bounds(cu_seq_lens, actual_kv_lengths, total_tokens):
     """Causal bound per output row.
 
-    ``actual_kv_lengths`` holds the zero-based tail token position; the
-    operator restores the first query position as
-    ``actual_kv_lengths[n] - q_len + 1``, so token j of request n sits at
-    ``floor((actual_kv_lengths[n] - q_len + 1 + j) / 8)`` visible regions.
+    ``actual_kv_lengths`` holds the effective KV length including the
+    current queries; the operator restores the first query position as
+    ``actual_kv_lengths[n] - q_len``, so token j of request n sits at
+    ``floor((actual_kv_lengths[n] - q_len + j) / 8)`` visible regions.
     """
     cu = cu_seq_lens.cpu()
     akl = actual_kv_lengths.cpu()
@@ -109,7 +110,7 @@ def _token_bounds(cu_seq_lens, actual_kv_lengths, total_tokens):
         q_len = int(cu[n + 1]) - int(cu[n])
         for t in range(int(cu[n]), int(cu[n + 1])):
             j = t - int(cu[n])
-            bounds[t] = (int(akl[n]) - q_len + 1 + j) // REGION_SIZE
+            bounds[t] = (int(akl[n]) - q_len + j) // REGION_SIZE
     return bounds
 
 
@@ -285,8 +286,8 @@ def test_decode_rows_contract():
     bound 0 (all -1), bound < topk (exact arange), bound == topk (no pad),
     bound > topk (selection), and a 64k-context row.
     """
-    kv_lens = [0, 5, 8, 16, 63, 64, 100, 4095, 4096, 4100, 8192, 16383,
-               32768, 65528, 65535, 65536]
+    kv_lens = [1, 6, 9, 17, 64, 65, 101, 4096, 4097, 4101, 8193, 16384,
+               32769, 65529, 65536, 65537]
     inputs = _build_inputs(kv_lens, [1] * 16, max_region_len=WIDE_REGION_LEN)
     scores, ids = _run_fused(*inputs, WIDE_REGION_LEN)
     assert scores.shape == (G * 16, WIDE_REGION_LEN)
@@ -303,11 +304,11 @@ def test_decode_rows_contract():
 def test_prefill_rows_contract():
     """Prefill form: multi-token requests driven by query_start_loc.
 
-    Includes a zero-context request (tail = q_len - 1, every token's bound
+    Includes a zero-context request (length = q_len, every token's bound
     is 0 -> all -1) and per-token causal drift inside a request (bound
-    grows with j). kv_lens are tail positions: ctx + q_len - 1.
+    grows with j). kv_lens are effective KV lengths: ctx + q_len.
     """
-    kv_lens = [3, 103, 65535]
+    kv_lens = [4, 104, 65536]
     tokens_per_req = [4, 4, 8]
     total = sum(tokens_per_req)
     inputs = _build_inputs(kv_lens, tokens_per_req, max_region_len=WIDE_REGION_LEN)
@@ -325,7 +326,7 @@ def test_prefill_rows_contract():
 
 def test_scores_and_ids_vs_triton_reference():
     """Numeric comparison against the pre-fusion Triton scoring kernel."""
-    kv_lens = [63, 100, 4095, 4100, 8192, 16383, 65528, 65535]
+    kv_lens = [64, 101, 4096, 4101, 8193, 16384, 65529, 65536]
     inputs = _build_inputs(kv_lens, [1] * 8, max_region_len=WIDE_REGION_LEN,
                            seed=7)
     scores, ids = _run_fused(*inputs, WIDE_REGION_LEN)
@@ -338,9 +339,9 @@ def test_scores_and_ids_vs_triton_reference():
 def test_prefill_vs_triton_reference():
     """Same comparison for the multi-token (prefill) input form.
 
-    kv_lens are tail positions (ctx + q_len - 1) for ctx = 1000, 65500.
+    kv_lens are effective KV lengths (ctx + q_len) for ctx = 1000, 65500.
     """
-    kv_lens = [1003, 65503]
+    kv_lens = [1004, 65504]
     tokens_per_req = [4, 4]
     inputs = _build_inputs(kv_lens, tokens_per_req,
                            max_region_len=WIDE_REGION_LEN, seed=11)
@@ -353,7 +354,7 @@ def test_prefill_vs_triton_reference():
 
 def test_determinism():
     """The fused operator must be bit-stable across repeated calls."""
-    inputs = _build_inputs([4100, 65535, 100, 8], [1] * 4,
+    inputs = _build_inputs([4101, 65536, 101, 9], [1] * 4,
                            max_region_len=WIDE_REGION_LEN, seed=3)
     scores1, ids1 = _run_fused(*inputs, WIDE_REGION_LEN)
     scores2, ids2 = _run_fused(*inputs, WIDE_REGION_LEN)

@@ -92,22 +92,23 @@ def _run(bundle, multi_token: bool):
     seq_lens = torch.tensor(SEQ_LENS, dtype=torch.int64, device=DEVICE)
     if multi_token:
         # One varlen request per verify request (the serving path).
-        # actual_kv_lengths holds the zero-based tail token position
-        # (seq_len - 1); the operator restores the first query position as
-        # seq_len - q_len.
+        # actual_kv_lengths holds the effective KV length including the
+        # current queries (seq_len); the operator restores the first query
+        # position as seq_len - q_len.
         bt = block_table[:N]
         cu_seq_lens = torch.arange(N + 1, device=DEVICE, dtype=torch.int32) * K
         seq_lens_i32 = seq_lens[:N].to(torch.int32)
-        actual_kv_lengths = seq_lens_i32 - 1
+        actual_kv_lengths = seq_lens_i32
         max_query_len = K
         seqused_kv = seq_lens_i32
     else:
-        # Flattened encoding: one single-token request per row.
+        # Flattened encoding: one single-token request per row. Its
+        # effective KV length is the row's position + 1.
         token_to_req = torch.arange(TOTAL, device=DEVICE, dtype=torch.int32) // K
         bt = block_table[:N][token_to_req.to(torch.long)]
         cu_seq_lens = torch.arange(TOTAL + 1, device=DEVICE, dtype=torch.int32)
         row_kv_seqlens = positions[:TOTAL].to(torch.int32) + 1
-        actual_kv_lengths = row_kv_seqlens - 1
+        actual_kv_lengths = row_kv_seqlens
         max_query_len = 1
         seqused_kv = row_kv_seqlens
 

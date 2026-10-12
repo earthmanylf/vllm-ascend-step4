@@ -1252,12 +1252,14 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         # attention is the aclnn GenericBlockSparseAttention operator, which
         # appends the current region (floor(pos / region_size)) and applies
         # the per-token causal truncation itself. actual_kv_lengths is the
-        # zero-based tail token position (seq_len - 1); with q_len=1 it
-        # equals the single query token's own position.
+        # effective KV length including the current query (seq_len); the
+        # query token's own 0-based position (seq_len - 1) feeds the
+        # attention operator's current-region append.
         cu_seq_lens = torch.arange(
             n + 1, device=index_q.device, dtype=torch.int32
         )
-        actual_kv_lengths = seq_lens_i32 - 1
+        positions = seq_lens_i32 - 1
+        actual_kv_lengths = seq_lens_i32
         _scores, ids = indexer_score_topk(
             index_q[:n],
             weights[:n],
@@ -1274,7 +1276,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             key_cache,
             value_cache,
             ids,
-            actual_kv_lengths,
+            positions,
             d.block_table,
             cu_seq_lens,
             seq_lens_i32,
@@ -1323,10 +1325,10 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         # Request-level varlen metadata: the committed context
         # ctx = seq_len - query_len anchors both operators. seqused_kv is
         # the full seq_len (right-aligned causal anchor); the indexer's
-        # actual_kv_lengths is the zero-based tail token position
-        # (seq_len - 1), from which the operator restores the first query
-        # position ctx and applies the mask3 bound floor((ctx + j) /
-        # region_size). cu_seq_lens reuses the builder's
+        # actual_kv_lengths is the same effective KV length (seq_len),
+        # from which the operator restores the first query position
+        # ctx = actual_kv_lengths - q_len and applies the mask3 bound
+        # floor((ctx + j) / region_size). cu_seq_lens reuses the builder's
         # start-loc copies -- int32 for the fused indexer, int64 for the
         # GenericBlockSparseAttention operator's cu_seqlens_q contract --
         # zero-kernel views refreshed in place by the builder. Static
@@ -1334,7 +1336,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         seq_lens = decode_md.seq_lens[:num_decodes]
         cu_seq_lens = md.query_start_loc[: num_decodes + 1]
         cu_seqlens_q = md.query_start_loc_int64[: num_decodes + 1]
-        actual_kv_lengths = seq_lens - 1
+        actual_kv_lengths = seq_lens
         _scores, ids = indexer_score_topk(
             index_q[:total_tokens],
             weights[:total_tokens],
@@ -1407,8 +1409,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         # never competes for a slot; the attention operator appends it and
         # causally truncates it to the token's position.
         # cu_seq_lens from the device start-loc; actual_kv_lengths is the
-        # zero-based tail token position (seq_len - 1, cached context plus
-        # this chunk), from which the indexer restores the first query
+        # effective KV length including this chunk (cached context plus
+        # query tokens), from which the indexer restores the first query
         # position as seq_len - q_len.
         cu_seq_lens = torch.cat(
             [
@@ -1416,7 +1418,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 p.query_start_loc[1 : num_reqs + 1].to(torch.int32),
             ]
         )
-        actual_kv_lengths = p.seq_lens[:num_reqs].to(torch.int32) - 1
+        actual_kv_lengths = p.seq_lens[:num_reqs].to(torch.int32)
         _scores, ids = indexer_score_topk(
             index_q[:num_query_tokens],
             weights[:num_query_tokens],
