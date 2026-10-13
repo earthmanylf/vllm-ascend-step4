@@ -7,6 +7,14 @@ def register_model():
         "vllm_ascend.models.gemma4_mm:AscendGemma4ForConditionalGeneration",
     )
     ModelRegistry.register_model(
+        "Step5ForCausalLM",
+        "vllm_ascend.models.step5:AscendStep5ForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "Step5MTP",
+        "vllm_ascend.models.step5.mtp:AscendStep5MTP",
+    )
+    ModelRegistry.register_model(
         "KimiLinearForCausalLM",
         "vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM",
     )
