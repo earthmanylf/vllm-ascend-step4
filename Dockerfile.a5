@@ -15,8 +15,8 @@
 # This file is a part of the vllm-ascend project.
 #
 
-ARG CANN_QUAY_URL="quay.io/ascend/cann"
-ARG CANN_VERSION="9.2.0"
+ARG CANN_QUAY_URL="swr.cn-north-12.myhuaweicloud.com/atlas_inference/cann"
+ARG CANN_VERSION="9.2.0_20260930220649"
 FROM ${CANN_QUAY_URL}:${CANN_VERSION}-950-ubuntu22.04-py3.12
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
