@@ -59,21 +59,20 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm.models.step5.kernels import (
+from vllm.models.step5.nvidia.config import (
     Step5SparseConfig,
     checkpoint_has_step5_sparse_config,
     get_step5_sparse_config,
 )
-from vllm.models.step5.layernorm import (
+from vllm.models.step5.nvidia.layernorm import (
     Step5IndexerLayerNorm,
     get_step5_norm_dtype,
     make_step5_rms_norm,
 )
-from vllm.models.step5.model import (
+from vllm.models.step5.nvidia.model import (
     Step5Attention,
     Step5DecoderLayer,
     Step5ForCausalLM,
-    Step5FP32RouterLinear,
     Step5FusedQKVIndexerLinear,
     Step5MLP,
     Step5MoE,
@@ -83,10 +82,13 @@ from vllm.models.step5.model import (
     _get_step5_moe_layer_indices,
     _is_step5_full_attention_layer,
     _per_layer_value,
-    _require_resolved_valid_vocab_size,
     _set_step5_moe_protocol_metadata,
     _step5_moe_reduce_policy,
     _validate_step5_dsa_parallel_geometry,
+)
+from vllm_ascend.models.step5._step5_compat import (
+    Step5FP32RouterLinear,
+    _require_resolved_valid_vocab_size,
 )
 
 import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)

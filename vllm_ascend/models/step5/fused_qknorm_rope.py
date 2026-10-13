@@ -26,7 +26,6 @@ import os
 import torch
 import triton
 import triton.language as tl
-import triton.language.extra.cann.extension as extension  # prefill-opt: gather->slice
 
 
 HEAD_DIM: int = 192
@@ -130,8 +129,8 @@ def _split_qkv_norm_rope_192_kernel(
         rotated1 = tl.fma(value0, sin_value, value1 * cos_value).to(tl.bfloat16)
 
         q_base = offs_t[:, None] * stride_q_out_token + q_head * HEAD_DIM
-        tl.store(q_out_ptr + q_base + pairs[None, :], rotated0, mask=rot_store_mask)
-        tl.store(q_out_ptr + q_base + (ROTARY_PAIRS + pairs)[None, :], rotated1, mask=rot_store_mask)
+        tl.store(q_out_ptr + q_base + idx0, rotated0, mask=rot_store_mask)
+        tl.store(q_out_ptr + q_base + idx1, rotated1, mask=rot_store_mask)
         tl.store(q_out_ptr + q_base + dims[None, :], normalized, mask=non_rot_store_mask)
 
     for kv_head in tl.range(NUM_KV_HEADS):
@@ -154,8 +153,8 @@ def _split_qkv_norm_rope_192_kernel(
         rotated1 = tl.fma(value0, sin_value, value1 * cos_value).to(tl.bfloat16)
 
         k_base = offs_t[:, None] * stride_k_out_token + kv_head * HEAD_DIM
-        tl.store(k_out_ptr + k_base + pairs[None, :], rotated0, mask=rot_store_mask)
-        tl.store(k_out_ptr + k_base + (ROTARY_PAIRS + pairs)[None, :], rotated1, mask=rot_store_mask)
+        tl.store(k_out_ptr + k_base + idx0, rotated0, mask=rot_store_mask)
+        tl.store(k_out_ptr + k_base + idx1, rotated1, mask=rot_store_mask)
         tl.store(k_out_ptr + k_base + dims[None, :], normalized, mask=non_rot_store_mask)
 
         # V passthrough: V must retain its original bits.
@@ -164,213 +163,6 @@ def _split_qkv_norm_rope_192_kernel(
         v_value = tl.load(qkv_ptr + v_in_base + dims[None, :], mask=load_mask)
         v_out_base = offs_t[:, None] * stride_v_out_token + kv_head * HEAD_DIM
         tl.store(v_out_ptr + v_out_base + dims[None, :], v_value, mask=load_mask)
-
-
-# ---------------------------------------------------------------------------
-# V2: 2-D grid variant of _split_qkv_norm_rope_192_kernel.
-#
-# Why: the original kernel uses grid=(cdiv(tokens, BLOCK_M),) and keeps the
-# *entire* q/k/v head loop inside a single program.  At decode (M = 1..4 rows)
-# that is exactly one program, and the profiler confirms it: every
-# _split_qkv_norm_rope_192 launch in the decode phase reports Block Num == 1,
-# i.e. 1 of ~64 AIV cores busy while the program serialises over
-# num_q_heads + 2*num_kv_heads head slots.  Measured on 950DT (NPU-graph
-# timing, launch overhead excluded): 15.3-16.1us per call at M=1..26, of which
-# a no-op Triton kernel on the same path costs ~2us.
-#
-# What changes: only the *decomposition*.  Grid axis 0 tiles tokens, axis 1
-# tiles head slots, so a program owns TOKENS_PER_PROG tokens x HEADS_PER_PROG
-# head slots.  Every arithmetic expression, the 256-wide fp32 reduction, the
-# tl.gather indices, the tl.fma and every bf16 rounding point are kept exactly
-# as in the original kernel, so the outputs are bit-identical (verified
-# element-wise on bf16 for tokens in {1,2,4,8,26} and both rotary widths).
-#
-# Gated by VLLM_STEP4_FUSE_QK_NORM_ROPE_V2=1 (default off -> original path);
-# any shape the heuristic cannot express falls through to the original kernel.
-# ---------------------------------------------------------------------------
-
-_V2_ENABLED: bool = os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE_V2", "0") == "1"
-_V2_NUM_VCORE: int | None = None
-
-# (tokens per program, head slots per program), smallest tile first.
-_V2_TILE_CANDIDATES: tuple[tuple[int, int], ...] = (
-    (1, 1), (1, 2), (2, 1), (2, 2), (4, 1), (4, 2), (8, 1), (8, 2), (16, 1), (16, 2),
-)
-
-
-def _v2_num_vcore() -> int:
-    """AIV core count, queried once and cached (0 on failure -> default 64)."""
-    global _V2_NUM_VCORE
-    if _V2_NUM_VCORE is None:
-        try:
-            _V2_NUM_VCORE = _npu_vec_core_num()
-        except Exception:
-            _V2_NUM_VCORE = 64
-    return _V2_NUM_VCORE
-
-
-def _pick_qknorm_rope_v2_tile(tokens: int, num_slots: int) -> tuple[int, int]:
-    """Pick (TOKENS_PER_PROG, HEADS_PER_PROG) for the V2 kernel.
-
-    Walk the candidate list from the smallest tile and take the first one whose
-    program count fits in a single wave of AIV cores.  That fills the machine
-    at decode (M = 1..4 rows) without the ragged second wave an over-sized
-    grid causes, and grows the tile once the tokens dominate so each program
-    still amortises its prologue (positions / cos / sin / norm weights).
-    """
-    num_vcore = _v2_num_vcore()
-    for tp, hp in _V2_TILE_CANDIDATES:
-        if triton.cdiv(tokens, tp) * triton.cdiv(num_slots, hp) <= num_vcore:
-            return tp, hp
-    return 4, 2
-
-
-def _v2_block_sizes(rotary_pairs: int) -> tuple[int, int]:
-    """(BLOCK_D, BLOCK_R) for the V2 kernel.
-
-    BLOCK_R must cover ROTARY_PAIRS; BLOCK_D stays 256 so the fp32 reduction
-    tile, the masks and the gather index range are identical to the original
-    kernel (whose widest gather index is ROTARY_PAIRS + BLOCK_R - 1 <= 223).
-    """
-    return 256, triton.next_power_of_2(rotary_pairs)
-
-
-@triton.jit(do_not_specialize=["tokens"])
-def _split_qkv_norm_rope_192_kernel_v2(
-    qkv_ptr,
-    q_out_ptr,
-    k_out_ptr,
-    v_out_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    cos_ptr,
-    sin_ptr,
-    positions_ptr,
-    tokens,
-    stride_qkv_token,
-    stride_q_out_token,
-    stride_k_out_token,
-    stride_v_out_token,
-    stride_cos,
-    NUM_Q_HEADS: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-    ROTARY_PAIRS: tl.constexpr,
-    EPS: tl.constexpr,
-    NORM_WEIGHT_BIAS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    TOKENS_PER_PROG: tl.constexpr,
-    HEADS_PER_PROG: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-):
-    """2-D grid variant; see the block comment above for the rationale.
-
-    Head slots are numbered [q0..q(NQ-1), k0..k(NKV-1), v0..v(NKV-1)], which is
-    exactly the packed qkv column order, so slot s always reads qkv column
-    s*HEAD_DIM.  The body is the original body with the head index made
-    program-relative; nothing else differs.
-    """
-    pid_m = tl.program_id(0)
-    pid_h = tl.program_id(1)
-
-    offs_t = pid_m * TOKENS_PER_PROG + tl.arange(0, TOKENS_PER_PROG)
-    t_mask = offs_t < tokens
-
-    dims = tl.arange(0, BLOCK_D)
-    dim_mask = dims < HEAD_DIM
-    pairs = tl.arange(0, BLOCK_R)
-    pair_mask = pairs < ROTARY_PAIRS
-
-    # RoPE angles come from the caller-provided cos/sin cache (per-layer
-    # rope_theta / rope_scaling are baked in by the caller).
-    position = tl.load(positions_ptr + offs_t, mask=t_mask, other=0)
-    rope_row = position[:, None] * stride_cos + pairs[None, :]
-    rope_mask = t_mask[:, None] & pair_mask[None, :]
-    cos_value = tl.load(cos_ptr + rope_row, mask=rope_mask, other=0.0).to(tl.float32)
-    sin_value = tl.load(sin_ptr + rope_row, mask=rope_mask, other=0.0).to(tl.float32)
-
-    # Both norm weights are hoisted out of the head loop, as in the original.
-    q_weight = tl.load(q_weight_ptr + dims, mask=dim_mask, other=0.0).to(tl.float32) + NORM_WEIGHT_BIAS
-    k_weight = tl.load(k_weight_ptr + dims, mask=dim_mask, other=0.0).to(tl.float32) + NORM_WEIGHT_BIAS
-
-    non_rot_mask = (dims >= 2 * ROTARY_PAIRS) & dim_mask
-    rot_store_mask = t_mask[:, None] & pair_mask[None, :]
-    non_rot_store_mask = non_rot_mask[None, :] & t_mask[:, None]
-    load_mask = t_mask[:, None] & dim_mask[None, :]
-
-    for s in tl.static_range(HEADS_PER_PROG):
-        slot = pid_h * HEADS_PER_PROG + s
-        head_col = slot * HEAD_DIM
-        head_base = offs_t[:, None] * stride_qkv_token + head_col
-
-        if slot < NUM_Q_HEADS:
-            values = tl.load(
-                qkv_ptr + head_base + dims[None, :],
-                mask=t_mask[:, None] & dim_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            sum_squares = tl.sum(values * values, axis=1)
-            inverse_rms = tl.rsqrt(sum_squares / HEAD_DIM + EPS)
-
-            normalized = (values * inverse_rms[:, None] * q_weight[None, :]).to(tl.bfloat16)
-
-            # prefill-opt: tl.gather（静态索引）→ extension.extract_slice。
-            # values 是 [TOKENS_PER_PROG, BLOCK_D=256] tile，idx0/idx1 的列范围
-            # [0:BLOCK_R] 与 [ROTARY_PAIRS:ROTARY_PAIRS+BLOCK_R] 全在界内
-            # （BLOCK_R=next_pow2(ROTARY_PAIRS)，ROTARY_PAIRS+BLOCK_R<=224<256），
-            # 故 extract 取到的元素与 gather 完全一致（纯数据移动，bit-identical）。
-            # 归一化逐元素，与切片可交换：先切片原始 values 再逐元素归一化，
-            # 与原先"整体归一化→bf16 cast→切片→f32"逐位相同。
-            v0_raw = extension.extract_slice(values, [0, 0], [TOKENS_PER_PROG, BLOCK_R], [1, 1])
-            v1_raw = extension.extract_slice(values, [0, ROTARY_PAIRS], [TOKENS_PER_PROG, BLOCK_R], [1, 1])
-            w0 = extension.extract_slice(tl.reshape(q_weight, (1, BLOCK_D)), [0, 0], [1, BLOCK_R], [1, 1])
-            w1 = extension.extract_slice(tl.reshape(q_weight, (1, BLOCK_D)), [0, ROTARY_PAIRS], [1, BLOCK_R], [1, 1])
-            value0 = (v0_raw * inverse_rms[:, None] * w0).to(tl.bfloat16).to(tl.float32)
-            value1 = (v1_raw * inverse_rms[:, None] * w1).to(tl.bfloat16).to(tl.float32)
-            rotated0 = (value0 * cos_value - value1 * sin_value).to(tl.bfloat16)
-            rotated1 = tl.fma(value0, sin_value, value1 * cos_value).to(tl.bfloat16)
-
-            q_base = offs_t[:, None] * stride_q_out_token + head_col
-            tl.store(q_out_ptr + q_base + pairs[None, :], rotated0, mask=rot_store_mask)
-            tl.store(q_out_ptr + q_base + (ROTARY_PAIRS + pairs)[None, :], rotated1, mask=rot_store_mask)
-            tl.store(q_out_ptr + q_base + dims[None, :], normalized, mask=non_rot_store_mask)
-        elif slot < NUM_Q_HEADS + NUM_KV_HEADS:
-            values = tl.load(
-                qkv_ptr + head_base + dims[None, :],
-                mask=t_mask[:, None] & dim_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            sum_squares = tl.sum(values * values, axis=1)
-            inverse_rms = tl.rsqrt(sum_squares / HEAD_DIM + EPS)
-
-            normalized = (values * inverse_rms[:, None] * k_weight[None, :]).to(tl.bfloat16)
-
-            # prefill-opt: tl.gather（静态索引）→ extension.extract_slice。
-            # values 是 [TOKENS_PER_PROG, BLOCK_D=256] tile，idx0/idx1 的列范围
-            # [0:BLOCK_R] 与 [ROTARY_PAIRS:ROTARY_PAIRS+BLOCK_R] 全在界内
-            # （BLOCK_R=next_pow2(ROTARY_PAIRS)，ROTARY_PAIRS+BLOCK_R<=224<256），
-            # 故 extract 取到的元素与 gather 完全一致（纯数据移动，bit-identical）。
-            # 归一化逐元素，与切片可交换：先切片原始 values 再逐元素归一化，
-            # 与原先"整体归一化→bf16 cast→切片→f32"逐位相同。
-            v0_raw = extension.extract_slice(values, [0, 0], [TOKENS_PER_PROG, BLOCK_R], [1, 1])
-            v1_raw = extension.extract_slice(values, [0, ROTARY_PAIRS], [TOKENS_PER_PROG, BLOCK_R], [1, 1])
-            w0 = extension.extract_slice(tl.reshape(k_weight, (1, BLOCK_D)), [0, 0], [1, BLOCK_R], [1, 1])
-            w1 = extension.extract_slice(tl.reshape(k_weight, (1, BLOCK_D)), [0, ROTARY_PAIRS], [1, BLOCK_R], [1, 1])
-            value0 = (v0_raw * inverse_rms[:, None] * w0).to(tl.bfloat16).to(tl.float32)
-            value1 = (v1_raw * inverse_rms[:, None] * w1).to(tl.bfloat16).to(tl.float32)
-            rotated0 = (value0 * cos_value - value1 * sin_value).to(tl.bfloat16)
-            rotated1 = tl.fma(value0, sin_value, value1 * cos_value).to(tl.bfloat16)
-
-            k_base = offs_t[:, None] * stride_k_out_token + (slot - NUM_Q_HEADS) * HEAD_DIM
-            tl.store(k_out_ptr + k_base + pairs[None, :], rotated0, mask=rot_store_mask)
-            tl.store(k_out_ptr + k_base + (ROTARY_PAIRS + pairs)[None, :], rotated1, mask=rot_store_mask)
-            tl.store(k_out_ptr + k_base + dims[None, :], normalized, mask=non_rot_store_mask)
-        else:
-            # V passthrough: V must retain its original bits.
-            v_head = slot - NUM_Q_HEADS - NUM_KV_HEADS
-            v_value = tl.load(qkv_ptr + head_base + dims[None, :], mask=load_mask)
-            v_out_base = offs_t[:, None] * stride_v_out_token + v_head * HEAD_DIM
-            tl.store(v_out_ptr + v_out_base + dims[None, :], v_value, mask=load_mask)
 
 
 def _fused_qknorm_rope_impl(
@@ -396,50 +188,6 @@ def _fused_qknorm_rope_impl(
     k_out = torch.empty((tokens, num_kv_heads * HEAD_DIM), device=qkv.device, dtype=qkv.dtype)
     v_out = torch.empty((tokens, num_kv_heads * HEAD_DIM), device=qkv.device, dtype=qkv.dtype)
     if tokens == 0:
-        return q_out, k_out, v_out
-
-    if (
-        _V2_ENABLED
-        and qkv.dtype == torch.bfloat16
-        and 0 < rotary_pairs
-        and 2 * rotary_pairs <= HEAD_DIM
-        and num_q_heads > 0
-        and num_kv_heads > 0
-    ):
-        # V2 path: same arithmetic, 2-D grid so decode actually fills the AIV
-        # cores.  Falls through to the original kernel for anything else.
-        num_slots = num_q_heads + 2 * num_kv_heads
-        tp, hp = _pick_qknorm_rope_v2_tile(tokens, num_slots)
-        block_d, block_r = _v2_block_sizes(rotary_pairs)
-        _split_qkv_norm_rope_192_kernel_v2[
-            (triton.cdiv(tokens, tp), triton.cdiv(num_slots, hp))
-        ](
-            qkv,
-            q_out,
-            k_out,
-            v_out,
-            q_weight,
-            k_weight,
-            cos,
-            sin,
-            positions,
-            tokens,
-            qkv.stride(0),
-            q_out.stride(0),
-            k_out.stride(0),
-            v_out.stride(0),
-            cos.stride(0),
-            NUM_Q_HEADS=num_q_heads,
-            NUM_KV_HEADS=num_kv_heads,
-            ROTARY_PAIRS=rotary_pairs,
-            EPS=float(eps),
-            NORM_WEIGHT_BIAS=float(norm_weight_bias),
-            HEAD_DIM=HEAD_DIM,
-            TOKENS_PER_PROG=tp,
-            HEADS_PER_PROG=hp,
-            BLOCK_D=block_d,
-            BLOCK_R=block_r,
-        )
         return q_out, k_out, v_out
 
     grid = lambda meta: (triton.cdiv(tokens, meta["BLOCK_M"]),)

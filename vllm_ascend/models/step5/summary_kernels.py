@@ -31,7 +31,7 @@ import triton.language as tl
 
 # Reuse the upstream Triton layout builder unchanged: it is device-agnostic
 # (pure Triton + torch) and bit-exact with the reference computation.
-from vllm.models.step5.nvidia.ops.cute_dsl.indexer_ops.decode_summary_layout_step3p5 import (  # noqa: E501
+from vllm_ascend.models.step5._decode_summary_layout import (  # noqa: E501
     build_decode_summary_layout_step3p5,
 )
 

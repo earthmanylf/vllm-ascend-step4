@@ -25,7 +25,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.models.step5.mtp import (
+from vllm.models.step5.nvidia.mtp import (
     Step5MTPSharedHead,
     Step5MTP,
     Step5MultiTokenPredictor,
@@ -34,9 +34,9 @@ from vllm.models.step5.mtp import (
     _get_mtp_config,
     _get_mtp_vllm_config,
     _get_step5_mtp_moe_blocks,
-    _require_resolved_valid_vocab_size,
     _set_step5_moe_protocol_metadata,
 )
+from vllm_ascend.models.step5._step5_compat import _require_resolved_valid_vocab_size
 from vllm.model_executor.models.utils import maybe_prefix
 
 from vllm_ascend.models.step5.model import AscendStep5DecoderLayer

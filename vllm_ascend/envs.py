@@ -81,6 +81,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
+    # Whether to run Step5 routed experts with the native fp8 block kernels
+    # (Step5Fp8BlockFusedMoEMethod). Default 0 -> AscendFp8BlockFusedMoEMethod. Valid "0"/"1".
+    "VLLM_ASCEND_ENABLE_STEP4_FP8": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_STEP4_FP8", "0"))),
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB

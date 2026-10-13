@@ -37,7 +37,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.models.step5.sparse_summary_cache import Step5DSAScratchWorkspace
+from vllm_ascend.models.step5._step5_compat import Step5DSAScratchWorkspace
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -52,16 +52,15 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 
 from vllm_ascend.models.step5.dsa_kernels import (
-    build_decode_summary_layout_step3p5_dispatch,
     decode_sparse_meta,
     indexer_logits_paged,
-    merge_split_states,
     prefill_sparse_meta,
     sparse_attention_decode,
     sparse_attention_prefill,
 )
 from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache
 from vllm_ascend.models.step5.summary_kernels import (
+    build_decode_summary_layout_step3p5,
     csa_compact_decode_update,
     csa_compact_prefill_update,
     csa_deferred_flush,
@@ -69,36 +68,6 @@ from vllm_ascend.models.step5.summary_kernels import (
 )
 
 logger = init_logger(__name__)
-
-
-def _decode_split_count(num_rows: int, topk: int, num_cores: int) -> int:
-    """Slot-window split count for the sparse attention decode kernel.
-
-    The decode kernel's grid is ``(num_rows, num_kv_groups, num_splits)``; at
-    ``max_num_seqs=1`` with MTP verify batches ``num_rows`` is 1..4, so the
-    default ``num_splits=1`` leaves all but a handful of AI cores idle while
-    each program streams the whole selected-KV window (topk=512 regions =
-    4096 tokens = 1.5MB K + 1.5MB V) alone. Split the slot window so the
-    device is filled, then merge the partial states (mathematically exact;
-    same online-softmax split/merge the prefill path already uses).
-
-    The value is derived only from host-config constants (capacity, topk,
-    core count) so it stays static per ACL-graph capture bucket. It is a
-    power of two, and every split keeps at least ``MIN_REGIONS_PER_SPLIT``
-    regions so the fused K/V gather (BLOCK_R regions per iteration) stays
-    efficient.
-    """
-    min_regions_per_split = 8
-    if num_rows <= 0:
-        return 1
-    # Aim for ~2 programs per core; each row already owns one program.
-    target = max(1, (2 * max(1, num_cores)) // num_rows)
-    cap = max(1, int(topk) // min_regions_per_split)
-    splits = min(target, cap)
-    # Floor to a power of two (kernel contract: BLOCK_R tiles the window).
-    splits = 1 << max(0, splits.bit_length() - 1)
-    return max(1, splits)
-
 
 _CSA_ALLOCATION_ERROR = (
     "Step5 DSA active-slot capacity is exhausted. Lower max_num_seqs or "
@@ -445,9 +414,6 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         self._decode_out_dtype = decode_out_dtype or torch.bfloat16
         # Selector width: every region a max-length sequence can fill.
         self._max_regions = -(-self.max_model_len // self.region_size)
-        # Cached AI-core count for the decode split-k policy (lazy: needs a
-        # live device; resolved before the first forward / graph capture).
-        self._device_num_cores: int | None = None
         self._summary_cache: AscendStep5SparseSummaryCache | None = None
         self._summary_cache_config = None
         self._dsa_scratch_workspace = Step5DSAScratchWorkspace()
@@ -470,23 +436,6 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         if is_forward_context_available():
             return int(getattr(get_forward_context(), "virtual_engine", 0) or 0)
         return 0
-
-    def _num_cores(self) -> int:
-        """AI-core count, resolved once and cached (split-k policy input)."""
-        if self._device_num_cores is None:
-            cores = 32
-            try:
-                import triton
-
-                cores = int(
-                    triton.runtime.driver.active.utils.get_device_properties("npu")[
-                        "num_aicore"
-                    ]
-                )
-            except Exception:  # noqa: BLE001 - conservative default
-                cores = 32
-            self._device_num_cores = max(1, cores)
-        return self._device_num_cores
 
     def _get_dsa_tensor_buffer_at_least(
         self,
@@ -735,7 +684,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             token_positions,
             reset_slots,
             token_valid,
-        ) = build_decode_summary_layout_step3p5_dispatch(
+        ) = build_decode_summary_layout_step3p5(
             md.slot_mapping,
             md.query_start_loc,
             md.seq_lens,
@@ -1052,42 +1001,18 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
         )
-        # Split-k: at max_num_seqs=1 the grid is (1, 1, 1) -- a single
-        # program streams the whole selected-KV window alone. Spread the
-        # slot window over idle cores and merge (exact; see
-        # _decode_split_count). splits is a pure function of the batch
-        # shape, so it is static per ACL-graph capture bucket.
-        splits = _decode_split_count(
-            groups * n, self.topk_regions, self._num_cores()
+        out, _ = sparse_attention_decode(
+            query,
+            key_flat,
+            value_flat,
+            packed,
+            counts,
+            seq_lens_i32,
+            num_kv_groups=groups,
+            region_size=self.region_size,
+            softmax_scale=self.scale,
+            block_regions=16,
         )
-        if splits > 1:
-            partial_out, partial_lse = sparse_attention_decode(
-                query,
-                key_flat,
-                value_flat,
-                packed,
-                counts,
-                seq_lens_i32,
-                num_kv_groups=groups,
-                region_size=self.region_size,
-                softmax_scale=self.scale,
-                block_regions=16,
-                num_splits=splits,
-            )
-            out, _ = merge_split_states(partial_out, partial_lse)
-        else:
-            out, _ = sparse_attention_decode(
-                query,
-                key_flat,
-                value_flat,
-                packed,
-                counts,
-                seq_lens_i32,
-                num_kv_groups=groups,
-                region_size=self.region_size,
-                softmax_scale=self.scale,
-                block_regions=16,
-            )
         output[:n] = out.to(output.dtype)
 
     def _forward_sparse_gqa_verify(
@@ -1161,39 +1086,18 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
         )
-        # Split-k over the flattened verify rows (same policy as the pure
-        # decode path; see _decode_split_count).
-        splits = _decode_split_count(
-            groups * total, self.topk_regions, self._num_cores()
+        out, _ = sparse_attention_decode(
+            query,
+            key_flat,
+            value_flat,
+            packed,
+            counts,
+            row_kv_seqlens,
+            num_kv_groups=groups,
+            region_size=self.region_size,
+            softmax_scale=self.scale,
+            block_regions=16,
         )
-        if splits > 1:
-            partial_out, partial_lse = sparse_attention_decode(
-                query,
-                key_flat,
-                value_flat,
-                packed,
-                counts,
-                row_kv_seqlens,
-                num_kv_groups=groups,
-                region_size=self.region_size,
-                softmax_scale=self.scale,
-                block_regions=16,
-                num_splits=splits,
-            )
-            out, _ = merge_split_states(partial_out, partial_lse)
-        else:
-            out, _ = sparse_attention_decode(
-                query,
-                key_flat,
-                value_flat,
-                packed,
-                counts,
-                row_kv_seqlens,
-                num_kv_groups=groups,
-                region_size=self.region_size,
-                softmax_scale=self.scale,
-                block_regions=16,
-            )
         output[:total] = out.to(output.dtype)
 
     def _score_regions(

@@ -23,10 +23,12 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
-from vllm.models.step5.sparse_summary_cache import (
+from vllm.models.step5.nvidia.sparse_summary_cache import (
     Step5SparseSummaryCache,
-    Step5SparseSummaryCacheConfig,
     Step5SparseSummaryCacheLayer,
+)
+from vllm_ascend.models.step5._step5_compat import (
+    Step5SparseSummaryCacheConfig,
     step5_sparse_summary_cache_bytes_per_block,
 )
 
