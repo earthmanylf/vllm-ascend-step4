@@ -414,3 +414,185 @@ class AscendFp8BlockFusedMoEMethod(AscendMoEScheme):
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+
+
+def _aclnn_block_fp8_available() -> bool:
+    """Whether the packaged custom-op lib registers the V5 block-fp8 GMM.
+
+    ``_C_ascend.grouped_matmul_block_fp8`` wraps the aclnnGroupedMatmulV5
+    G-B scenario (e4m3 weights + fp32 128x128 block scales + fp32
+    per-token-per-128-group activation scales), which torch_npu's
+    npu_grouped_matmul wrapper cannot reach (it routes fp8 to the V4 entry
+    and rejects it). Needs a build with COMPILE_CUSTOM_KERNELS=1; when the
+    op is absent the Step5 fp8 path falls back to the vendored triton
+    kernels.
+    """
+    from vllm_ascend.ops.grouped_matmul_v5 import block_fp8_gmm_available
+
+    return block_fp8_gmm_available()
+
+
+def _to_kmajor(weight: torch.Tensor, scale_inv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transpose one MoE weight (and its block scales) to the V5 layout.
+
+    aclnnGroupedMatmulV5 expects K-major weights: ``[g, K, N]`` fp8 with
+    ``[g, ceil(K/128), ceil(N/128)]`` fp32 block scales, while the
+    checkpoint (and the loader) store ``[g, N, K]`` with
+    ``[g, ceil(N/128), ceil(K/128)]`` scales. Pure layout change -- the
+    fp8 payload and the scales are bitwise untouched.
+    """
+    return weight.transpose(1, 2).contiguous(), scale_inv.transpose(1, 2).contiguous()
+
+
+@register_scheme(FP8_METHOD, "step5_moe")
+class Step5Fp8BlockFusedMoEMethod(AscendMoEScheme):
+    """Step5 routed experts executing the native fp8 block quantization.
+
+    Unlike :class:`AscendFp8BlockFusedMoEMethod`, weights stay
+    ``float8_e4m3fn`` with their fp32 ``weight_scale_inv`` block scales
+    exactly as checkpointed -- no bf16 resolution and no MXFP8 requantize.
+    ``apply`` runs each expert with the kernels vendored from the step5-hf
+    reference (``vllm_ascend/models/step5/fp8_kernels.py``): dynamic
+    per-128-group e4m3 activation quantization plus the block-scaled fp8
+    GEMM, clamped SwiGLU between the two projections, and a top-k
+    slot-order fp32 weighted combine.
+
+    With TP (no EP) every rank holds the intermediate-dim slice of all
+    experts, so each rank produces a partial routed contribution that the
+    decoder layer combines with the shared expert in fp32 before one
+    all-reduce.
+    """
+
+    quant_type: QuantType = QuantType.NONE
+
+    # The only clamp limit Step5 ships (validated by the model's MoE block).
+    SWIGLU_LIMIT = 7.0
+
+    # Keep the router's fp32 topk_weights: AscendRoutedExperts._select_experts
+    # skips its hidden-dtype cast for schemes opting in here. npu_moe_gating_top_k
+    # already produced the weights in fp32 (Step5 feeds it fp32 logits and the
+    # op's output dtype follows its input); the cast to bf16 would be a one-way
+    # precision loss on the routed combine.
+    keep_fp32_topk_weights = True
+
+    def __init__(self, weight_block_size: tuple[int, int], moe_config) -> None:
+        self.block_n, self.block_k = weight_block_size
+        if (self.block_n, self.block_k) != (128, 128):
+            raise ValueError(f"Step5 fp8 experts require 128x128 weight blocks, got {(self.block_n, self.block_k)}.")
+        # Hints the upstream loader to narrow ``*_weight_scale_inv`` per
+        # expert shard, exactly like AscendFp8BlockFusedMoEMethod.
+        self.group_size = self.block_k
+        self.moe_config = moe_config
+
+    def get_weight(
+        self,
+        num_experts: int,
+        intermediate_size_per_partition: int,
+        hidden_sizes: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        return {
+            "w13_weight": torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_sizes,
+                dtype=BLOCK_FP8_WEIGHT_DTYPE,
+            ),
+            "w2_weight": torch.empty(
+                num_experts,
+                hidden_sizes,
+                intermediate_size_per_partition,
+                dtype=BLOCK_FP8_WEIGHT_DTYPE,
+            ),
+        }
+
+    def get_dynamic_quant_param(
+        self,
+        num_experts: int,
+        intermediate_size_per_partition: int,
+        hidden_sizes: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        return {
+            "w13_weight_scale_inv": torch.empty(
+                num_experts,
+                cdiv(2 * intermediate_size_per_partition, self.block_n),
+                cdiv(hidden_sizes, self.block_k),
+                dtype=torch.float32,
+            ),
+            "w2_weight_scale_inv": torch.empty(
+                num_experts,
+                cdiv(hidden_sizes, self.block_n),
+                cdiv(intermediate_size_per_partition, self.block_k),
+                dtype=torch.float32,
+            ),
+        }
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Nothing to resolve or requantize: the fp8 weights and block scales
+        # are executed as loaded. The only preparation is a pure layout
+        # change: when the aclnnGroupedMatmulV5 custom op is packaged, both
+        # weights and scales move to the K-major layout that operator
+        # expects, so fp8_block_apply_mlp can run the whole expert batch
+        # through the grouped kernel instead of the per-expert triton loop.
+        self.use_aclnn_gmm = _aclnn_block_fp8_available()
+        if self.use_aclnn_gmm:
+            logger.info_once(
+                "Step5 fp8 experts: aclnnGroupedMatmulV5 block-fp8 G-B path enabled (K-major weight layout)."
+            )
+            for weight_name, scale_name in (
+                ("w13_weight", "w13_weight_scale_inv"),
+                ("w2_weight", "w2_weight_scale_inv"),
+            ):
+                weight, scale = _to_kmajor(getattr(layer, weight_name).data, getattr(layer, scale_name).data)
+                replace_parameter(layer, weight_name, weight)
+                replace_parameter(layer, scale_name, scale)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: Any | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ):
+        # Same shape as AscendW8A8MXFP8DynamicFusedMoEMethod.apply: pack the
+        # routed-experts inputs and hand them to the framework's three-stage
+        # pipeline (token_dispatch -> MLP compute -> token_combine). The
+        # dispatcher pair adapts to the active comm method (ALLGATHER sorts
+        # locally and unpermutes, MC2 ships tokens across ranks), and the
+        # FP8_BLOCK quant branch routes the middle stage to the vendored
+        # step5-hf block-fp8 kernels (see fp8_block_apply_mlp).
+        #
+        # topk_weights come straight from npu_moe_gating_top_k: Step5's fp32
+        # gate feeds fp32 logits into the op (whose output dtype follows its
+        # input) and keep_fp32_topk_weights opts out of the framework's
+        # hidden-dtype cast in _select_experts, so the weights arrive in fp32.
+        # The .float() is a no-op on that path and only guards unexpected
+        # bf16 producers.
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+        from vllm_ascend.ops.fused_moe.dataclass.fused_experts import (
+            build_fused_experts_input,
+        )
+
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        return moe_comm_method.fused_experts(
+            fused_experts_input=build_fused_experts_input(
+                hidden_states=x,
+                topk_weights=topk_weights.float(),
+                topk_ids=topk_ids,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                quant_type=QuantType.FP8_BLOCK,
+                dynamic_eplb=False,
+                expert_map=layer.ascend_expert_map,
+                global_redundant_expert_num=layer.global_redundant_expert_num,
+                mc2_mask=layer.ascend_mc2_mask,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                pertoken_scale=None,
+                activation=layer.activation,
+                w1_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+            )
+        )
