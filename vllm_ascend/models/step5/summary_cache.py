@@ -120,6 +120,79 @@ class AscendStep5SparseSummaryCache(Step5SparseSummaryCache):
 class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
     """Binds ``AscendStep5SparseSummaryCache`` instead of the upstream class."""
 
+    def __init__(
+        self,
+        *,
+        prefix: str,
+        target_impl: Any,
+        sparse_config: Any = None,
+        main_layer_name: str,
+        static_forward_context: dict[str, Any],
+    ) -> None:
+        # swf's Step5SparseSummaryCacheLayer.__init__ takes (prefix, target_impl,
+        # main_layer_name, static_forward_context): no sparse_config, and it no
+        # longer sets the Ascend-private attributes. Adapt here.
+        super().__init__(
+            prefix=prefix,
+            target_impl=target_impl,
+            main_layer_name=main_layer_name,
+            static_forward_context=static_forward_context,
+        )
+        self._main_layer_name = main_layer_name
+        self._sparse_config = sparse_config
+        self._kv_cache_block_size: int | None = None
+        self._dsa_scratch_workspace = None
+        self._backing_bytes_per_page: int | None = None
+        self._budget_bytes_per_page: int | None = None
+        self._budget_only_cache = None
+
+    def _set_summary_cache_budget(self, block_size: int) -> int:
+        # Record the scheduler block size (bind validates it was created after
+        # the KV spec) and report the bytes the Ascend sidecar actually needs so
+        # the vLLM extra-budget contract matches the real allocation.
+        self._kv_cache_block_size = int(block_size)
+        if block_size % 8:
+            raise ValueError("Step5 KV blocks must align to eight-token regions")
+        try:
+            proxy_dim = int(getattr(self._sparse_config, "proxy_dim", 0) or 0)
+            num_proxy_kv_heads = int(
+                getattr(self._target_impl, "summary_cache_num_proxy_kv_heads", 1) or 1
+            )
+            region_block_size = int(self._target_impl.sparse_region_block_size)
+            payload = step5_sparse_summary_cache_bytes_per_block(
+                block_size=block_size,
+                region_block_size=region_block_size,
+                proxy_dim=proxy_dim,
+                num_kv_heads=num_proxy_kv_heads,
+                sum_dtype=torch.uint8,
+                count_dtype=torch.uint8,
+            )
+            backing = ((int(payload) + int(block_size) - 1) // int(block_size)) * int(
+                block_size
+            )
+            reverse = (
+                Step5SparseSummaryCacheConfig.max_region_fragments_per_block(
+                    block_size=block_size,
+                    region_block_size=region_block_size,
+                )
+                * torch.tensor([], dtype=torch.int32).element_size()
+            )
+            return int(backing + reverse)
+        except Exception:
+            return super()._set_summary_cache_budget(block_size)
+
+    def _ensure_shared_scratch_workspace(self, forward_context: dict[str, Any]) -> None:
+        # Ascend DSA uses staged / deferred-flush; no shared CUDA scratch workspace.
+        return None
+
+    def prepare_kv_cache_side_storage_memory_profile(
+        self, forward_context: dict[str, Any], device: Any
+    ) -> None:
+        # Upstream builds a CUDA Step5FlashInferSparse adapter and reads
+        # ``_target_impl.adapter``; the Ascend impl has neither. No-op keeps the
+        # worker memory-profiling pass NPU-safe.
+        return None
+
     def bind_kv_cache_side_storage(
         self,
         forward_context: dict[str, Any],
