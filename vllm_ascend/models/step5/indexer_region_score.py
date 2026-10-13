@@ -5,13 +5,17 @@ Wraps ``indexer_region_score`` from ops-transformer, which fuses region
 scoring, causal masking (mask_mode=3) and TopK selection with ascending
 logical-id sort (``top_k`` + ``sort_mode=1``) into a single operator call.
 
-The operator returns ``scores [G,T,R]`` and fills the caller-allocated
-``selected_region_ids [G,T,top_k]`` INT32 (logical region ids, ascending,
--1 padded). It performs **no** physical-page mapping, current-region append
-or metadata packing — those stay in the Triton pack kernels
-(``_decode_pack_kernel`` / ``_append_current_region_kernel``), whose
-``ids [rows, topk]`` input contract is satisfied by a zero-copy reshape of
-the operator output.
+The operator returns ``(scores [G,T,R], ids [G,T,top_k])`` and allocates
+the INT32 id output itself (ascending logical region ids, ``-1`` padded).
+With ``top_k > 0`` the causal path prunes K macros per request -- regions
+beyond a row's visible range are neither fetched nor scored nor written --
+so the masked score columns and the ``[max_region_len, R_out)`` tail are
+**unspecified**; only the visible candidates' scores are guaranteed and
+must be the only columns consumed as scores. The operator performs **no**
+physical-page mapping, current-region append or metadata packing — those
+stay in the Triton pack kernels (``_decode_pack_kernel`` /
+``_append_current_region_kernel``), whose ``ids [rows, topk]`` input
+contract is satisfied by a zero-copy reshape of the operator output.
 """
 
 from __future__ import annotations
@@ -62,15 +66,13 @@ def indexer_score_topk(
         group-major 2D views of the operator's [G,T,...] outputs, ready for
         the Triton pack kernels. ``ids`` rows hold logical region ids in
         ascending order with ``-1`` tail padding, the exact contract of
-        ``region_topk_ids`` / ``topk_select_new`` outputs.
+        ``region_topk_ids`` / ``topk_select_new`` outputs. With ``top_k > 0``
+        only the causally visible score columns are defined (the operator
+        skips fetching/scoring/writing masked macros); masked and tail
+        columns must not be consumed as scores.
     """
     tokens, groups = index_q.shape[:2]
-    selected_ids = torch.empty(
-        (groups, tokens, topk),
-        device=index_q.device,
-        dtype=torch.int32,
-    )
-    scores = indexer_region_score(
+    scores, ids = indexer_region_score(
         index_q.to(torch.float8_e4m3fn),
         weights,
         paged_key_summary=mean_cache,
@@ -84,9 +86,8 @@ def indexer_score_topk(
         region_size=region_size,
         top_k=topk,
         sort_mode=1,
-        selected_region_ids=selected_ids,
     )
     return (
         scores.reshape(groups * tokens, scores.shape[-1]),
-        selected_ids.reshape(groups * tokens, topk),
+        ids.reshape(groups * tokens, topk),
     )
