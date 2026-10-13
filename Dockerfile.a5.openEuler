@@ -16,7 +16,7 @@
 #
 
 ARG CANN_QUAY_URL="quay.io/ascend/cann"
-ARG CANN_VERSION="9.1.0"
+ARG CANN_VERSION="9.2.0"
 FROM ${CANN_QUAY_URL}:${CANN_VERSION}-950-openeuler24.03-py3.12
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
@@ -40,17 +40,17 @@ RUN yum update -y && \
     rm -rf /var/cache/yum/*
 
 # Upgrade CANN ops package to 9.2.0
-ARG TARGETPLATFORM
-RUN ARCH=$(case "${TARGETPLATFORM}" in \
-        "linux/amd64") echo "x86_64" ;; \
-        "linux/arm64") echo "aarch64" ;; \
-        *) echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM}" && exit 1 ;; \
-    esac) && \
-    CANN_OPS_URL=https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.2.T3/Ascend-cann-950-ops_9.2.0-beta.2_linux-${ARCH}.run && \
-    wget --quiet --header="Referer: https://www.hiascend.com/" ${CANN_OPS_URL} -O ~/Ascend-cann-ops-9.2.0.run && \
-    chmod +x ~/Ascend-cann-ops-9.2.0.run && \
-    ~/Ascend-cann-ops-9.2.0.run --quiet --install --install-for-all && \
-    rm -f ~/Ascend-cann-ops-9.2.0.run
+# ARG TARGETPLATFORM
+# RUN ARCH=$(case "${TARGETPLATFORM}" in \
+#         "linux/amd64") echo "x86_64" ;; \
+#         "linux/arm64") echo "aarch64" ;; \
+#         *) echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM}" && exit 1 ;; \
+#     esac) && \
+#     CANN_OPS_URL=https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.2.T3/Ascend-cann-950-ops_9.2.0-beta.2_linux-${ARCH}.run && \
+#     wget --quiet --header="Referer: https://www.hiascend.com/" ${CANN_OPS_URL} -O ~/Ascend-cann-ops-9.2.0.run && \
+#     chmod +x ~/Ascend-cann-ops-9.2.0.run && \
+#     ~/Ascend-cann-ops-9.2.0.run --quiet --install --install-for-all && \
+#     rm -f ~/Ascend-cann-ops-9.2.0.run
 
 # Install modelscope (for fast download) and ray (for multinode)
 RUN pip config set global.index-url ${PIP_INDEX_URL} && \
@@ -59,8 +59,8 @@ RUN pip config set global.index-url ${PIP_INDEX_URL} && \
     python3 -m pip cache purge
 
 # Install vLLM
-ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG VLLM_TAG=v0.27.1
+ARG VLLM_REPO=https://github.com/earthmanylf/vllm-step4
+ARG VLLM_TAG=water18
 RUN if [ -n "$GIT_PROXY" ]; then git config --global url."${GIT_PROXY}https://github.com/".insteadOf https://github.com/; fi && \
     git clone --depth 1 -b $VLLM_TAG $VLLM_REPO /vllm-workspace/vllm
 # In x86, triton will be installed by vllm. But in Ascend, triton doesn't work correctly. we need to uninstall it.
@@ -76,14 +76,32 @@ ENV SOC_VERSION=$SOC_VERSION \
     OMP_NUM_THREADS=1
 COPY . /vllm-workspace/vllm-ascend/
 
+# Install flash-attention-npu
+RUN git clone https://github.com/MinghuasLab/flash-attention-npu.git && \
+    cd flash-attention-npu && \
+    git checkout 1b66cbece9223ef95f60f05f884f02270680f78d && \
+    git submodule update --init --recursive && \
+    FLASH_ATTN_BUILD_NPU=950 python setup.py install
+
 RUN export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     python3 -m pip install -e /vllm-workspace/vllm-ascend/ --extra-index-url ${PYTORCH_INDEX_URL} && \
     python3 -m pip uninstall -y triton triton-ascend && \
-    python3 -m pip install triton-ascend==3.2.2 --extra-index-url ${ASCEND_INDEX_URL} && \
     python3 -m pip install concurrent-log-handler && \
     python3 -m pip cache purge
+
+RUN wget https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261011191350/triton_ascend-3.6.0%2Bdev20261011191350-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl && \
+    pip install triton_ascend-3.6.0%2Bdev20261011191350-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+
+# Install custom op
+RUN git clone https://gitcode.com/HuangKun8682/ops-transformer_inedex_topk && \
+    cd ops-transformer_inedex_topk && \
+    bash build.sh --pkg --soc="ascend950" --vendor_name="step5_ops" --ops="ascend950" -j16 && \
+    bash build.sh --torch_extension && \
+    cd build_out && \
+    ./cann-ops-transformer-step5_ops_linux-aarch64.run && \
+    python3 -m pip install --force-reinstall --no-deps cann_ops_transformer-1.0.0-py3-none-any.whl
 
 # Install _rust_tool_parser for the Rust frontend.
 RUN cd /vllm-workspace/vllm && \
@@ -92,6 +110,8 @@ RUN cd /vllm-workspace/vllm && \
 
 RUN echo "export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:$LD_PRELOAD" >> ~/.bashrc
 RUN echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib" >> ~/.bashrc
+RUN echo "export ASCEND_CUSTOM_OPP_PATH=$ASCEND_OPP_PATH/vendors/step5_ops_transformer" >> ~/.bashrc
+RUN echo "export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.2.0/opp/vendors/step5_ops_transformer/op_api/lib/:${LD_LIBRARY_PATH}" >> ~/.bashrc
 
 # ===== Conditional installation based on BUILD_TYPE =====
 # All ARG definitions are in the same stage for better maintainability
