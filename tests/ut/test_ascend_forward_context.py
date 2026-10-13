@@ -453,20 +453,36 @@ def test_select_moe_comm_method_a3_mc2_invalid_hidden_size(
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "world_size", "top_k_experts", "expected"),
+    ("num_tokens", "world_size", "pipeline_parallel_size", "top_k_experts", "expected"),
     [
-        (128, 4, 2, MoECommType.MC2),
-        (129, 2, 4, MoECommType.ALLGATHER),
-        (129, 8, 4, MoECommType.ALLTOALL),
+        (128, 4, 1, 2, MoECommType.MC2),
+        (129, 2, 1, 4, MoECommType.ALLGATHER),
+        (129, 8, 1, 4, MoECommType.ALLTOALL),
+        # Large global world but small EP world (e.g. PP4TP4): the EP world
+        # size, not world_size_across_dp, decides against all-to-all.
+        (129, 16, 4, 8, MoECommType.ALLGATHER),
+        (128, 16, 4, 8, MoECommType.MC2),
+        (129, 8, 2, 2, MoECommType.ALLTOALL),
     ],
 )
-def test_select_moe_comm_method_a5(monkeypatch, num_tokens, world_size, top_k_experts, expected):
+def test_select_moe_comm_method_a5(
+    monkeypatch,
+    num_tokens,
+    world_size,
+    pipeline_parallel_size,
+    top_k_experts,
+    expected,
+):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
         device_type=AscendDeviceType.A5,
         capacity=128,
     )
-    vllm_config = _make_vllm_config(world_size=world_size, top_k_experts=top_k_experts)
+    vllm_config = _make_vllm_config(
+        world_size=world_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        top_k_experts=top_k_experts,
+    )
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
 
