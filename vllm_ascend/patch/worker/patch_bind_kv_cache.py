@@ -56,6 +56,18 @@ def bind_kv_cache(
     # vLLM #52506 adds ReplaySSM ring trackers on main.
     utils.share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)
 
+    # vLLM core's bind_kv_cache_to_layers also walks KVCacheSideStorageLayer
+    # instances (e.g. the Step5 DSA sparse summary sidecar). The Ascend rewrite
+    # above only assigns ``layer.kv_cache``, so restore the side-storage pass.
+    try:
+        from vllm.v1.worker.utils import KVCacheSideStorageLayer
+    except Exception:
+        KVCacheSideStorageLayer = None
+    if KVCacheSideStorageLayer is not None:
+        for _layer in forward_context.values():
+            if isinstance(_layer, KVCacheSideStorageLayer):
+                _layer.bind_kv_cache_side_storage(forward_context)
+
 
 utils.bind_kv_cache = bind_kv_cache
 

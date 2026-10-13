@@ -1445,7 +1445,17 @@ class AscendStep5Model(Step5Model):
         return hidden_states
 
 
-class AscendStep5ForCausalLM(Step5ForCausalLM):
+class AscendStep5ForCausalLM
+
+    @staticmethod
+    def get_model_state_cls():
+        # swf's Step5ForCausalLM.get_model_state_cls() returns the swf core
+        # Step5ModelState, which would bypass AscendModelState.prepare_attn on
+        # the v2 hot path. Pin the Ascend model state instead.
+        from vllm_ascend.worker.v2.model_states.default import AscendModelState
+
+        return AscendModelState
+(Step5ForCausalLM):
     def __init__(
         self,
         *,
