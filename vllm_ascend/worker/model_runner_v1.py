@@ -468,7 +468,7 @@ class NPUModelRunner(GPUModelRunner):
             self.attn_backend, (AscendAttentionBackend, AscendMLABackend)
         )
         import os
-        self._needs_seq_lens_cpu_sync = os.environ.get("VLLM_STEP4_ENABLE_FA3", "0") == "0"
+        self._needs_seq_lens_cpu_sync = os.environ.get("VLLM_STEP4_ENABLE_FA3", "1") == "0"
 
         # kv role
         self.is_kv_producer = False

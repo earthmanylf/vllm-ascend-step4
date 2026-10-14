@@ -237,7 +237,7 @@ class NPUPlatform(Platform):
         if attn_selector_config.use_pcp and attn_selector_config.use_dcp:
             raise NotImplementedError("Ascend MRV2 does not support PCP and DCP simultaneously yet.")
 
-        if os.environ.get("VLLM_STEP4_ENABLE_FA3", "0") == "1":
+        if os.environ.get("VLLM_STEP4_ENABLE_FA3", "1") == "1":
             if util.find_spec("flash_attn_npu_3") is None:
                 raise ImportError("FA3 requires flash-attention-npu built with its v3 backend (flash_attn_npu_3).")
             logger.info_once("Using Ascend FA3 attention with device-side tiling.")

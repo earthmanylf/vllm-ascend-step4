@@ -65,9 +65,14 @@ RUN pip config set global.index-url ${PIP_INDEX_URL} && \
     python3 -m pip cache purge
 
 # Install vLLM
-ARG VLLM_REPO=https://github.com/earthmanylf/vllm-step4
+ARG VLLM_REPO=https://github.com/vllm-ascend/DSv4.1
 ARG VLLM_TAG=water18
-RUN if [ -n "$GIT_PROXY" ]; then git config --global url."${GIT_PROXY}https://github.com/".insteadOf https://github.com/; fi && \
+RUN --mount=type=secret,id=github_token,required=false \
+    TOKEN=$(cat /run/secrets/github_token 2>/dev/null || true); \
+    if [ -n "$GIT_PROXY" ]; then \
+        AUTH=""; [ -n "$TOKEN" ] && AUTH="x-access-token:${TOKEN}@"; \
+        git config --global url."https://${AUTH}${GIT_PROXY#https://}https://github.com/".insteadOf "https://github.com/"; \
+    fi && \
     git clone --depth 1 -b $VLLM_TAG $VLLM_REPO /vllm-workspace/vllm
 # In x86, triton will be installed by vllm. But in Ascend, triton doesn't work correctly. we need to uninstall it.
 RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[audio] --extra-index-url ${PYTORCH_INDEX_URL} && \
@@ -83,13 +88,6 @@ ENV SOC_VERSION=$SOC_VERSION \
     OMP_NUM_THREADS=1
 COPY . /vllm-workspace/vllm-ascend/
 
-# Install flash-attention-npu
-RUN git clone https://github.com/MinghuasLab/flash-attention-npu.git && \
-    cd flash-attention-npu && \
-    git checkout 1b66cbece9223ef95f60f05f884f02270680f78d && \
-    git submodule update --init --recursive && \
-    FLASH_ATTN_BUILD_NPU=950 python setup.py install
-
 RUN export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
@@ -98,11 +96,25 @@ RUN export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
     python3 -m pip install concurrent-log-handler && \
     python3 -m pip cache purge
 
-RUN wget https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261011191350/triton_ascend-3.6.0%2Bdev20261011191350-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl && \
-    pip install triton_ascend-3.6.0%2Bdev20261011191350-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+    
+RUN wget https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261013182112/triton_ascend-3.6.0%2Bdev20261013182112-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl && \
+    pip install triton_ascend-3.6.0%2Bdev20261013182112-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+    
+# Install flash-attention-npu
+RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    source /usr/local/Ascend/nnal/atb/set_env.sh && \
+    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH && \
+    git clone https://github.com/MinghuasLab/flash-attention-npu.git && \
+    cd flash-attention-npu && \
+    git checkout 1b66cbece9223ef95f60f05f884f02270680f78d && \
+    git submodule update --init --recursive && \
+    FLASH_ATTN_BUILD_NPU=950 python setup.py install
 
 # Install custom op
-RUN git clone https://gitcode.com/HuangKun8682/ops-transformer_inedex_topk && \
+RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    source /usr/local/Ascend/nnal/atb/set_env.sh && \
+    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH && \
+    git clone https://gitcode.com/HuangKun8682/ops-transformer_inedex_topk && \
     cd ops-transformer_inedex_topk && \
     bash build.sh --pkg --soc="ascend950" --vendor_name="step5_ops" --ops="ascend950" -j16 && \
     bash build.sh --torch_extension && \
