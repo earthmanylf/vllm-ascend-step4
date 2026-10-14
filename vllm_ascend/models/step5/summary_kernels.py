@@ -1198,6 +1198,27 @@ def csa_deferred_flush(
 
 
 @triton.jit
+def _csa_quantized_e4m3_to_fp32(value):
+    """Make FP8 rounding observable before widening back to FP32.
+
+    Triton Ascend can remove a float->FP8->float cast round-trip. Decode
+    the quantized byte explicitly so the narrowing remains observable,
+    matching real FP8 storage used by the persisted mean and Cube indexer.
+    """
+    bits = value.to(tl.float8e4nv).to(tl.uint8, bitcast=True).to(tl.uint32)
+    exponent = (bits >> 3) & 15
+    mantissa = bits & 7
+    # Construct exact powers of two as FP32 bits, including exp=15's finite
+    # E4M3fn values. Only exponent15/mantissa7 denotes NaN in this format.
+    power = ((exponent + 120) << 23).to(tl.float32, bitcast=True)
+    normal = (1.0 + mantissa.to(tl.float32) * 0.125) * power
+    subnormal = mantissa.to(tl.float32) * 0.001953125
+    magnitude = tl.where(exponent == 0, subnormal, normal)
+    magnitude = tl.where((exponent == 15) & (mantissa == 7), float("nan"), magnitude)
+    return tl.where((bits & 128) != 0, -magnitude, magnitude)
+
+
+@triton.jit
 def _csa_verify_preview_logits_kernel(
     logits,
     index_q,
@@ -1282,18 +1303,15 @@ def _csa_verify_preview_logits_kernel(
     count = prefix_den * scale + tl.sum(staged_weights, axis=0)
     mean = tl.where(count > 0.0, numerator / tl.maximum(count, 1.0e-20), 0.0)
     # Match persisted summary double rounding and the indexer's BF16 widening.
-    mean = mean.to(tl.bfloat16).to(tl.float8e4nv).to(tl.bfloat16).to(tl.float32)
+    mean = _csa_quantized_e4m3_to_fp32(mean.to(tl.bfloat16))
     score = tl.full((), 0.0, tl.float32)
     for head in tl.static_range(HEADS):
-        q = (
+        q = _csa_quantized_e4m3_to_fp32(
             tl.load(
                 index_q + row * Q_ROW_STRIDE + group * Q_GROUP_STRIDE + head * Q_HEAD_STRIDE + dims,
                 mask=dim_mask,
                 other=0.0,
             )
-            .to(tl.float8e4nv)
-            .to(tl.bfloat16)
-            .to(tl.float32)
         )
         weight = tl.load(weights + row * W_ROW_STRIDE + group * W_GROUP_STRIDE + head).to(tl.float32)
         dot = tl.sum(q * mean, axis=0)
