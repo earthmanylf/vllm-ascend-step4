@@ -1,7 +1,9 @@
 """Generated Step-4 minimal inference kernel.py; do not edit by hand.
 
 Regenerate with ``python3 -m dsa_parity.build_step5_minimal_release``.
-Numerical bodies come from the source manifest below.  Only merged-module
+Downstream 950DT adaptation: the indexer cache preparation launch uses
+64-row tiles to fit UB with the pinned 3.6 compiler. Original numerical
+bodies come from the source manifest below.  Only merged-module
 imports/metadata and the experimental Triton sliding-attention branch are
 rewritten; sliding attention is the validated PyTorch SDPA implementation.
 """
@@ -881,13 +883,16 @@ def indexer_logits_paged(
         (num_requests, padded_rows, block_d), device=mean_cache.device, dtype=torch.bfloat16,
     )
     key_valid = torch.empty((num_requests, padded_rows), device=mean_cache.device, dtype=torch.int32)
-    _prepare_indexer_cache[(triton.cdiv(padded_rows, 256), num_requests)](
+    # 256x256 gather overflows 950DT UB in the pinned Triton A5 compiler.
+    # Smaller preparation tiles preserve every logical row and page mapping.
+    prepare_rows = 64
+    _prepare_indexer_cache[(triton.cdiv(padded_rows, prepare_rows), num_requests)](
         mean_cache, block_table, prepared_cache, key_valid,
         seq_k, padded_rows, int(block_table.shape[1]),
         mean_cache.stride(0), mean_cache.stride(1), mean_cache.stride(3),
         block_table.stride(0), block_table.stride(1),
         SUMMARIES_PER_PAGE=int(summaries_per_page), PROXY_DIM=proxy_dim,
-        HAS_CACHE=mean_cache.shape[0] > 0, BLOCK_R=256, BLOCK_D=block_d,
+        HAS_CACHE=mean_cache.shape[0] > 0, BLOCK_R=prepare_rows, BLOCK_D=block_d,
         compile_mode = "simd",
     )
     segment_stride = triton.next_power_of_2(chunk_rows + 1)
