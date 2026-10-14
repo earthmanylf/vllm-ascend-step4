@@ -33,11 +33,9 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm_ascend.models.step5._step5_compat import Step5DSAScratchWorkspace
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -49,8 +47,9 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend.models.step5._step5_compat import Step5DSAScratchWorkspace
 from vllm_ascend.models.step5.dsa_kernels import (
     decode_sparse_meta,
     indexer_logits_paged,
@@ -64,14 +63,14 @@ from vllm_ascend.models.step5.summary_kernels import (
     csa_compact_decode_update,
     csa_compact_prefill_update,
     csa_deferred_flush,
+    csa_verify_preview_logits,
     csa_verify_stage_update,
 )
 
 logger = init_logger(__name__)
 
 _CSA_ALLOCATION_ERROR = (
-    "Step5 DSA active-slot capacity is exhausted. Lower max_num_seqs or "
-    "increase the CSA capacity policy."
+    "Step5 DSA active-slot capacity is exhausted. Lower max_num_seqs or increase the CSA capacity policy."
 )
 
 
@@ -207,18 +206,14 @@ class AscendStep5DSAMetadata(AttentionMetadata):
     decode: AscendStep5DSADecodeMetadata | None = None
 
 
-class AscendStep5DSAMetadataBuilder(
-    AttentionMetadataBuilder[AscendStep5DSAMetadata]
-):
+class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetadata]):
     # Decode forward is fully tensor-driven (see AscendStep5DSAImpl
     # ._forward_sparse_gqa_decode): static shapes per capture bucket, all
     # data-dependent choices realized with device-side validity masks, so
     # uniform single-token decode batches are ACL-graph capturable under
     # FULL_DECODE_ONLY; mixed prefill+decode batches still run eager -- the
     # contract of UNIFORM_BATCH.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_BATCH
-    )
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold: int = 1
 
     def __init__(
@@ -247,25 +242,19 @@ class AscendStep5DSAMetadataBuilder(
         block_table = common_attn_metadata.block_table_tensor
         qsl_cpu = common_attn_metadata.query_start_loc_cpu
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.reorder_batch_threshold,
-                require_uniform=True,
-            )
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
+            require_uniform=True,
         )
 
         prefill_metadata: AscendStep5DSAPrefillMetadata | None = None
         active_prefills = 0
         if num_prefills > 0:
-            active_prefills = _active_prefill_num_reqs(
-                num_prefills, num_prefill_tokens, qsl_cpu, num_decodes
-            )
+            active_prefills = _active_prefill_num_reqs(num_prefills, num_prefill_tokens, qsl_cpu, num_decodes)
             prefill_end = num_decodes + active_prefills
             prefill_seq_lens = seq_lens[num_decodes:prefill_end]
-            prefill_query_lens = qsl_cpu[num_decodes + 1 : prefill_end + 1] - qsl_cpu[
-                num_decodes:prefill_end
-            ]
+            prefill_query_lens = qsl_cpu[num_decodes + 1 : prefill_end + 1] - qsl_cpu[num_decodes:prefill_end]
             # One CPU round trip that already existed for context_lens: keep the
             # host lists around so the prefill step never calls .tolist() on a
             # device tensor again (each of those stalls the NPU pipeline).
@@ -284,8 +273,7 @@ class AscendStep5DSAMetadataBuilder(
                 seq_lens=prefill_seq_lens,
                 context_lens=prefill_context_lens,
                 block_table=block_table[num_decodes:prefill_end],
-                query_start_loc=query_start_loc[num_decodes : prefill_end + 1]
-                - num_decode_tokens,
+                query_start_loc=query_start_loc[num_decodes : prefill_end + 1] - num_decode_tokens,
                 max_query_len=int(prefill_query_lens.max()),
                 num_query_tokens=int(prefill_query_lens.sum()),
                 seq_lens_host=seq_lens_host_t.tolist(),
@@ -297,9 +285,7 @@ class AscendStep5DSAMetadataBuilder(
         if num_decodes > 0:
             query_lens_cpu = qsl_cpu[1 : num_decodes + 1] - qsl_cpu[:num_decodes]
             decode_query_len = int(query_lens_cpu[0].item())
-            active_decodes = _active_decode_num_reqs(
-                num_decodes, num_decode_tokens, decode_query_len
-            )
+            active_decodes = _active_decode_num_reqs(num_decodes, num_decode_tokens, decode_query_len)
             decode_metadata = AscendStep5DSADecodeMetadata(
                 seq_lens=seq_lens[:active_decodes],
                 block_table=block_table[:active_decodes],
@@ -395,9 +381,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 f"size, got block_size={block_size}, region_size={region_size}."
             )
         self.num_speculative_tokens = int(num_speculative_tokens)
-        if self.num_speculative_tokens > 0 and (
-            self.num_speculative_tokens + 1 > region_size
-        ):
+        if self.num_speculative_tokens > 0 and (self.num_speculative_tokens + 1 > region_size):
             # Same constraint as the upstream CUDA impl: a verify batch's
             # K+1 rows must fit inside one region for the staged-rewrite
             # rollback to stay exact.
@@ -453,22 +437,13 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         """
         virtual_engine = self._dsa_virtual_engine()
         self._dsa_scratch_workspace.get_order_token(virtual_engine, device=device)
-        buffers = self._dsa_scratch_workspace.tensor_buffers_by_engine.setdefault(
-            virtual_engine, {}
-        )
+        buffers = self._dsa_scratch_workspace.tensor_buffers_by_engine.setdefault(virtual_engine, {})
         required = 1
         for dim in shape:
             required *= int(dim)
         out = buffers.get(name)
-        if (
-            out is None
-            or out.device != device
-            or out.dtype != dtype
-            or int(out.numel()) < int(required)
-        ):
-            if self._dsa_scratch_workspace.allocations_locked or getattr(
-                self, "_dsa_scratch_bound", False
-            ):
+        if out is None or out.device != device or out.dtype != dtype or int(out.numel()) < int(required):
+            if self._dsa_scratch_workspace.allocations_locked or getattr(self, "_dsa_scratch_bound", False):
                 raise RuntimeError(
                     "Step5 DSA scratch capacity was exceeded after bind: "
                     f"name={name!r}, requested_shape={shape}, "
@@ -499,9 +474,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         capacity = self._csa_active_region_capacity()
         proxy_dim = int(self.proxy_dim)
         region_block_size = int(self.region_size)
-        stage_element_size = torch.tensor(
-            [], dtype=self._decode_out_dtype
-        ).element_size()
+        stage_element_size = torch.tensor([], dtype=self._decode_out_dtype).element_size()
         state_elements = capacity * proxy_dim  # num_kv_heads == 1
         active_token_elements = state_elements * region_block_size
         return int(
@@ -510,9 +483,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             + 2 * state_elements * torch.tensor([], dtype=torch.float32).element_size()
             + capacity * torch.tensor([], dtype=torch.float32).element_size()
             + 2 * active_token_elements * stage_element_size
-            + capacity
-            * region_block_size
-            * torch.tensor([], dtype=torch.uint8).element_size()
+            + capacity * region_block_size * torch.tensor([], dtype=torch.uint8).element_size()
         )
 
     # -- summary cache binding ------------------------------------------------
@@ -525,25 +496,17 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
     ) -> None:
         capacity = int(capacity or self._csa_active_region_capacity())
         device = summary_cache.mean_cache.device
-        total_regions = int(summary_cache.num_pages) * int(
-            summary_cache.summaries_per_page
-        )
+        total_regions = int(summary_cache.num_pages) * int(summary_cache.summaries_per_page)
         proxy_dim = int(self.proxy_dim)
-        summary_cache._step5_csa_active_region_ids = torch.full(
-            (capacity,), -1, device=device, dtype=torch.int32
-        )
+        summary_cache._step5_csa_active_region_ids = torch.full((capacity,), -1, device=device, dtype=torch.int32)
         summary_cache._step5_csa_active_slot_by_region = torch.full(
             (total_regions,), -1, device=device, dtype=torch.int32
         )
-        summary_cache._step5_csa_allocation_success = torch.ones(
-            (1,), device=device, dtype=torch.int32
-        )
+        summary_cache._step5_csa_allocation_success = torch.ones((1,), device=device, dtype=torch.int32)
         summary_cache._step5_csa_numerator_cache = torch.zeros(
             (capacity, 1, proxy_dim), device=device, dtype=torch.float32
         )
-        summary_cache._step5_csa_denominator_cache = torch.zeros_like(
-            summary_cache._step5_csa_numerator_cache
-        )
+        summary_cache._step5_csa_denominator_cache = torch.zeros_like(summary_cache._step5_csa_numerator_cache)
         summary_cache._step5_csa_max_cache = torch.full(
             (capacity, 1), float("-inf"), device=device, dtype=torch.float32
         )
@@ -552,9 +515,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             device=device,
             dtype=self._decode_out_dtype,
         )
-        summary_cache._step5_csa_active_token_z = torch.zeros_like(
-            summary_cache._step5_csa_active_token_k
-        )
+        summary_cache._step5_csa_active_token_z = torch.zeros_like(summary_cache._step5_csa_active_token_k)
         summary_cache._step5_csa_active_token_valid = torch.zeros(
             (capacity, self.region_size), device=device, dtype=torch.uint8
         )
@@ -578,9 +539,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             self._summary_cache_config = summary_cache.config
             self._initialize_csa_summary_state(summary_cache)
         device = summary_cache.mean_cache.device
-        max_layout_rows = self._round_up(
-            max(self.max_num_batched_tokens, self.max_num_seqs), 64
-        )
+        max_layout_rows = self._round_up(max(self.max_num_batched_tokens, self.max_num_seqs), 64)
         for name, dtype in (
             ("csa_layout_flat_slot", torch.int64),
             ("csa_layout_token_slots", torch.int64),
@@ -588,9 +547,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             ("csa_layout_reset_slots", torch.int64),
             ("csa_layout_token_valid", torch.bool),
         ):
-            self._get_dsa_tensor_buffer_at_least(
-                name, (max_layout_rows,), device=device, dtype=dtype
-            )
+            self._get_dsa_tensor_buffer_at_least(name, (max_layout_rows,), device=device, dtype=dtype)
         self._get_dsa_tensor_buffer_at_least(
             "csa_prefill_scratch_region_ids",
             (max_layout_rows,),
@@ -717,10 +674,10 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
     ) -> None:
         """Fold this step's indexer K/Z tokens into the paged summary state.
 
-        Mirrors upstream: a pure decode batch (single token per request)
-        stages tokens and flushes completed regions; any batch containing
-        prefill tokens (mixed included) runs the ordered two-pass update over
-        all tokens of the batch. MTP verify batches (uniform K+1 rows per
+        Single-token decode segments stage tokens and flush completed
+        regions, including in mixed batches. Prefill segments run the ordered
+        two-pass update separately: it cannot fold a decode's staged tail.
+        MTP verify batches (uniform K+1 rows per
         decode request) stage their rows without flushing and materialize
         fully-committed regions through the deferred flush, so rejected
         tokens never pollute the fp8 page cache.
@@ -743,11 +700,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             proxy_dim=int(self.proxy_dim),
             region_block_size=int(self.region_size),
         )
-        verify_batch = (
-            self.num_speculative_tokens > 0
-            and md.decode is not None
-            and md.decode.query_len > 1
-        )
+        verify_batch = self.num_speculative_tokens > 0 and md.decode is not None and md.decode.query_len > 1
         if verify_batch:
             self._update_summary_cache_verify(
                 summary_cache=summary_cache,
@@ -760,8 +713,13 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 common=common,
             )
             return
-        use_decode_update = md.num_prefills == 0 and md.decode is not None
-        if use_decode_update:
+        decode_rows = int(md.num_decode_tokens) if md.decode is not None else 0
+        if md.decode is not None:
+            if self.num_speculative_tokens > 0:
+                # The scheduler can shrink a verify window to one token.
+                # Flush regions accepted in the preceding verify round before
+                # entering the ordinary decode path, including a new region.
+                self._flush_committed_decode_summary(summary_cache=summary_cache, md=md, mean_cache=mean_cache)
             csa_compact_decode_update(
                 mean_cache,
                 summary_cache._step5_csa_active_region_ids,
@@ -773,18 +731,19 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 summary_cache._step5_csa_active_token_k,
                 summary_cache._step5_csa_active_token_z,
                 summary_cache._step5_csa_active_token_valid,
-                layout.token_flat_slot,
-                layout.reset_slots,
-                layout.token_valid,
-                layout.token_positions,
-                index_k,
-                index_z,
-                live_rows=int(layout.token_flat_slot.numel()),
+                layout.token_flat_slot[:decode_rows],
+                layout.reset_slots[:decode_rows],
+                layout.token_valid[:decode_rows],
+                layout.token_positions[:decode_rows],
+                index_k[:decode_rows],
+                index_z[:decode_rows],
+                live_rows=decode_rows,
                 **common,
             )
-        else:
+        if md.num_prefills > 0:
+            prefill_rows = num_tokens - decode_rows
             device = index_k.device
-            padded_rows = self._round_up(num_tokens, 64)
+            padded_rows = self._round_up(prefill_rows, 64)
             scratch_region_ids = self._get_dsa_tensor_buffer_at_least(
                 "csa_prefill_scratch_region_ids",
                 (padded_rows,),
@@ -815,16 +774,38 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 scratch_region_ids,
                 scratch_row_map,
                 scratch_reset_map,
-                layout.token_flat_slot,
-                layout.reset_slots,
-                layout.token_valid,
-                layout.token_positions,
-                index_k,
-                index_z,
-                live_rows=num_tokens,
+                layout.token_flat_slot[decode_rows:],
+                layout.reset_slots[decode_rows:],
+                layout.token_valid[decode_rows:],
+                layout.token_positions[decode_rows:],
+                index_k[decode_rows:],
+                index_z[decode_rows:],
+                live_rows=prefill_rows,
                 **common,
             )
         self._assert_csa_allocation_success(allocation_success)
+
+    def _flush_committed_decode_summary(self, *, summary_cache, md, mean_cache) -> None:
+        d = md.decode
+        csa_deferred_flush(
+            mean_cache,
+            summary_cache._step5_csa_active_region_ids,
+            summary_cache._step5_csa_active_slot_by_region,
+            summary_cache._step5_csa_numerator_cache,
+            summary_cache._step5_csa_denominator_cache,
+            summary_cache._step5_csa_max_cache,
+            summary_cache._step5_csa_active_token_k,
+            summary_cache._step5_csa_active_token_z,
+            summary_cache._step5_csa_active_token_valid,
+            d.seq_lens,
+            d.block_table,
+            num_reqs=md.num_decodes,
+            query_len=int(d.query_len),
+            num_pages=int(summary_cache.num_pages),
+            summaries_per_page=int(summary_cache.summaries_per_page),
+            region_block_size=int(summary_cache.region_block_size),
+            page_size=int(summary_cache.page_size),
+        )
 
     def _update_summary_cache_verify(
         self,
@@ -850,29 +831,10 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         its own rows; a request never contributes rows to both segments.
         """
         d = md.decode
-        n = md.num_decodes
         query_len = int(d.query_len)
         # 1) Materialize fully-committed tail regions (releases their slots
         #    for reuse by this step's staging).
-        csa_deferred_flush(
-            mean_cache,
-            summary_cache._step5_csa_active_region_ids,
-            summary_cache._step5_csa_active_slot_by_region,
-            summary_cache._step5_csa_numerator_cache,
-            summary_cache._step5_csa_denominator_cache,
-            summary_cache._step5_csa_max_cache,
-            summary_cache._step5_csa_active_token_k,
-            summary_cache._step5_csa_active_token_z,
-            summary_cache._step5_csa_active_token_valid,
-            d.seq_lens,
-            d.block_table,
-            num_reqs=n,
-            query_len=query_len,
-            num_pages=int(summary_cache.num_pages),
-            summaries_per_page=int(summary_cache.summaries_per_page),
-            region_block_size=int(summary_cache.region_block_size),
-            page_size=int(summary_cache.page_size),
-        )
+        self._flush_committed_decode_summary(summary_cache=summary_cache, md=md, mean_cache=mean_cache)
         # 2) Stage the verify rows (decode segment leads the batch).
         nv = int(md.num_decode_tokens)
         csa_verify_stage_update(
@@ -1056,9 +1018,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             dtype=torch.float32,
         )
         # Token -> request map: each request contributes K consecutive rows.
-        token_to_req = (
-            torch.arange(total, device=index_q.device, dtype=torch.int32) // k
-        )
+        token_to_req = torch.arange(total, device=index_q.device, dtype=torch.int32) // k
         indexer_logits_paged(
             index_q[:total],
             weights[:total],
@@ -1074,6 +1034,15 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         # clamp(kv_seqlen - start_token, 0, region_size), which is the
         # per-row causal mask.
         row_kv_seqlens = positions[:total].to(torch.int32) + 1
+        csa_verify_preview_logits(
+            logits,
+            index_q[:total],
+            weights[:total],
+            positions[:total],
+            d.block_table[:n],
+            summary_cache,
+            query_len=k,
+        )
         # Per-row block-table rows, gathered on device so the flatten stays
         # graph-capturable; this mirrors the reference's metadata-flatten
         # kernel expanding per-request rows to per-token rows.
@@ -1126,18 +1095,9 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         # ``seq_lens`` from the common attention metadata hold each request's
         # FULL history (past + this chunk's query tokens); the per-row query
         # length is the difference.
-        query_lens_list = [
-            int(seq_lens_host[row]) - int(context_lens_host[row])
-            for row in range(num_rows)
-        ]
-        last_positions = [
-            int(seq_lens_host[row]) - 1
-            for row in range(num_rows)
-            if query_lens_list[row] > 0
-        ]
-        width = max(
-            (position // self.region_size for position in last_positions), default=0
-        )
+        query_lens_list = [int(seq_lens_host[row]) - int(context_lens_host[row]) for row in range(num_rows)]
+        last_positions = [int(seq_lens_host[row]) - 1 for row in range(num_rows) if query_lens_list[row] > 0]
+        width = max((position // self.region_size for position in last_positions), default=0)
         logits = torch.zeros(
             (groups * num_tokens, max(width, 1)),
             device=index_q.device,
@@ -1193,16 +1153,12 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             p.context_lens_host,
         )
         groups = self.num_kv_groups
-        q_positions = positions[token_offset : token_offset + num_query_tokens].to(
-            torch.int32
-        )
+        q_positions = positions[token_offset : token_offset + num_query_tokens].to(torch.int32)
         # Token -> request map straight from the device start-loc.
         requests = (
             torch.searchsorted(
                 p.query_start_loc,
-                torch.arange(
-                    num_query_tokens, device=index_q.device, dtype=p.query_start_loc.dtype
-                ),
+                torch.arange(num_query_tokens, device=index_q.device, dtype=p.query_start_loc.dtype),
                 right=True,
             )
             - 1
@@ -1254,8 +1210,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         summary_cache = self._summary_cache
         if summary_cache is None:
             raise RuntimeError(
-                "Step5 sparse summary cache must be bound during KV cache "
-                "initialization before attention forward."
+                "Step5 sparse summary cache must be bound during KV cache initialization before attention forward."
             )
         num_tokens = md.num_actual_tokens
 

@@ -40,6 +40,7 @@ __all__ = [
     "csa_compact_decode_update",
     "csa_compact_prefill_update",
     "csa_reset_blocks",
+    "csa_verify_preview_logits",
 ]
 
 
@@ -122,9 +123,7 @@ def _csa_reset_blocks_kernel(
 
     region = page * SUMMARIES_PER_PAGE + fragment
     safe_region = tl.where(valid, region, 0)
-    slot = tl.load(active_slot_by_region + safe_region, mask=valid, other=-1).to(
-        tl.int64
-    )
+    slot = tl.load(active_slot_by_region + safe_region, mask=valid, other=-1).to(tl.int64)
     slot_ok = valid & (slot >= 0) & (slot < ACTIVE_CAPACITY)
     safe_slot = tl.where(slot_ok, slot, 0)
     owner = tl.load(active_region_ids + safe_slot, mask=slot_ok, other=-1)
@@ -279,9 +278,7 @@ def _csa_decode_stage_flush_kernel(
         mask=has_slot & dim_mask,
         other=0.0,
     )
-    prefix_max = tl.load(
-        max_logits + safe_slot * max_stride_slot, mask=has_slot, other=-float("inf")
-    ).to(tl.float32)
+    prefix_max = tl.load(max_logits + safe_slot * max_stride_slot, mask=has_slot, other=-float("inf")).to(tl.float32)
 
     # Region restart: a token at offset 0 resets all state for this region,
     # including the staged tail of an abandoned generation.
@@ -297,20 +294,14 @@ def _csa_decode_stage_flush_kernel(
             mask=has_slot & (toks < REGION_BLOCK_SIZE),
         )
         _csa_store_fp8_mean(
-            mean_cache
-            + (region // SUMMARIES_PER_PAGE) * mean_stride_page
-            + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
+            mean_cache + (region // SUMMARIES_PER_PAGE) * mean_stride_page + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
             dims,
             tl.zeros((BLOCK_D,), dtype=tl.float32),
             dim_mask,
         )
 
-    cur_k = tl.load(index_k + row * PROXY_DIM + dims, mask=dim_mask, other=0.0).to(
-        tl.float32
-    )
-    cur_z = tl.load(index_z + row * PROXY_DIM + dims, mask=dim_mask, other=0.0).to(
-        tl.float32
-    )
+    cur_k = tl.load(index_k + row * PROXY_DIM + dims, mask=dim_mask, other=0.0).to(tl.float32)
+    cur_z = tl.load(index_z + row * PROXY_DIM + dims, mask=dim_mask, other=0.0).to(tl.float32)
 
     if offset == REGION_BLOCK_SIZE - 1:
         # Region completes: fold staged tokens [0, REGION_BLOCK_SIZE-1), the
@@ -325,18 +316,12 @@ def _csa_decode_stage_flush_kernel(
             != 0
         )
         staged_z = tl.load(
-            staging_z
-            + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
-            + toks[:, None] * PROXY_DIM
-            + dims[None, :],
+            staging_z + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM) + toks[:, None] * PROXY_DIM + dims[None, :],
             mask=staged_ok[:, None] & dim_mask[None, :],
             other=-float("inf"),
         ).to(tl.float32)
         staged_k = tl.load(
-            staging_k
-            + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
-            + toks[:, None] * PROXY_DIM
-            + dims[None, :],
+            staging_k + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM) + toks[:, None] * PROXY_DIM + dims[None, :],
             mask=staged_ok[:, None] & dim_mask[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -353,9 +338,7 @@ def _csa_decode_stage_flush_kernel(
         scale = tl.where(has_prefix, tl.exp(prefix_max - shared_max), 0.0)
         staged_w = tl.where(staged_ok[:, None], tl.exp(staged_z - shared_max), 0.0)
         cur_w = tl.exp(cur_z - shared_max)
-        numerator = prefix_num * scale + tl.sum(staged_w * staged_k, axis=0) + (
-            cur_w * cur_k
-        )
+        numerator = prefix_num * scale + tl.sum(staged_w * staged_k, axis=0) + (cur_w * cur_k)
         denominator_acc = prefix_den * scale + tl.sum(staged_w, axis=0) + cur_w
         mean = tl.where(
             denominator_acc > 0.0,
@@ -363,9 +346,7 @@ def _csa_decode_stage_flush_kernel(
             0.0,
         )
         _csa_store_fp8_mean(
-            mean_cache
-            + (region // SUMMARIES_PER_PAGE) * mean_stride_page
-            + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
+            mean_cache + (region // SUMMARIES_PER_PAGE) * mean_stride_page + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
             dims,
             mean,
             dim_mask,
@@ -409,18 +390,12 @@ def _csa_decode_stage_flush_kernel(
     if slot_ok:
         tl.store(active_slot_by_region + region, slot.to(tl.int32))
         tl.store(
-            staging_k
-            + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
-            + offset * PROXY_DIM
-            + dims,
+            staging_k + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM) + offset * PROXY_DIM + dims,
             cur_k.to(staging_k.dtype.element_ty),
             mask=dim_mask,
         )
         tl.store(
-            staging_z
-            + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
-            + offset * PROXY_DIM
-            + dims,
+            staging_z + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM) + offset * PROXY_DIM + dims,
             cur_z.to(staging_z.dtype.element_ty),
             mask=dim_mask,
         )
@@ -601,9 +576,7 @@ def _csa_prefill_update_ordered_kernel(
                 other=-1,
             )
             if tl.max(rows) >= 0:
-                last_row = tl.load(
-                    scratch_row_map + group_slot * REGION_BLOCK_SIZE + (REGION_BLOCK_SIZE - 1)
-                )
+                last_row = tl.load(scratch_row_map + group_slot * REGION_BLOCK_SIZE + (REGION_BLOCK_SIZE - 1))
                 complete = last_row >= 0
                 if complete == PROCESS_COMPLETE:
                     region_i32 = region.to(tl.int32)
@@ -655,9 +628,7 @@ def _csa_prefill_update_ordered_kernel(
 
                     has_prefix = tl.max(prefix_den) > 0.0
                     base_max = tl.where(has_prefix, prefix_max, -float("inf"))
-                    shared_max = tl.maximum(
-                        base_max, tl.max(tl.where(valid_row[:, None], logits, -float("inf")))
-                    )
+                    shared_max = tl.maximum(base_max, tl.max(tl.where(valid_row[:, None], logits, -float("inf"))))
                     scale = tl.where(has_prefix, tl.exp(prefix_max - shared_max), 0.0)
                     weights = tl.where(valid_row[:, None], tl.exp(logits - shared_max), 0.0)
                     numerator = prefix_num * scale + tl.sum(weights * values, axis=0)
@@ -757,17 +728,13 @@ def csa_compact_prefill_update(
         return
 
     # Step 1: torch.unique — de-duplicate region ids + inverse index
-    unique_regions, inverse_indices = torch.unique(
-        flat_slot[:live_rows], return_inverse=True
-    )
+    unique_regions, inverse_indices = torch.unique(flat_slot[:live_rows], return_inverse=True)
     num_unique = int(unique_regions.numel())
 
     # Step 2: clear scratch buffers + write unique region ids (fused in kernel)
     total_items = num_unique * int(region_block_size)
     clear_block = 256
-    _csa_prefill_clear_scratch_kernel[
-        (triton.cdiv(max(total_items, num_unique), clear_block),)
-    ](
+    _csa_prefill_clear_scratch_kernel[(triton.cdiv(max(total_items, num_unique), clear_block),)](
         scratch_region_ids,
         scratch_row_map,
         scratch_reset_map,
@@ -946,12 +913,8 @@ def _csa_verify_stage_kernel(
                 # whose CAS probe can claim a second slot for the same
                 # region and orphan the old one.
 
-            cur_k = tl.load(
-                index_k + row * PROXY_DIM + dims, mask=dim_mask, other=0.0
-            ).to(tl.float32)
-            cur_z = tl.load(
-                index_z + row * PROXY_DIM + dims, mask=dim_mask, other=0.0
-            ).to(tl.float32)
+            cur_k = tl.load(index_k + row * PROXY_DIM + dims, mask=dim_mask, other=0.0).to(tl.float32)
+            cur_z = tl.load(index_z + row * PROXY_DIM + dims, mask=dim_mask, other=0.0).to(tl.float32)
 
             # Allocate a slot on first touch (the region may still be
             # slotless when the verify batch is the first to touch it after
@@ -972,18 +935,12 @@ def _csa_verify_stage_kernel(
             if slot_ok:
                 tl.store(active_slot_by_region + region, slot.to(tl.int32))
                 tl.store(
-                    staging_k
-                    + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
-                    + offset * PROXY_DIM
-                    + dims,
+                    staging_k + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM) + offset * PROXY_DIM + dims,
                     cur_k.to(staging_k.dtype.element_ty),
                     mask=dim_mask,
                 )
                 tl.store(
-                    staging_z
-                    + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM)
-                    + offset * PROXY_DIM
-                    + dims,
+                    staging_z + safe_slot * (REGION_BLOCK_SIZE * PROXY_DIM) + offset * PROXY_DIM + dims,
                     cur_z.to(staging_z.dtype.element_ty),
                     mask=dim_mask,
                 )
@@ -1133,12 +1090,7 @@ def _csa_deferred_flush_kernel(
     # verify batches, and never rewritten once committed. Prefill-written
     # offsets live in the prefix N/D/M, verify-written offsets in staging,
     # so the fold below covers the region exactly.
-    staged_ok = (
-        tl.load(
-            staging_valid + slot * REGION_BLOCK_SIZE + toks, mask=tok_mask, other=0
-        )
-        != 0
-    )
+    staged_ok = tl.load(staging_valid + slot * REGION_BLOCK_SIZE + toks, mask=tok_mask, other=0) != 0
 
     prefix_num = tl.load(
         active_numerator + slot * numerator_stride_slot + dims,
@@ -1176,9 +1128,7 @@ def _csa_deferred_flush_kernel(
         0.0,
     )
     _csa_store_fp8_mean(
-        mean_cache
-        + (region // SUMMARIES_PER_PAGE) * mean_stride_page
-        + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
+        mean_cache + (region // SUMMARIES_PER_PAGE) * mean_stride_page + (region % SUMMARIES_PER_PAGE) * PROXY_DIM,
         dims,
         mean,
         dim_mask,
@@ -1186,16 +1136,10 @@ def _csa_deferred_flush_kernel(
     # Release the slot: the region now lives only in the page cache.
     tl.store(active_slot_by_region + region, -1)
     tl.store(active_region_ids + slot, -1)
-    tl.store(
-        active_numerator + slot * numerator_stride_slot + dims, 0.0, mask=dim_mask
-    )
-    tl.store(
-        denominator + slot * denominator_stride_slot + dims, 0.0, mask=dim_mask
-    )
+    tl.store(active_numerator + slot * numerator_stride_slot + dims, 0.0, mask=dim_mask)
+    tl.store(denominator + slot * denominator_stride_slot + dims, 0.0, mask=dim_mask)
     tl.store(max_logits + slot * max_stride_slot, -float("inf"))
-    tl.store(
-        staging_valid + slot * REGION_BLOCK_SIZE + toks, 0, mask=tok_mask
-    )
+    tl.store(staging_valid + slot * REGION_BLOCK_SIZE + toks, 0, mask=tok_mask)
 
 
 def csa_deferred_flush(
@@ -1220,7 +1164,7 @@ def csa_deferred_flush(
 ) -> None:
     """Materialize fully-committed tail regions of MTP verify requests."""
     rows = int(seq_lens.numel())
-    if rows == 0 or num_reqs <= 0 or query_len <= 1:
+    if rows == 0 or num_reqs <= 0 or query_len <= 0:
         return
     _csa_deferred_flush_kernel[(rows,)](
         mean_cache,
@@ -1249,5 +1193,161 @@ def csa_deferred_flush(
         ACTIVE_CAPACITY=int(active_region_ids.numel()),
         BLOCK_T=triton.next_power_of_2(int(region_block_size)),
         BLOCK_D=triton.next_power_of_2(int(staging_k.shape[-1])),
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _csa_verify_preview_logits_kernel(
+    logits,
+    index_q,
+    weights,
+    positions,
+    block_table,
+    active_region_ids,
+    active_slot_by_region,
+    active_numerator,
+    denominator,
+    max_logits,
+    staging_k,
+    staging_z,
+    staging_valid,
+    TOTAL_ROWS: tl.constexpr,
+    QUERY_LEN: tl.constexpr,
+    OUT_STRIDE: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    Q_ROW_STRIDE: tl.constexpr,
+    Q_GROUP_STRIDE: tl.constexpr,
+    Q_HEAD_STRIDE: tl.constexpr,
+    W_ROW_STRIDE: tl.constexpr,
+    W_GROUP_STRIDE: tl.constexpr,
+    NUM_STRIDE: tl.constexpr,
+    DEN_STRIDE: tl.constexpr,
+    MAX_STRIDE: tl.constexpr,
+    SUMMARIES_PER_PAGE: tl.constexpr,
+    PROXY_DIM: tl.constexpr,
+    REGION_SIZE: tl.constexpr,
+    HEADS: tl.constexpr,
+    ACTIVE_CAPACITY: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Replace the one provisional history score exposed by a verify crossing.
+
+    QUERY_LEN <= REGION_SIZE means at most the request's first region can
+    complete inside the window. Only later query rows may rank that region.
+    Its preview is computed in registers; persistent payload and slot state
+    remain untouched so rejected drafts can still be overwritten next step.
+    """
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    first_row = (row // QUERY_LEN) * QUERY_LEN
+    first_position = tl.load(positions + first_row)
+    position = tl.load(positions + row)
+    logical_region = first_position // REGION_SIZE
+    if position // REGION_SIZE <= logical_region:
+        return
+    page = tl.load(block_table + (row // QUERY_LEN) * TABLE_STRIDE + logical_region // SUMMARIES_PER_PAGE)
+    if page < 0:
+        return
+    region = page * SUMMARIES_PER_PAGE + logical_region % SUMMARIES_PER_PAGE
+    hint = tl.load(active_slot_by_region + region).to(tl.int64)
+    hint_ok = (hint >= 0) & (hint < ACTIVE_CAPACITY)
+    safe_hint = tl.where(hint_ok, hint, 0)
+    owner = tl.load(active_region_ids + safe_hint, mask=hint_ok, other=-1)
+    if ~(hint_ok & (owner == region)):
+        return
+    dims = tl.arange(0, BLOCK_D)
+    dim_mask = dims < PROXY_DIM
+    toks = tl.arange(0, BLOCK_T)
+    valid = tl.load(staging_valid + hint * REGION_SIZE + toks, mask=toks < REGION_SIZE, other=0) != 0
+    prefix_num = tl.load(active_numerator + hint * NUM_STRIDE + dims, mask=dim_mask, other=0.0)
+    prefix_den = tl.load(denominator + hint * DEN_STRIDE + dims, mask=dim_mask, other=0.0)
+    prefix_max = tl.load(max_logits + hint * MAX_STRIDE)
+    z = tl.load(
+        staging_z + hint * REGION_SIZE * PROXY_DIM + toks[:, None] * PROXY_DIM + dims[None, :],
+        mask=valid[:, None] & dim_mask[None, :],
+        other=-float("inf"),
+    ).to(tl.float32)
+    keys = tl.load(
+        staging_k + hint * REGION_SIZE * PROXY_DIM + toks[:, None] * PROXY_DIM + dims[None, :],
+        mask=valid[:, None] & dim_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    has_prefix = tl.max(prefix_den) > 0.0
+    shared_max = tl.maximum(tl.where(has_prefix, prefix_max, -float("inf")), tl.max(z))
+    scale = tl.where(has_prefix, tl.exp(prefix_max - shared_max), 0.0)
+    staged_weights = tl.where(valid[:, None], tl.exp(z - shared_max), 0.0)
+    numerator = prefix_num * scale + tl.sum(staged_weights * keys, axis=0)
+    count = prefix_den * scale + tl.sum(staged_weights, axis=0)
+    mean = tl.where(count > 0.0, numerator / tl.maximum(count, 1.0e-20), 0.0)
+    # Match persisted summary double rounding and the indexer's BF16 widening.
+    mean = mean.to(tl.bfloat16).to(tl.float8e4nv).to(tl.bfloat16).to(tl.float32)
+    score = tl.full((), 0.0, tl.float32)
+    for head in tl.static_range(HEADS):
+        q = (
+            tl.load(
+                index_q + row * Q_ROW_STRIDE + group * Q_GROUP_STRIDE + head * Q_HEAD_STRIDE + dims,
+                mask=dim_mask,
+                other=0.0,
+            )
+            .to(tl.float8e4nv)
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        weight = tl.load(weights + row * W_ROW_STRIDE + group * W_GROUP_STRIDE + head).to(tl.float32)
+        dot = tl.sum(q * mean, axis=0)
+        score = tl.maximum(dot, 0.0, propagate_nan=tl.PropagateNan.ALL) * weight + score
+    tl.store(logits + (group * TOTAL_ROWS + row) * OUT_STRIDE + logical_region, score)
+
+
+def csa_verify_preview_logits(
+    logits,
+    index_q,
+    weights,
+    positions,
+    block_table,
+    cache,
+    *,
+    query_len: int,
+) -> None:
+    """Score a newly visible staged region without allocating or committing it."""
+    if query_len <= 1 or index_q.shape[0] == 0:
+        return
+    if query_len > cache.region_block_size:
+        raise ValueError("Step5 verify preview requires query_len <= region_block_size")
+    _csa_verify_preview_logits_kernel[(index_q.shape[0], index_q.shape[1])](
+        logits,
+        index_q,
+        weights,
+        positions,
+        block_table,
+        cache._step5_csa_active_region_ids,
+        cache._step5_csa_active_slot_by_region,
+        cache._step5_csa_numerator_cache,
+        cache._step5_csa_denominator_cache,
+        cache._step5_csa_max_cache,
+        cache._step5_csa_active_token_k,
+        cache._step5_csa_active_token_z,
+        cache._step5_csa_active_token_valid,
+        TOTAL_ROWS=index_q.shape[0],
+        QUERY_LEN=query_len,
+        OUT_STRIDE=logits.stride(0),
+        TABLE_STRIDE=block_table.stride(0),
+        Q_ROW_STRIDE=index_q.stride(0),
+        Q_GROUP_STRIDE=index_q.stride(1),
+        Q_HEAD_STRIDE=index_q.stride(2),
+        W_ROW_STRIDE=weights.stride(0),
+        W_GROUP_STRIDE=weights.stride(1),
+        NUM_STRIDE=cache._step5_csa_numerator_cache.stride(0),
+        DEN_STRIDE=cache._step5_csa_denominator_cache.stride(0),
+        MAX_STRIDE=cache._step5_csa_max_cache.stride(0),
+        SUMMARIES_PER_PAGE=cache.summaries_per_page,
+        PROXY_DIM=index_q.shape[-1],
+        REGION_SIZE=cache.region_block_size,
+        HEADS=index_q.shape[2],
+        ACTIVE_CAPACITY=cache._step5_csa_active_region_ids.numel(),
+        BLOCK_D=triton.next_power_of_2(index_q.shape[-1]),
+        BLOCK_T=triton.next_power_of_2(cache.region_block_size),
         num_warps=4,
     )
