@@ -1,0 +1,190 @@
+# 基于 Dockerfile.cann92，去掉 CANN 包、torch_npu、npuir 的安装
+# （CANN / torch_npu / npuir 由基础镜像提供）；
+# cann-ops-transformer 自定义算子按 cann_ops.md 从源码编译安装
+#
+# 与 Dockerfile.cann92 的区别：
+#   - 移除 CANN toolkit / ops 两个 .run 包的拷贝与安装
+#   - 移除 torch_npu whl 的拷贝与安装
+#   - 移除 npuir 安装包的拷贝与安装
+#   - 保留：fastokens、triton-ascend、flash-attention-npu、vllm-step4
+#   - 新增（按 cann_ops.md）：从 gitcode 克隆 ops-transformer_inedex_topk 仓（stepx 分支），
+#     源码编译 cann-ops-transformer step5_ops 自定义算子 run 包 + whl 包并安装，
+#     以及 ASCEND_CUSTOM_OPP_PATH / LD_LIBRARY_PATH 环境变量
+#
+# 构建命令（构建上下文中需包含 vllm-step4 本地源码目录）：
+#   docker build --network host \
+#     -f Dockerfile.cann92-nocann -t <image>:<tag> .
+#
+# 前提：
+#   - 基础镜像中已安装 CANN、torch_npu、npuir，以及 git、cmake、g++ 等编译工具链
+#   - 构建过程能访问 github.com（克隆 flash-attention-npu 源码）
+#   - 构建过程能访问 OBS（下载 triton-ascend whl）
+#   - 构建过程能访问 gitcode.com（克隆 ops-transformer 算子仓）
+#   - 构建上下文中存在 vllm-step4 目录（私有仓无法匿名克隆，故用本地代码 COPY；
+#     构建前确认该目录已切到目标分支；目录名不同可用 --build-arg VLLM_STEP4_DIR=<目录名> 调整）
+
+# ==================== 全局参数 ====================
+
+# 基础镜像（需已安装 CANN、torch_npu、npuir 及编译工具链）
+# 注意：triton whl 默认链接为 cp312（Python 3.12）编译，基础镜像 Python 版本需与之匹配；
+#       不匹配时请更换 BASE_IMAGE，或用 --build-arg TRITON_WHL_URL=... 换 cp311 的链接
+ARG BASE_IMAGE=quay.io/ascend/vllm-ascend:v0.27.1rc1-a5-openeuler
+
+# 容器内工作目录
+ARG WORKDIR=/workspace
+
+# triton-ascend whl 下载地址（构建时从 OBS 下载）
+# 注：该 whl 为 cp312（Python 3.12）编译，需与基础镜像 Python 版本匹配
+ARG TRITON_WHL_URL=https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261011191350/triton_ascend-3.6.0%2Bdev20261011191350-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+# 安装时在 /tmp 下查找 triton whl 的匹配模式
+ARG TRITON_WHL_GLOB=triton_ascend*.whl
+
+# CANN 环境脚本（基础镜像中已安装 CANN）
+# 注：Dockerfile-gxy 中为 /usr/local/Ascend/ascend-toolkit/set_env.sh，
+#     如基础镜像中路径不同，可用 --build-arg CANN_SET_ENV_PATH=... 覆盖
+ARG CANN_SET_ENV_PATH=/usr/local/Ascend/cann/set_env.sh
+
+# flash-attention-npu 源码仓库与版本（构建时从 GitHub 克隆）
+ARG FLASH_ATTN_REPO=https://github.com/MinghuasLab/flash-attention-npu.git
+ARG FLASH_ATTN_TAG=v0.4.0
+# flash-attention-npu 编译目标 NPU 型号
+ARG FLASH_ATTN_BUILD_NPU=950
+
+# vllm-step4 本地源码目录（私有仓，从构建上下文 COPY 进镜像）
+ARG VLLM_STEP4_DIR=vllm-step4
+
+# cann-ops-transformer 自定义算子源码仓与分支（按 cann_ops.md，构建时从 gitcode 克隆编译）
+ARG OPS_TRANSFORMER_REPO=https://gitcode.com/HuangKun8682/ops-transformer_inedex_topk.git
+ARG OPS_TRANSFORMER_BRANCH=stepx
+# 算子编译参数：NPU 型号、vendor 名、算子列表、并行编译任务数
+ARG OPS_SOC=ascend950
+ARG OPS_VENDOR=step5_ops
+ARG OPS_LIST=generic_block_sparse_attention,generic_block_sparse_attention_metadata,indexer_region_score
+ARG OPS_BUILD_JOBS=16
+
+# ==================== 阶段 base：安装 triton ====================
+FROM ${BASE_IMAGE} AS base
+
+ARG WORKDIR
+ARG TRITON_WHL_URL
+ARG TRITON_WHL_GLOB
+
+# 使用 root，确保有权限执行安装操作
+USER root
+
+# 减少 pip 缓存、关闭版本检查
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_NO_CACHE_DIR=1
+
+# 设置工作目录
+WORKDIR ${WORKDIR}
+
+# ==================== 安装 fastokens（联网失败时快速报错） ====================
+RUN set -eux; \
+    pip install fastokens==0.2.0; \
+    pip cache purge || true
+
+# ==================== 安装 triton-ascend（从 OBS 下载 whl） ====================
+# 用 python 下载：自动解码 URL 中的 %2B 为 +，保证 whl 文件名合法
+RUN set -eux; \
+    pip uninstall -y triton-ascend || true; \
+    pip uninstall -y triton || true; \
+    python3 -c "import os, urllib.parse, urllib.request; url='${TRITON_WHL_URL}'; name=os.path.basename(urllib.parse.unquote(url)); urllib.request.urlretrieve(url, '/tmp/' + name); print('Downloaded: /tmp/' + name)"; \
+    whl="$(find /tmp -maxdepth 1 -type f -name "${TRITON_WHL_GLOB}" | head -n 1)"; \
+    if [ -z "$whl" ]; then \
+        echo "Error: triton-ascend wheel not found in /tmp, pattern=${TRITON_WHL_GLOB}"; \
+        exit 1; \
+    fi; \
+    pip install --no-deps "$whl"; \
+    pip cache purge || true; \
+    rm -f "$whl"
+
+# ==================== 阶段 final：安装 flash-attention-npu、vllm-step4、cann-ops-transformer ====================
+FROM base AS final
+
+# 使用 bash 以确保 source 命令可用（来自 Dockerfile-gxy）
+SHELL ["/bin/bash", "-c"]
+
+ARG WORKDIR
+ARG CANN_SET_ENV_PATH
+ARG FLASH_ATTN_REPO
+ARG FLASH_ATTN_TAG
+ARG FLASH_ATTN_BUILD_NPU
+ARG VLLM_STEP4_DIR
+ARG OPS_TRANSFORMER_REPO
+ARG OPS_TRANSFORMER_BRANCH
+ARG OPS_SOC
+ARG OPS_VENDOR
+ARG OPS_LIST
+ARG OPS_BUILD_JOBS
+
+# ==================== 安装 flash-attention-npu（从 GitHub 克隆源码编译） ====================
+# 注意：recursive submodule 含 llvm-project 等大仓库（数 GB），克隆耗时较长属正常现象；
+# setup.py install（非 editable）产物已装入 site-packages，装完整个删除源码树以减小镜像体积
+RUN set -eux; \
+    if [ ! -f "${CANN_SET_ENV_PATH}" ]; then \
+        echo "Error: CANN env script not found: ${CANN_SET_ENV_PATH}"; exit 1; \
+    fi; \
+    . "${CANN_SET_ENV_PATH}"; \
+    cd ${WORKDIR}; \
+    git clone ${FLASH_ATTN_REPO} flash-attention-npu; \
+    cd flash-attention-npu; \
+    git checkout ${FLASH_ATTN_TAG}; \
+    git submodule update --init --recursive --depth 1; \
+    FLASH_ATTN_BUILD_NPU=${FLASH_ATTN_BUILD_NPU} python setup.py install; \
+    cd ${WORKDIR}; \
+    rm -rf flash-attention-npu
+
+# ==================== 安装 vllm-step4（本地源码 COPY，可编辑模式安装） ====================
+# 注意：-e 可编辑安装依赖源码目录，COPY 进镜像后保留
+COPY ${VLLM_STEP4_DIR} ${WORKDIR}/vllm-step4
+RUN set -eux; \
+    pip uninstall -yq vllm || true; \
+    pip uninstall -yq vllm-ascend || true; \
+    pip install setuptools-rust; \
+    if [ ! -f "${CANN_SET_ENV_PATH}" ]; then \
+        echo "Error: CANN env script not found: ${CANN_SET_ENV_PATH}"; exit 1; \
+    fi; \
+    . "${CANN_SET_ENV_PATH}"; \
+    cd ${WORKDIR}; \
+    VLLM_TARGET_DEVICE="empty" python3 -m pip install -e vllm-step4/[audio] --no-build-isolation --no-deps; \
+    pip cache purge || true
+
+# ==================== 编译并安装 cann-ops-transformer 自定义算子（按 cann_ops.md，从源码构建） ====================
+# 流程：克隆算子仓 -> 编译 run 包（build.sh --pkg）-> 编译 whl 包（build.sh --torch_extension）-> 安装两者 -> 删除源码
+# 注意：克隆/编译/安装/清理放在单个 RUN 中，避免源码和编译中间产物残留在镜像层里
+RUN set -eux; \
+    if [ ! -f "${CANN_SET_ENV_PATH}" ]; then \
+        echo "Error: CANN env script not found: ${CANN_SET_ENV_PATH}"; exit 1; \
+    fi; \
+    . "${CANN_SET_ENV_PATH}"; \
+    cd ${WORKDIR}; \
+    git clone ${OPS_TRANSFORMER_REPO} ops-transformer_inedex_topk; \
+    cd ops-transformer_inedex_topk; \
+    git checkout ${OPS_TRANSFORMER_BRANCH}; \
+    bash build.sh --pkg --soc="${OPS_SOC}" --vendor_name="${OPS_VENDOR}" --ops="${OPS_LIST}" -j${OPS_BUILD_JOBS}; \
+    pip install build; \
+    bash build.sh --torch_extension; \
+    run_file="$(find build_out -maxdepth 1 -type f -name 'cann-ops-transformer-*.run' | head -n 1)"; \
+    whl_file="$(find build_out -maxdepth 1 -type f -name 'cann_ops_transformer-*.whl' | head -n 1)"; \
+    if [ -z "${run_file}" ] || [ -z "${whl_file}" ]; then \
+        echo "Error: ops run/whl package not found in build_out"; exit 1; \
+    fi; \
+    chmod +x "${run_file}"; \
+    "${run_file}" --quiet --install-for-all --force; \
+    python3 -m pip install --force-reinstall --no-deps "${whl_file}"; \
+    pip cache purge || true; \
+    cd ${WORKDIR}; \
+    rm -rf ops-transformer_inedex_topk
+
+# 设置自定义算子环境变量（vendor 目录名为 ${OPS_VENDOR}_transformer，与 cann_ops.md 一致）
+# ASCEND_OPP_PATH 由 CANN set_env.sh 定义（$CANN_HOME/opp），但未必烧在基础镜像 ENV 里；
+# 这里用 ARG 给默认值兜底：镜像已有同名 ENV 时优先用镜像的，否则用默认值
+ARG ASCEND_OPP_PATH=/usr/local/Ascend/cann/opp
+ENV ASCEND_CUSTOM_OPP_PATH=${ASCEND_OPP_PATH}/vendors/${OPS_VENDOR}_transformer
+ENV LD_LIBRARY_PATH=${ASCEND_OPP_PATH}/vendors/${OPS_VENDOR}_transformer/op_api/lib/:${LD_LIBRARY_PATH}
+
+# 恢复默认工作目录
+WORKDIR ${WORKDIR}
+
+CMD ["/bin/bash"]
