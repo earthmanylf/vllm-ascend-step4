@@ -28,6 +28,10 @@ class _FakeKVCacheSpec:
         self.max_blocks_per_request = max_blocks_per_request
         self.store_on_host = store_on_host
         self.block_size = block_size
+        self.requires_zeroing = False
+        self.extra_budget_page_size_bytes = 0
+        self.extra_budget_fixed_size_bytes = 0
+        self.prefix_cache_recompute_tokens = 0
 
     def max_memory_usage_bytes(self, _vllm_config):
         return self.max_blocks_per_request * self.page_size_bytes
@@ -317,9 +321,8 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
                     ),
                     patch.object(
                         manager_module,
-                        "offload",
-                        offload_backend,
-                        create=True,
+                        "_load_offload_backend",
+                        return_value=offload_backend,
                     ),
                     patch.object(
                         manager_module.torch,
@@ -332,6 +335,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
                         return_value=MagicMock(),
                     ),
                     patch.object(manager_module, "_sparse_kv_ops", return_value=MagicMock()),
+                    patch.object(manager_module.torch_npu.npu, "current_device", return_value=0),
                 ):
                     SparseKVOffloadManager(
                         vllm_config,
@@ -385,7 +389,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
                 "get_sparse_kv_offload_cpu_pool_size_bytes",
                 return_value=(1 << 30) + 1,
             ),
-            patch.object(manager_module, "offload", offload_backend, create=True),
+            patch.object(manager_module, "_load_offload_backend", return_value=offload_backend),
             patch.object(manager_module.torch, "zeros", return_value=MagicMock()),
             patch.object(manager_module.torch, "empty", return_value=MagicMock()),
             patch.object(manager_module, "_sparse_kv_ops", return_value=MagicMock()),

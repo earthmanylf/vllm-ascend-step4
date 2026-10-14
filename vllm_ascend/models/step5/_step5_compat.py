@@ -17,7 +17,6 @@ import math
 from dataclasses import dataclass, field
 
 import torch
-from vllm.config import ModelConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
 
@@ -323,20 +322,9 @@ class Step5FP32RouterLinear(ReplicatedLinear):
         return super().forward(x.to(torch.float32))
 
 
-def _require_resolved_valid_vocab_size(model_config: ModelConfig) -> int:
-    if model_config.valid_vocab_size is None:
-        raise ValueError(
-            "Step5 requires valid_vocab_size to be resolved from the tokenizer "
-            "before model construction. Call VllmConfig.resolve_valid_vocab_size() "
-            "or pass --valid-vocab-size when tokenizer initialization is skipped."
-        )
-    return model_config.get_valid_vocab_size()
-
-
 __all__ = [
     "Step5DSAScratchWorkspace",
     "Step5FP32RouterLinear",
-    "_require_resolved_valid_vocab_size",
     "Step5SparseSummaryCacheConfig",
     "Step5SparseSummaryCache",
     "step5_sparse_summary_cache_bytes_per_block",

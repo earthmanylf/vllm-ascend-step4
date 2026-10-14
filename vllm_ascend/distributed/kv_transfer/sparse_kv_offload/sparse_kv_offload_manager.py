@@ -1,4 +1,3 @@
-import contextlib
 import typing
 from dataclasses import dataclass
 from zlib import adler32
@@ -6,13 +5,6 @@ from zlib import adler32
 import numpy as np
 import torch
 import torch_npu
-
-with contextlib.suppress(Exception):
-    # we should remove this after memfabric.offload is merged to master and available in ci machine.
-    # Importing the package provisions an AICPU kernel on the fly, which raises its own
-    # ProvisioningError rather than ImportError when the CANN build toolchain is incomplete.
-    # Sparse KV offload is opt-in, so nothing here may abort worker startup.
-    from memfabric_hybrid import offload  # type: ignore
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -29,9 +21,9 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
-
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
+
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 # Main BF16 cache:
@@ -83,6 +75,18 @@ _SPARSE_KV_OFFLOAD_OP_NAMES = (
     "sparse_kv_restore_bfloat16_tensor",
     "sparse_kv_restore_int16_tensor",
 )
+
+
+def _load_offload_backend() -> typing.Any:
+    # Importing MemFabric registers an AICPU package with the runtime. Keep
+    # that side effect out of workers that never enable sparse KV offload.
+    try:
+        from memfabric_hybrid import offload  # type: ignore
+    except ModuleNotFoundError as exc:
+        if exc.name != "memfabric_hybrid":
+            raise
+        raise RuntimeError("Sparse KV offload requires memfabric_hybrid with offload support.") from exc
+    return offload
 
 
 def get_subscribed_compute_streams() -> set:
@@ -206,7 +210,7 @@ def empty_aligned_int8_cpu_tensors(
     """
     chunk_nums = [cdiv(size, alignment) for size in sizes]
     total_chunk_num = 1 + sum(chunk_nums)
-    raw_tensor = offload.empty([total_chunk_num * alignment], dtype=torch.int8, pin_memory=True)
+    raw_tensor = _load_offload_backend().empty([total_chunk_num * alignment], dtype=torch.int8, pin_memory=True)
     base_addr = raw_tensor.data_ptr()
     if base_addr % alignment:
         base_addr = (base_addr // alignment + 1) * alignment
@@ -572,16 +576,16 @@ class SparseKVOffloadManager:
             sparse_kv_offload_config.dram_size_per_dp_GB,
             kv_cache_config.num_blocks,
         )
-        config = offload.OffloadConfig()
+        config = _load_offload_backend().OffloadConfig()
         config.device_id = torch_npu.npu.current_device()
         config.reserve_size = actual_pool_size_bytes
         config.alloc_size = actual_pool_size_bytes if self.tp_rank == 0 else 0
         config.world_size = self.tp_size
         config.rank_id = self.tp_rank
-        config.scene = offload.Scene.SHARED
+        config.scene = _load_offload_backend().Scene.SHARED
         store_port = OFFLOAD_STORE_PORT_BASE + parallel_config.data_parallel_index
         config.store_url = f"tcp://127.0.0.1:{store_port}"
-        assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
+        assert _load_offload_backend().initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
 
     def _warmup_external_lru_planner_threads(self) -> int:
@@ -713,11 +717,15 @@ class SparseKVOffloadManager:
         owner_ptr = torch.zeros(1, dtype=torch.int64, device="npu")
         membership_map = None
         if self.tp_rank == 0:
-            membership_map = offload.empty(
-                [row_capacity * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
-                dtype=torch.int16,
-                pin_memory=True,
-            ).view(shape)
+            membership_map = (
+                _load_offload_backend()
+                .empty(
+                    [row_capacity * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
+                    dtype=torch.int16,
+                    pin_memory=True,
+                )
+                .view(shape)
+            )
             membership_map.fill_(-1)
             control = membership_map[
                 :,
@@ -1211,7 +1219,7 @@ class SparseKVOffloadManager:
 
     def copy_sfa_kv(self, sources, destinations, lengths, count) -> None:
         """Enqueue bounded descriptor copies on the current compute stream."""
-        result = offload.sparse_copy(sources, destinations, lengths, count, sources.device)
+        result = _load_offload_backend().sparse_copy(sources, destinations, lengths, count, sources.device)
         if result not in (None, 0):
             raise RuntimeError(f"memfabric fused_copy_sfa tail H2D failed with result={result}")
 
@@ -1343,7 +1351,7 @@ class SparseKVOffloadManager:
         self.d2h_lengths_npu[token_count : 2 * token_count].masked_fill_(~valid, 0)
         self.d2h_size_npu.fill_(2 * token_count)
 
-        result = offload.sparse_copy(
+        result = _load_offload_backend().sparse_copy(
             self.d2h_src_ptrs_npu,
             self.d2h_dst_ptrs_npu,
             self.d2h_lengths_npu,
@@ -1465,7 +1473,7 @@ class SparseKVOffloadManager:
             # Make sure that tp0 d2h is finished before other tp's h2d.
             # NOTE we can't use barrier since it can't be captured in graph.
             self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
-        offload.sparse_copy(
+        _load_offload_backend().sparse_copy(
             self.gvas_buffer_npu,
             self.addr_buffer_npu,
             self.size_buffer_npu,

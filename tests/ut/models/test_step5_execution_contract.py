@@ -435,7 +435,6 @@ class TestStep5MTP(unittest.TestCase):
                 "WeightsMapper": types.SimpleNamespace,
                 "_get_mtp_config": lambda cfg: object(),
                 "_get_mtp_vllm_config": lambda cfg: cfg,
-                "_require_resolved_valid_vocab_size": lambda model_config: 100,
                 "AscendStep5MultiTokenPredictor": lambda **kwargs: seen.append(kwargs["vllm_config"]) or predictor,
                 "maybe_prefix": lambda prefix, name: name,
                 "_get_step5_mtp_moe_blocks": lambda model: [],
@@ -504,6 +503,70 @@ class TestStep5MTP(unittest.TestCase):
             dtype_changes,
             [("embeds", "bf16"), ("previous", "bf16"), ("projected", "fp32")] if fp32_residual else [],
         )
+
+
+class TestStep5VocabularyContract(unittest.TestCase):
+    def test_target_and_draft_use_fixed_swf_logits_api(self):
+        import inspect
+
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+        # Use the installed fixed SWF signature, with no legacy ModelConfig
+        # vocabulary field. Only expensive weight allocation is replaced.
+        signature = inspect.signature(LogitsProcessor.__init__)
+        seen = []
+
+        def build_logits(*args, **kwargs):
+            signature.bind(None, *args, **kwargs)
+            seen.append((args, kwargs))
+            return object()
+
+        hf_config = types.SimpleNamespace(
+            vocab_size=131072,
+            hidden_size=4096,
+            num_hidden_layers=92,
+            num_nextn_predict_layers=3,
+            fp32_residual_connection=True,
+            tie_word_embeddings=False,
+        )
+        config = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(hf_config=hf_config),
+            quant_config=None,
+        )
+        target_model = types.SimpleNamespace(layers=[], make_empty_intermediate_tensors=object())
+        target = load_methods(
+            "model.py",
+            "AscendStep5ForCausalLM",
+            {"__init__"},
+            {
+                "nn": types.SimpleNamespace(Module=object),
+                "AscendStep5Model": lambda **kwargs: target_model,
+                "get_pp_group": lambda: types.SimpleNamespace(is_last_rank=True),
+                "ParallelLMHead": lambda *args, **kwargs: object(),
+                "LogitsProcessor": build_logits,
+                "maybe_prefix": lambda prefix, name: name,
+                "PPMissingLayer": type("Missing", (), {}),
+                "Step5MoE": object,
+                "_set_step5_moe_protocol_metadata": lambda *args: None,
+            },
+        )
+        target(vllm_config=config)
+        predictor = load_methods(
+            "mtp.py",
+            "AscendStep5MultiTokenPredictor",
+            {"__init__"},
+            {
+                "nn": types.SimpleNamespace(Module=object),
+                "torch": types.SimpleNamespace(nn=types.SimpleNamespace(ModuleDict=dict)),
+                "_get_mtp_config": lambda cfg: hf_config,
+                "VocabParallelEmbedding": lambda *args: object(),
+                "AscendStep5MultiTokenPredictorLayer": lambda **kwargs: object(),
+                "LogitsProcessor": build_logits,
+            },
+        )
+        draft = predictor(vllm_config=config)
+        self.assertEqual(set(draft.layers), {"92", "93", "94"})
+        self.assertEqual(seen, [((131072,), {}), ((131072,), {})])
 
 
 if __name__ == "__main__":

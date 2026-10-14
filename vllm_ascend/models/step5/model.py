@@ -22,7 +22,6 @@ import re
 from typing import Any
 
 import torch
-import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
 from torch import nn
 from torch.nn.parameter import Parameter
 from vllm.config import VllmConfig
@@ -93,10 +92,10 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 from vllm_ascend.device.device_op import DeviceOperator
 
+import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
 from vllm_ascend import envs
 from vllm_ascend.models.step5._step5_compat import (
     Step5FP32RouterLinear,
-    _require_resolved_valid_vocab_size,
 )
 from vllm_ascend.models.step5.dsa_attention import (
     AscendStep5DSABackend,
@@ -1573,7 +1572,6 @@ class AscendStep5ForCausalLM(Step5ForCausalLM):
         nn.Module.__init__(self)
         self.vllm_config = vllm_config
         model_config = vllm_config.model_config
-        valid_vocab_size = _require_resolved_valid_vocab_size(model_config)
         config = model_config.hf_config
         self.config = config
         self.fp32_residual_connection = config.fp32_residual_connection
@@ -1589,10 +1587,7 @@ class AscendStep5ForCausalLM(Step5ForCausalLM):
             )
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
-            self.logits_processor = LogitsProcessor(
-                config.vocab_size,
-                valid_vocab_size=valid_vocab_size,
-            )
+            self.logits_processor = LogitsProcessor(config.vocab_size)
         else:
             self.lm_head = PPMissingLayer()
 

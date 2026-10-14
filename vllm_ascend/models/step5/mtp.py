@@ -41,7 +41,6 @@ from vllm.models.step5.nvidia.mtp import (
     _set_step5_moe_protocol_metadata,
 )
 
-from vllm_ascend.models.step5._step5_compat import _require_resolved_valid_vocab_size
 from vllm_ascend.models.step5.model import AscendStep5DecoderLayer
 
 
@@ -124,10 +123,7 @@ class AscendStep5MultiTokenPredictor(Step5MultiTokenPredictor):
             }
         )
 
-        self.logits_processor = LogitsProcessor(
-            config.vocab_size,
-            valid_vocab_size=_require_resolved_valid_vocab_size(_get_mtp_vllm_config(vllm_config).model_config),
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
 
 
 class AscendStep5MTP(Step5MTP):
@@ -145,7 +141,6 @@ class AscendStep5MTP(Step5MTP):
             vllm_config = replace(vllm_config, quant_config=quant_config)
         self.config = _get_mtp_config(vllm_config)
         self.vllm_config = vllm_config
-        _require_resolved_valid_vocab_size(_get_mtp_vllm_config(vllm_config).model_config)
         self.model = AscendStep5MultiTokenPredictor(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         self.lm_head = self.model.layers[str(self.model.mtp_start_layer_idx)].shared_head.head
         moe_blocks = _get_step5_mtp_moe_blocks(self.model)
