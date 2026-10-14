@@ -365,5 +365,50 @@ def test_per_group_lookup_matches_scheduler_call_convention():
     assert hit_lengths == (4095, 4095)
 
 
+@pytest.mark.parametrize("drop_eagle", [False, True])
+@pytest.mark.parametrize("replay_limit", [0, 255, 256, 384, 2048])
+def test_replay_ceiling_keeps_block_aligned_target_and_draft_hits(drop_eagle, replay_limit):
+    class AlignedManager:
+        supports_fine_grained_hash_lookup = False
+        calls = []
+
+        @classmethod
+        def find_longest_cache_hit(cls, **kwargs):
+            cls.calls.append(kwargs)
+            blocks = kwargs["max_length"] // HASH_BLOCK_SIZE
+            if kwargs["drop_eagle_block"]:
+                blocks = max(0, blocks - 1)
+            return tuple(
+                [object() for _ in range(blocks)] for _ in kwargs["kv_cache_group_ids"]
+            ), blocks * HASH_BLOCK_SIZE
+
+    coordinator = _make_lookup_coordinator(producer=not drop_eagle)
+    coordinator.lcm_block_size = HASH_BLOCK_SIZE
+    coordinator.attention_groups = [
+        SpecGroup(FA_SPEC, [0], AlignedManager, True),
+        SpecGroup(FA_SPEC, [1], AlignedManager, False),
+    ]
+    blocks, hit_length, uncached = coordinator.find_longest_cache_hit([], 1024, replay_limit)
+    expected = min(1024 - (HASH_BLOCK_SIZE if drop_eagle else 0), replay_limit)
+    expected = expected // HASH_BLOCK_SIZE * HASH_BLOCK_SIZE
+    assert hit_length == expected
+    assert hit_length <= replay_limit
+    assert tuple(len(group) for group in blocks) == (expected // HASH_BLOCK_SIZE,) * 2
+    assert uncached == 0
+    for call in AlignedManager.calls:
+        if not call["drop_eagle_block"]:
+            assert call["max_length"] <= min(1024, replay_limit)
+
+
+@pytest.mark.parametrize("producer", [False, True])
+def test_per_group_replay_ceiling_preserves_eagle_verification_margin(producer):
+    coordinator = _make_lookup_coordinator(producer=producer)
+    coordinator.find_longest_cache_hit_per_group([], 2048, 512)
+    assert _RecordingFA.calls[-1]["max_length"] == (512 if producer else 640)
+    assert _RecordingFA.calls[-1]["drop_eagle_block"] is (not producer)
+    assert _RecordingMamba.calls[-1]["max_length"] == 512
+    assert _RecordingMamba.calls[-1]["drop_eagle_block"] is False
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

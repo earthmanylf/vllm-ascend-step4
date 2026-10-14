@@ -9,6 +9,19 @@ from vllm.v1.worker.utils import defaultdict, extract_layer_index
 from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
 
 
+def _bind_kv_cache_side_storage(forward_context: dict) -> None:
+    # The SWF side-storage protocol is optional in official vLLM. All owner
+    # caches must be installed before sidecars bind; aliases bind only once.
+    protocol = getattr(utils, "KVCacheSideStorageLayer", None)
+    if protocol is None:
+        return
+    seen = set()
+    for layer in forward_context.values():
+        if id(layer) not in seen and isinstance(layer, protocol):
+            seen.add(id(layer))
+            layer.bind_kv_cache_side_storage(forward_context)
+
+
 # Without this patch, it will raise an exception when initialize kv_cache.
 # TODO To remove the patch, we need check why the original bind_kv_cache raises an NotImplementedError.
 def bind_kv_cache(
@@ -56,17 +69,7 @@ def bind_kv_cache(
     # vLLM #52506 adds ReplaySSM ring trackers on main.
     utils.share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)
 
-    # vLLM core's bind_kv_cache_to_layers also walks KVCacheSideStorageLayer
-    # instances (e.g. the Step5 DSA sparse summary sidecar). The Ascend rewrite
-    # above only assigns ``layer.kv_cache``, so restore the side-storage pass.
-    try:
-        from vllm.v1.worker.utils import KVCacheSideStorageLayer
-    except Exception:
-        KVCacheSideStorageLayer = None
-    if KVCacheSideStorageLayer is not None:
-        for _layer in forward_context.values():
-            if isinstance(_layer, KVCacheSideStorageLayer):
-                _layer.bind_kv_cache_side_storage(forward_context)
+    _bind_kv_cache_side_storage(forward_context)
 
 
 utils.bind_kv_cache = bind_kv_cache
@@ -92,6 +95,7 @@ def bind_kv_cache_to_layers(
             layer.bind_kv_cache(kv_cache)
         else:
             layer.kv_cache = kv_cache
+    _bind_kv_cache_side_storage(forward_context)
     ordered_layer_names = sorted(kv_caches, key=lambda name: extract_layer_index(name, num_attn_module))
     utils.share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)
 

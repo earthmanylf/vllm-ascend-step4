@@ -31,7 +31,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
@@ -343,6 +342,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        max_returned_cache_hit_length: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int] | tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
@@ -355,6 +355,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         Args:
             block_hashes: The block hashes of the request.
             max_cache_hit_length: The maximum length of the cache hit.
+            max_returned_cache_hit_length: Optional replay ceiling for the returned prefix.
 
         Returns:
             A tuple containing:
@@ -366,7 +367,11 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             return block_hashes
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
-        hit_length = max_cache_hit_length
+        returned_ceiling = min(
+            max_cache_hit_length,
+            max_cache_hit_length if max_returned_cache_hit_length is None else max_returned_cache_hit_length,
+        )
+        hit_length = returned_ceiling
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
         hit_length_by_group: list[int] = [0] * num_groups
@@ -413,6 +418,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                         else group_block_size
                     )
                     _max_length = min(curr_hit_length + eagle_margin, max_cache_hit_length)
+                else:
+                    _max_length = min(_max_length, returned_ceiling)
                 hit_result = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,
@@ -466,22 +473,41 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        max_returned_cache_hit_length: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], tuple[int, ...]]:
         # PD + hybrid connector path. Skip the EAGLE drop on the prefill
         # producer and on standalone instances (see
         # ``self.skips_eagle_block_drop``): matched content blocks are
         # always verified prompt blocks there.
         num_groups = len(self.kv_cache_config.kv_cache_groups)
+        returned_ceiling = min(
+            max_cache_hit_length,
+            max_cache_hit_length if max_returned_cache_hit_length is None else max_returned_cache_hit_length,
+        )
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
         hit_lengths: list[int] = [0] * num_groups
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+            drop_eagle_block = use_eagle and not self.skips_eagle_block_drop
+            group_max_length = returned_ceiling
+            # Keep the legacy two-argument connector behavior. With a replay
+            # ceiling, EAGLE may inspect one extra drop unit as in fixed SWF.
+            if max_returned_cache_hit_length is not None and drop_eagle_block and not isinstance(spec, MambaSpec):
+                group_block_size = self._get_effective_block_size(spec)
+                eagle_margin = (
+                    self.hash_block_size
+                    if self.enable_partial_hash_hits
+                    and manager_cls.supports_fine_grained_hash_lookup
+                    and group_block_size > self.hash_block_size
+                    else group_block_size
+                )
+                group_max_length = min(max_cache_hit_length, returned_ceiling + eagle_margin)
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
-                max_length=max_cache_hit_length,
+                max_length=group_max_length,
                 kv_cache_group_ids=group_ids,
                 block_pool=self.block_pool,
                 kv_cache_spec=spec,
-                drop_eagle_block=use_eagle and not self.skips_eagle_block_drop,
+                drop_eagle_block=drop_eagle_block,
                 alignment_tokens=self._cache_hit_alignment_tokens,
                 dcp_world_size=self.dcp_world_size,
                 pcp_world_size=1,
