@@ -18,16 +18,20 @@ weights load unchanged.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.config.utils import replace
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.models.step5.nvidia.mtp import (
-    Step5MTPSharedHead,
     Step5MTP,
+    Step5MTPSharedHead,
     Step5MultiTokenPredictor,
     Step5MultiTokenPredictorLayer,
     _build_mtp_norm,
@@ -36,9 +40,8 @@ from vllm.models.step5.nvidia.mtp import (
     _get_step5_mtp_moe_blocks,
     _set_step5_moe_protocol_metadata,
 )
-from vllm_ascend.models.step5._step5_compat import _require_resolved_valid_vocab_size
-from vllm.model_executor.models.utils import maybe_prefix
 
+from vllm_ascend.models.step5._step5_compat import _require_resolved_valid_vocab_size
 from vllm_ascend.models.step5.model import AscendStep5DecoderLayer
 
 
@@ -64,16 +67,33 @@ class AscendStep5MultiTokenPredictorLayer(Step5MultiTokenPredictorLayer):
         quant_config = vllm_config.quant_config
         self.enorm = _build_mtp_norm(config)
         self.hnorm = _build_mtp_norm(config)
-        self.eh_proj = nn.Linear(
-            config.hidden_size * 2, config.hidden_size, bias=False
-        )
-        self.shared_head = Step5MTPSharedHead(
-            config=config, quant_config=quant_config, prefix=f"{prefix}.shared_head"
-        )
+        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.shared_head = Step5MTPSharedHead(config=config, quant_config=quant_config, prefix=f"{prefix}.shared_head")
         self.mtp_block = AscendStep5DecoderLayer(
             mtp_vllm_config,
             prefix=f"{prefix}.mtp_block",
         )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_index: int = 0,
+    ) -> torch.Tensor:
+        assert inputs_embeds is not None
+        # Ascend's decoder returns the complete residual-added tensor. The
+        # swf predictor expects a sequence-sharded (FFN, residual) pair, so
+        # its inherited forward cannot be used with the Ascend block.
+        if self.fp32_residual_connection:
+            inputs_embeds = inputs_embeds.to(torch.bfloat16)
+            previous_hidden_states = previous_hidden_states.to(torch.bfloat16)
+        eh_input = torch.cat([self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)], dim=-1)
+        hidden_states = self.eh_proj(eh_input)
+        if self.fp32_residual_connection:
+            hidden_states = hidden_states.to(torch.float32)
+        return self.mtp_block(positions=positions, hidden_states=hidden_states)
 
 
 class AscendStep5MultiTokenPredictor(Step5MultiTokenPredictor):
@@ -89,10 +109,7 @@ class AscendStep5MultiTokenPredictor(Step5MultiTokenPredictor):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
         if self.num_mtp_layers <= 0:
-            raise ValueError(
-                "Step5 MTP requires num_nextn_predict_layers > 0, got "
-                f"{self.num_mtp_layers}."
-            )
+            raise ValueError(f"Step5 MTP requires num_nextn_predict_layers > 0, got {self.num_mtp_layers}.")
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
@@ -109,9 +126,7 @@ class AscendStep5MultiTokenPredictor(Step5MultiTokenPredictor):
 
         self.logits_processor = LogitsProcessor(
             config.vocab_size,
-            valid_vocab_size=_require_resolved_valid_vocab_size(
-                _get_mtp_vllm_config(vllm_config).model_config
-            ),
+            valid_vocab_size=_require_resolved_valid_vocab_size(_get_mtp_vllm_config(vllm_config).model_config),
         )
 
 
@@ -122,14 +137,17 @@ class AscendStep5MTP(Step5MTP):
         # Bypass Step5MTP.__init__ (raises on non-CUDA platforms); the body
         # below replicates it with the Ascend predictor.
         nn.Module.__init__(self)
+        # Match the draft's module prefixes without changing the target's
+        # quantization exclusions (the target may be wrapped in language_model).
+        if vllm_config.quant_config is not None:
+            quant_config = deepcopy(vllm_config.quant_config)
+            quant_config.apply_vllm_mapper(WeightsMapper(orig_to_new_prefix={"language_model.": ""}))
+            vllm_config = replace(vllm_config, quant_config=quant_config)
         self.config = _get_mtp_config(vllm_config)
         self.vllm_config = vllm_config
-        _require_resolved_valid_vocab_size(
-            _get_mtp_vllm_config(vllm_config).model_config
-        )
-        self.model = AscendStep5MultiTokenPredictor(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
+        _require_resolved_valid_vocab_size(_get_mtp_vllm_config(vllm_config).model_config)
+        self.model = AscendStep5MultiTokenPredictor(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self.lm_head = self.model.layers[str(self.model.mtp_start_layer_idx)].shared_head.head
         moe_blocks = _get_step5_mtp_moe_blocks(self.model)
         # Expose the actual draft topology so dense MTP forwards do not
         # inherit the target model's DP collectives.

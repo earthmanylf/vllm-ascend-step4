@@ -21,9 +21,10 @@ find_package(Torch REQUIRED)
 
 run_python(TORCH_VERSION
   "import torch; print(torch.__version__)" "Failed to locate torch path")
-# check torch version is 2.10.0
-if(NOT ${TORCH_VERSION} VERSION_EQUAL "2.10.0")
-  message(FATAL_ERROR "Expected PyTorch version 2.10.0, but found ${TORCH_VERSION}")
+# Ignore the wheel's local build suffix (for example, +cpu).
+string(REGEX REPLACE "\\+.*$" "" TORCH_BASE_VERSION "${TORCH_VERSION}")
+if(NOT TORCH_BASE_VERSION VERSION_EQUAL "2.13.0")
+  message(FATAL_ERROR "Expected PyTorch version 2.13.0, but found ${TORCH_VERSION}")
 endif()
 
 set(RUN_MODE "npu" CACHE STRING "cpu/sim/npu")

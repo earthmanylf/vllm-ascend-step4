@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ascend Step-4 model fork.
 
-Sliding-window layers reuse the upstream dense ``Step5Attention`` unchanged
-(sparse_config=None, model_has_dsa_layers=False) and run on the
-platform-default Ascend attention backend, which supports sliding windows.
+Sliding-window layers retain the upstream dense projection and rotary layout
+and select the platform-default Ascend attention backend.
 
 Full-attention (DSA) layers use ``AscendStep5DSAAttention``, a
 minimax_m3-style custom attention module whose impl runs the step5-hf
@@ -20,13 +19,12 @@ from __future__ import annotations
 import copy
 import os
 import re
-
 from typing import Any
 
 import torch
+import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
 from torch import nn
 from torch.nn.parameter import Parameter
-
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dp_group,
@@ -36,12 +34,19 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.linear import RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    LinearBase,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -56,9 +61,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
-from vllm.sequence import IntermediateTensors
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
-
 from vllm.models.step5.nvidia.config import (
     Step5SparseConfig,
     checkpoint_has_step5_sparse_config,
@@ -75,8 +77,8 @@ from vllm.models.step5.nvidia.model import (
     Step5ForCausalLM,
     Step5FusedQKVIndexerLinear,
     Step5MLP,
-    Step5MoE,
     Step5Model,
+    Step5MoE,
     Step5SparseIndexerIndexTPLinear,
     _get_step5_layer_types,
     _get_step5_moe_layer_indices,
@@ -86,19 +88,20 @@ from vllm.models.step5.nvidia.model import (
     _step5_moe_reduce_policy,
     _validate_step5_dsa_parallel_geometry,
 )
+from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm_ascend.device.device_op import DeviceOperator
+
+from vllm_ascend import envs
 from vllm_ascend.models.step5._step5_compat import (
     Step5FP32RouterLinear,
     _require_resolved_valid_vocab_size,
 )
-
-import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
-from vllm_ascend import envs
-from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.step5.dsa_attention import (
     AscendStep5DSABackend,
     AscendStep5DSAImpl,
 )
-
 from vllm_ascend.models.step5.fused_add_rms_norm import fused_add_rms_norm_cast
 from vllm_ascend.models.step5.fused_qknorm_rope import (
     fused_indexer_qkz_kv_norm_rope,
@@ -108,6 +111,7 @@ from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache
 from vllm_ascend.quantization.configs.fp8_config import AscendFp8Config, Step5Fp8BlockConfig
 
 logger = init_logger(__name__)
+
 
 def _kv_cache_torch_dtype(cache_config, vllm_config) -> torch.dtype:
     cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
@@ -122,7 +126,7 @@ def _kv_cache_torch_dtype(cache_config, vllm_config) -> torch.dtype:
     raise ValueError(f"Unsupported step5-ascend KV cache dtype: {cache_dtype}")
 
 
-def _step5_fp8_expert_layout(config: Any) -> tuple[set[int], int]:
+def _step5_fp8_expert_layout(config: Any, quant_config: Any = None) -> tuple[set[int], int]:
     """Return (bf16 expert layer indices, quant block size).
 
     A Step5 checkpoint either declares ``quantization_config.fp8`` with
@@ -130,23 +134,27 @@ def _step5_fp8_expert_layout(config: Any) -> tuple[set[int], int]:
     those under ``modules_to_not_convert`` -- or declares nothing, in which
     case every expert is bf16.
     """
-    quant_config = getattr(config, "quantization_config", None)
-    if not quant_config:
-        return set(), 0
-    quant_method = quant_config.get("quant_method")
+    # The VL frontend passes its text_config to the language model, while
+    # checkpoint quantization metadata can live only at the VL top level.
+    # The resolved quant config retains those exclusions and mapper updates.
+    if quant_config is not None:
+        quant_method = quant_config.get_name()
+        block = quant_config.weight_block_size
+        ignored_layers = quant_config.ignored_layers
+    else:
+        hf_quant_config = getattr(config, "quantization_config", None)
+        if not hf_quant_config:
+            return set(), 0
+        quant_method = hf_quant_config.get("quant_method")
+        block = hf_quant_config.get("weight_block_size")
+        ignored_layers = hf_quant_config.get("modules_to_not_convert") or hf_quant_config.get("ignored_layers")
     if quant_method not in ("fp8", "compressed-tensors"):
-        raise ValueError(
-            f"Step5 Ascend fp8 experts support quant_method=fp8, got "
-            f"{quant_method!r}."
-        )
-    block = quant_config.get("weight_block_size") or [128, 128]
+        raise ValueError(f"Step5 Ascend fp8 experts support quant_method=fp8, got {quant_method!r}.")
+    block = block or [128, 128]
     if list(block) != [128, 128]:
-        raise ValueError(
-            "Step5 Ascend fp8 experts require 128x128 weight blocks, got "
-            f"{list(block)}."
-        )
+        raise ValueError(f"Step5 Ascend fp8 experts require 128x128 weight blocks, got {list(block)}.")
     bf16_layers: set[int] = set()
-    for entry in quant_config.get("modules_to_not_convert") or []:
+    for entry in ignored_layers or []:
         # A skipped router (moe.gate) does not make the routed experts BF16.
         # Only a skipped expert subtree, or the whole MoE module, does.
         match = re.search(r"layers\.(\d+)\.moe(?:\.experts(?:\.|$)|$)", entry)
@@ -211,9 +219,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         if yarn_only_types and layer_type not in yarn_only_types:
             rope_scaling = None
         if isinstance(rope_theta, list):
-            rope_theta = _per_layer_value(
-                rope_theta, self.layer_idx, name="rope_theta", default=None
-            )
+            rope_theta = _per_layer_value(rope_theta, self.layer_idx, name="rope_theta", default=None)
 
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
@@ -227,28 +233,16 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         self.rope_theta = rope_theta
         self.zero_centered = zero_centered
         self.use_head_wise_attn_gate = use_head_wise_attn_gate
-        self.use_rope = bool(
-            _per_layer_value(
-                use_rope_layers, self.layer_idx, name="use_rope_layers", default=True
-            )
-        )
+        self.use_rope = bool(_per_layer_value(use_rope_layers, self.layer_idx, name="use_rope_layers", default=True))
         if norm_dtype is None:
             norm_dtype = get_step5_norm_dtype(vllm_config.model_config.hf_config)
-        linear_quant_config = (
-            quant_config
-            if quant_config is None or quant_config.get_name() != "fp8"
-            else None
-        )
+        linear_quant_config = quant_config if quant_config is None or quant_config.get_name() != "fp8" else None
 
         # --- upstream DSA geometry validation -------------------------------
         if self.num_kv_heads != 1:
-            raise ValueError(
-                f"Step5 DSA requires exactly one local KV head, got {self.num_kv_heads}"
-            )
+            raise ValueError(f"Step5 DSA requires exactly one local KV head, got {self.num_kv_heads}")
         if self.head_dim not in (128, 192):
-            raise ValueError(
-                f"Step5 DSA head_dim must be 128/192, got {self.head_dim}"
-            )
+            raise ValueError(f"Step5 DSA head_dim must be 128/192, got {self.head_dim}")
         _validate_step5_dsa_parallel_geometry(
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
@@ -265,15 +259,9 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            indexer_q_output_size=(
-                int(sparse_config.sparse_indexer_num_heads) * proxy_dim
-            ),
-            indexer_kv_output_size=(
-                int(sparse_config.sparse_indexer_num_k_heads) * proxy_dim
-            ),
-            gate_output_size=(
-                self.total_num_heads if use_head_wise_attn_gate else None
-            ),
+            indexer_q_output_size=(int(sparse_config.sparse_indexer_num_heads) * proxy_dim),
+            indexer_kv_output_size=(int(sparse_config.sparse_indexer_num_k_heads) * proxy_dim),
+            gate_output_size=(self.total_num_heads if use_head_wise_attn_gate else None),
             proxy_dim=proxy_dim,
             index_tp_size=int(sparse_config.index_tp_size),
             quant_config=linear_quant_config,
@@ -300,9 +288,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         )
 
         # --- main attention norms + rope -------------------------------------
-        rope_parameters: dict[str, Any] = (
-            dict(rope_scaling) if rope_scaling is not None else {}
-        )
+        rope_parameters: dict[str, Any] = dict(rope_scaling) if rope_scaling is not None else {}
         rope_parameters.setdefault("rope_type", "default")
         if self.rope_theta is not None:
             rope_parameters["rope_theta"] = self.rope_theta
@@ -332,9 +318,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         sparse_params = dict(self._sparse_indexer_base_rope_parameters)
         if str(sparse_params.get("rope_type", "default")).strip().lower() == "none":
             sparse_params["rope_type"] = "default"
-        sparse_params["partial_rotary_factor"] = float(
-            int(sparse_config.sparse_indexer_rope_dim) / proxy_dim
-        )
+        sparse_params["partial_rotary_factor"] = float(int(sparse_config.sparse_indexer_rope_dim) / proxy_dim)
         self.sparse_indexer_rotary_emb = get_rope(
             head_size=proxy_dim,
             max_position=max_position,
@@ -360,23 +344,15 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         )
         if self.use_fused_indexer_norm_rope:
             self._indexer_rotary_dim = indexer_rope_dim
-            self._indexer_num_q_heads = int(
-                sparse_config.sparse_indexer_num_heads
-            ) // int(sparse_config.index_tp_size)
-            self._indexer_num_k_heads = int(
-                sparse_config.sparse_indexer_num_k_heads
-            )
+            self._indexer_num_q_heads = int(sparse_config.sparse_indexer_num_heads) // int(sparse_config.index_tp_size)
+            self._indexer_num_k_heads = int(sparse_config.sparse_indexer_num_k_heads)
             self._indexer_zero_centered = zero_centered
             indexer_rotary_cache = self.sparse_indexer_rotary_emb.cos_sin_cache
-            self._indexer_rope_cos, self._indexer_rope_sin = (
-                indexer_rotary_cache.chunk(2, dim=-1)
-            )
+            self._indexer_rope_cos, self._indexer_rope_sin = indexer_rotary_cache.chunk(2, dim=-1)
 
         # --- vLLM attention-layer plumbing (minimax_m3 pattern) ---------------
         self.layer_name = f"{prefix}.attn"
-        self.kv_cache_dtype = (
-            cache_config.cache_dtype if cache_config is not None else "auto"
-        )
+        self.kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
         self.kv_cache_torch_dtype = _kv_cache_torch_dtype(cache_config, vllm_config)
         self.attn_backend = AscendStep5DSABackend
         # Mirror the upstream CUDA wiring (vllm.models.step5.model): the MTP
@@ -385,9 +361,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         num_speculative_tokens = 0
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.method == "mtp":
-            num_speculative_tokens = int(
-                getattr(spec_config, "num_speculative_tokens", 0) or 0
-            )
+            num_speculative_tokens = int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
         self.impl = AscendStep5DSAImpl(
             self.num_heads,
             self.head_dim,
@@ -400,9 +374,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             max_num_seqs=int(vllm_config.scheduler_config.max_num_seqs),
             max_model_len=int(vllm_config.model_config.max_model_len),
             block_size=int(vllm_config.cache_config.block_size),
-            max_num_batched_tokens=int(
-                vllm_config.scheduler_config.max_num_batched_tokens
-            ),
+            max_num_batched_tokens=int(vllm_config.scheduler_config.max_num_batched_tokens),
             decode_out_dtype=vllm_config.model_config.dtype,
             num_speculative_tokens=num_speculative_tokens,
         )
@@ -414,9 +386,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         self.max_position_embeddings = max_position
 
         self.use_fused_qknorm_rope = (
-            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1"
-            and self.use_rope
-            and self.head_dim == 192
+            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1" and self.use_rope and self.head_dim == 192
         )
         if self.use_fused_qknorm_rope:
             self._fused_rotary_pairs = self.rotary_dim // 2
@@ -439,12 +409,8 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             main_layer_name=self.layer_name,
             static_forward_context=compilation_config.static_forward_context,
         )
-        self.kv_cache_extra_budget_page_size_bytes = (
-            self.sparse_summary_cache._set_summary_cache_budget
-        )
-        self.kv_cache_extra_budget_fixed_size_bytes = (
-            self.sparse_summary_cache._fixed_runtime_state_budget
-        )
+        self.kv_cache_extra_budget_page_size_bytes = self.sparse_summary_cache._set_summary_cache_budget
+        self.kv_cache_extra_budget_fixed_size_bytes = self.sparse_summary_cache._fixed_runtime_state_budget
         if cache_config is not None:
             # A prefix-cache hit replays at least one page of the prompt so
             # the recomputed tail rebuilds the summary state that the hit
@@ -452,7 +418,6 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_prefix_recompute_tokens = int(cache_config.block_size)
         else:
             self.kv_cache_prefix_recompute_tokens = 0
-
 
     def get_attn_backend(self) -> type[AscendStep5DSABackend]:
         return self.attn_backend
@@ -475,9 +440,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             requires_zeroing=self.kv_cache_requires_zeroing,
             extra_budget_page_size_bytes=int(page_budget or 0),
             extra_budget_fixed_size_bytes=int(fixed_budget or 0),
-            prefix_cache_recompute_tokens=int(
-                self.kv_cache_prefix_recompute_tokens or 0
-            ),
+            prefix_cache_recompute_tokens=int(self.kv_cache_prefix_recompute_tokens or 0),
         )
 
     def _apply_sparse_indexer_rope(
@@ -537,35 +500,21 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
                 subtract_mean_q=False,
                 subtract_mean_k=True,
             )
-            index_q = index_q.reshape(
-                num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
-            )
-            index_k = index_k.reshape(
-                num_tokens, num_index_k_heads, proxy_dim
-            )
-            index_z = index_z.reshape(
-                num_tokens, num_index_k_heads, proxy_dim
-            )
+            index_q = index_q.reshape(num_tokens, self.num_kv_heads, heads_per_group, proxy_dim)
+            index_k = index_k.reshape(num_tokens, num_index_k_heads, proxy_dim)
+            index_z = index_z.reshape(num_tokens, num_index_k_heads, proxy_dim)
         else:
             index_k = self.sparse_indexer_k_norm(index_k.contiguous())
-            index_q = index_q.view(
-                num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
-            ).contiguous()
+            index_q = index_q.view(num_tokens, self.num_kv_heads, heads_per_group, proxy_dim).contiguous()
             index_q = self.sparse_indexer_q_norm(index_q)
-            index_k = index_k.view(
-                num_tokens, num_index_k_heads, proxy_dim
-            ).contiguous()
+            index_k = index_k.view(num_tokens, num_index_k_heads, proxy_dim).contiguous()
             index_q, index_k = self._apply_sparse_indexer_rope(
                 positions,
                 index_q.reshape(num_tokens, -1, proxy_dim),
                 index_k,
             )
-            index_q = index_q.reshape(
-                num_tokens, self.num_kv_heads, heads_per_group, proxy_dim
-            )
-            index_z = index_z.view(
-                num_tokens, num_index_k_heads, proxy_dim
-            ).contiguous()
+            index_q = index_q.reshape(num_tokens, self.num_kv_heads, heads_per_group, proxy_dim)
+            index_z = index_z.view(num_tokens, num_index_k_heads, proxy_dim).contiguous()
 
         weights = weights.to(dtype=torch.float32)
         weights = weights.view(num_tokens, self.num_kv_heads, heads_per_group)
@@ -584,9 +533,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             key_cache, value_cache = self.kv_cache[0], self.kv_cache[1]
         else:
             key_cache, value_cache = self.kv_cache[0], self.kv_cache[1]
-        DeviceOperator.reshape_and_cache(
-            k, v, key_cache, value_cache, md.slot_mapping[:num_tokens]
-        )
+        DeviceOperator.reshape_and_cache(k, v, key_cache, value_cache, md.slot_mapping[:num_tokens])
 
     def forward(
         self,
@@ -612,23 +559,15 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
                 norm_weight_bias=1.0 if self.zero_centered else 0.0,
             )
         else:
-            q, k, v = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size], dim=-1
-            )
-            q_by_head = q.view(
-                *q.shape[:-1], self.num_heads, self.head_dim
-            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q_by_head = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
             q = self.q_norm(q_by_head.contiguous()).view(q.shape)
-            k_by_head = k.view(
-                *k.shape[:-1], self.num_kv_heads, self.head_dim
-            )
+            k_by_head = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
             k = self.k_norm(k_by_head.contiguous()).view(k.shape)
             if self.use_rope:
                 q, k = self.rotary_emb(positions, q, k)
 
-        index_q_raw, index_k_raw, index_z_raw, gate = (
-            self.qkv_indexer_proj.split_indexer(qkzg)
-        )
+        index_q_raw, index_k_raw, index_z_raw, gate = self.qkv_indexer_proj.split_indexer(qkzg)
         index_q, index_k, index_z, weights = self._finish_indexer(
             positions, hidden_states, index_q_raw, index_k_raw, index_z_raw
         )
@@ -655,8 +594,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         attn_output = output.view(num_tokens, self.num_heads * self.head_dim)
         if gate is not None:
             attn_output = (
-                attn_output.view(num_tokens, self.num_heads, self.head_dim)
-                * gate.unsqueeze(-1).sigmoid()
+                attn_output.view(num_tokens, self.num_heads, self.head_dim) * gate.unsqueeze(-1).sigmoid()
             ).view(num_tokens, -1)
         if reduce_scatter_output:
             # Sequence-parallel o_proj: reduce-scatter needs rows divisible
@@ -665,9 +603,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             sp_pad = (-attn_output.shape[0]) % self.tp_size
             if sp_pad:
                 attn_output = torch.nn.functional.pad(attn_output, (0, 0, 0, sp_pad))
-            output_tensor, _ = self.o_proj(
-                attn_output, reduce_scatter_results=True, reduce_scatter_dim=0
-            )
+            output_tensor, _ = self.o_proj(attn_output, reduce_scatter_results=True, reduce_scatter_dim=0)
         else:
             output_tensor, _ = self.o_proj(attn_output)
         return output_tensor
@@ -724,14 +660,11 @@ class AscendStep5FusedMoEBlock(Step5MoE):
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
 
         self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = (
-            self.physical_expert_start + self.n_local_physical_experts
-        )
+        self.physical_expert_end = self.physical_expert_start + self.n_local_physical_experts
 
         if self.tp_size > config.moe_num_experts:
             raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.moe_num_experts}."
+                f"Tensor parallel size {self.tp_size} is greater than the number of experts {config.moe_num_experts}."
             )
 
         self.gate = Step5FP32RouterLinear(
@@ -752,24 +685,15 @@ class AscendStep5FusedMoEBlock(Step5MoE):
         )
         self.need_fp32_gate = config.need_fp32_gate
         if not self.need_fp32_gate:
-            raise ValueError(
-                "Step5 MoE requires need_fp32_gate=true for stable router logits."
-            )
+            raise ValueError("Step5 MoE requires need_fp32_gate=true for stable router logits.")
 
         activation = "silu"
         swiglu_limits = config.swiglu_limits or []
-        swiglu_limit = (
-            swiglu_limits[self.layer_idx]
-            if self.layer_idx < len(swiglu_limits)
-            else None
-        )
+        swiglu_limit = swiglu_limits[self.layer_idx] if self.layer_idx < len(swiglu_limits) else None
         if swiglu_limit not in (None, 0):
             swiglu_limit = float(swiglu_limit)
             if swiglu_limit != 7.0:
-                raise ValueError(
-                    "Step5 fused MoE supports only swiglu_limit=7.0, got "
-                    f"{swiglu_limit}."
-                )
+                raise ValueError(f"Step5 fused MoE supports only swiglu_limit=7.0, got {swiglu_limit}.")
             activation = "swiglustep"
 
         # Optional Step5-native fp8 expert execution, gated by the
@@ -783,7 +707,7 @@ class AscendStep5FusedMoEBlock(Step5MoE):
         moe_quant_config = quant_config
         enable_step5_fp8 = bool(envs.VLLM_ASCEND_ENABLE_STEP4_FP8)
         if enable_step5_fp8 and isinstance(quant_config, AscendFp8Config):
-            bf16_expert_layers, _ = _step5_fp8_expert_layout(config)
+            bf16_expert_layers, _ = _step5_fp8_expert_layout(config, quant_config)
             if self.layer_idx in bf16_expert_layers:
                 moe_quant_config = None
             else:
@@ -817,17 +741,16 @@ class AscendStep5FusedMoEBlock(Step5MoE):
 
         # reduce_results=False: AscendMoERunner owns the shared-expert TP
         # reduction (fused into the token combine for MC2/All2All, or a
-        # separate shared-only all-reduce otherwise).
+        # separate shared-only all-reduce otherwise). It also owns SP token
+        # gathering; the SWF MLP's SP mode would replicate its TP weights.
         self.share_expert = Step5MLP(
             config=config,
             hidden_size=self.hidden_size,
             intermediate_size=share_expert_dim,
             hidden_act="silu",
             reduce_results=False,
-            is_sequence_parallel=enable_sp_moe,
-            quant_config=quant_config
-            if quant_config and quant_config.get_name() != "fp8"
-            else None,
+            sequence_parallel=False,
+            quant_config=quant_config if quant_config and quant_config.get_name() != "fp8" else None,
             prefix=f"{prefix}.share_expert",
         )
         # No custom_routing_function here: it would disable the Ascend fused
@@ -867,18 +790,13 @@ class AscendStep5FusedMoEBlock(Step5MoE):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
         # Sequence-parallel state is carried by the runner's FusedMoEConfig.
-        if (
-            self.experts.moe_config.is_sequence_parallel
-            and not input_is_sequence_parallel
-        ):
+        if self.experts.moe_config.is_sequence_parallel and not input_is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self.experts.is_internal_router:
             # Internal-router runners compute the gate themselves and the
             # runner sums the shared expert into the routed output.
-            return self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
-            )
+            return self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         router_logits, _ = self.gate(hidden_states)
         # Single complete tensor: AscendMoERunner sums the shared expert
         # output internally and applies the required TP reductions.
@@ -895,18 +813,264 @@ class AscendStep5Attention(Step5Attention):
     otherwise.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        max_position: int = 4096 * 32,
+        head_dim: int | None = None,
+        rms_norm_eps: float = 1e-06,
+        qkv_bias: bool = False,
+        rope_theta: float | list[float] | None = 10000,
+        cache_config: Any | None = None,
+        quant_config: Any | None = None,
+        rope_scaling: dict[str, Any] | None = None,
+        prefix: str = "",
+        attn_type: str = AttentionType.DECODER,
+        # Step5 specific args
+        sliding_window: int | None = None,
+        use_head_wise_attn_gate: bool = False,
+        layer_types: list[Any] | None = None,
+        use_rope_layers: list[Any] | None = None,
+        yarn_only_types: list[Any] | None = None,
+        swa_num_attention_heads: int | None = None,
+        partial_rotary_factor: float = 1.0,
+        zero_centered: bool = True,
+        vllm_config: VllmConfig | None = None,
+        sparse_config: Step5SparseConfig | None = None,
+        norm_dtype: torch.dtype | None = None,
+    ):
+        nn.Module.__init__(self)
+        if sparse_config is not None:
+            raise ValueError("AscendStep5Attention handles dense layers only")
+        del vllm_config
+        if qkv_bias:
+            raise NotImplementedError("Step5 attention_bias is not supported.")
+        self.hidden_size = hidden_size
+        self.total_num_heads = num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = tp_size
+        self.layer_idx = extract_layer_index(prefix)
+        sparse_indexer_base_rope_parameters = dict(rope_scaling) if rope_scaling is not None else {}
+        default_layer_type = "sliding_attention" if self.layer_idx % 2 == 0 else "full_attention"
+        layer_type = _per_layer_value(
+            layer_types,
+            self.layer_idx,
+            name="layer_types",
+            default=default_layer_type,
+        )
+        enable_sliding_window = layer_type == "sliding_attention"
+        if yarn_only_types and layer_type not in yarn_only_types:
+            rope_scaling = None
+        if sliding_window is not None and enable_sliding_window:
+            if swa_num_attention_heads is not None:
+                num_heads = swa_num_attention_heads
+                self.total_num_heads = swa_num_attention_heads
+        else:
+            sliding_window = None
+        if isinstance(rope_theta, list):
+            if not rope_theta:
+                raise ValueError("Step5 rope_theta cannot be an empty list.")
+            rope_theta = _per_layer_value(
+                rope_theta,
+                self.layer_idx,
+                name="rope_theta",
+                default=None,
+            )
+        self.rank = get_tensor_model_parallel_rank()
+        if self.total_num_heads <= 0 or self.total_num_heads % tp_size != 0:
+            raise ValueError(
+                "Step5 attention heads must be positive and divisible by tensor "
+                f"parallel size, got num_heads={self.total_num_heads}, "
+                f"tp_size={tp_size}."
+            )
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads <= 0:
+            raise ValueError(f"Step5 attention requires a positive number of KV heads, got {self.total_num_kv_heads}.")
+        if self.total_num_kv_heads >= tp_size:
+            if self.total_num_kv_heads % tp_size != 0:
+                raise ValueError(
+                    "Step5 KV heads must be divisible by tensor parallel size "
+                    "when sharded, got "
+                    f"num_kv_heads={self.total_num_kv_heads}, tp_size={tp_size}."
+                )
+        else:
+            if tp_size % self.total_num_kv_heads != 0:
+                raise ValueError(
+                    "Step5 KV heads must divide tensor parallel size when "
+                    "replicated, got "
+                    f"num_kv_heads={self.total_num_kv_heads}, tp_size={tp_size}."
+                )
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        if head_dim is None and hidden_size % self.total_num_heads != 0:
+            raise ValueError(
+                "Step5 hidden_size must be divisible by num_heads when head_dim "
+                f"is omitted, got hidden_size={hidden_size}, "
+                f"num_heads={self.total_num_heads}."
+            )
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
+        if self.head_dim <= 0:
+            raise ValueError(f"Step5 head_dim must be positive, got {self.head_dim}.")
+        self.partial_rotary_factor = float(partial_rotary_factor)
+        self.rotary_dim = int(self.head_dim * self.partial_rotary_factor)
+        if (
+            self.partial_rotary_factor <= 0.0
+            or self.partial_rotary_factor > 1.0
+            or self.rotary_dim <= 0
+            or self.rotary_dim % 2 != 0
+        ):
+            raise ValueError(
+                "Step5 partial_rotary_factor must produce a positive, even "
+                "rotary dimension no larger than head_dim, got "
+                f"head_dim={self.head_dim}, "
+                f"partial_rotary_factor={self.partial_rotary_factor}, "
+                f"rotary_dim={self.rotary_dim}."
+            )
+        if max_position is None or int(max_position) <= 0:
+            raise ValueError(f"Step5 max_position must be a positive integer, got {max_position}.")
+        max_position = int(max_position)
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.fuse_qkv_gate = (
+            use_head_wise_attn_gate
+            and self.total_num_kv_heads >= tp_size
+            and (
+                quant_config is None
+                or all(
+                    isinstance(
+                        LinearBase(
+                            hidden_size,
+                            width,
+                            quant_config=quant_config,
+                            prefix=f"{prefix}.{name}",
+                            tp_rank=self.rank,
+                            tp_size=tp_size,
+                        ).quant_method,
+                        UnquantizedLinearMethod,
+                    )
+                    for name, width in (
+                        (
+                            "qkv_proj",
+                            (self.total_num_heads + 2 * num_kv_heads) * self.head_dim,
+                        ),
+                        ("g_proj", self.total_num_heads),
+                    )
+                )
+            )
+        )
+        self.use_dsa_backend = False
+        self.sparse_summary_cache: Any = None
+        if self.fuse_qkv_gate:
+            self.qkvg_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [
+                    self.total_num_heads * self.head_dim,
+                    self.total_num_kv_heads * self.head_dim,
+                    self.total_num_kv_heads * self.head_dim,
+                    self.total_num_heads,
+                ],
+                bias=False,
+                quant_config=quant_config,
+                # Keep the original prefix so quantization configuration that
+                # targets qkv_proj continues to apply to the fused module.
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.params_dtype = self.qkvg_proj.params_dtype
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.params_dtype = self.qkv_proj.params_dtype
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+        rope_parameters: dict[str, Any] = dict(rope_scaling) if rope_scaling is not None else {}
+        rope_parameters.setdefault("rope_type", "default")
+        if rope_theta is not None:
+            rope_parameters["rope_theta"] = rope_theta
+        rope_parameters["partial_rotary_factor"] = partial_rotary_factor
+        sparse_indexer_base_rope_parameters.setdefault("rope_type", "default")
+        if rope_theta is not None:
+            sparse_indexer_base_rope_parameters["rope_theta"] = rope_theta
+        sparse_indexer_base_rope_parameters["partial_rotary_factor"] = partial_rotary_factor
+        self._sparse_indexer_base_rope_parameters = dict(sparse_indexer_base_rope_parameters)
+        self.rotary_emb = get_rope(
+            head_size=self.head_dim,
+            max_position=max_position,
+            rope_parameters=rope_parameters,
+            dtype=self.params_dtype,
+        )
+        self.zero_centered = zero_centered
+        self.q_norm = make_step5_rms_norm(
+            self.head_dim,
+            eps=rms_norm_eps,
+            zero_centered=self.zero_centered,
+            dtype=norm_dtype,
+        )
+        self.k_norm = make_step5_rms_norm(
+            self.head_dim,
+            eps=rms_norm_eps,
+            zero_centered=self.zero_centered,
+            dtype=norm_dtype,
+        )
+        self.use_head_wise_attn_gate = use_head_wise_attn_gate
+        if use_head_wise_attn_gate and not self.use_dsa_backend and not self.fuse_qkv_gate:
+            self.g_proj = ColumnParallelLinear(
+                hidden_size,
+                self.total_num_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_proj",
+            )
+        self.use_rope = bool(
+            _per_layer_value(
+                use_rope_layers,
+                self.layer_idx,
+                name="use_rope_layers",
+                default=True,
+            )
+        )
+        # Let the hardware plugin select the dense NPU backend.
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            # Step5 checkpoints do not quantize the KV cache.
+            quant_config=None,
+            prefix=f"{prefix}.attn",
+            per_layer_sliding_window=sliding_window,
+            attn_type=attn_type,
+        )
+        if cache_config is not None:
+            # Prefix-cache reuse must replay at least one cache page, for DSA
+            # layers and for dense layers sharing their KV layout.
+            self.attn.kv_cache_prefix_recompute_tokens = int(cache_config.block_size)
+        self.max_position_embeddings = max_position
+        self.sparse_attn = None
+        self.fuse_swa_gate = False
+
+        # NPU kernels replace the CUDA-only QK normalization and rotary fusion.
         self.use_fused_qknorm_rope = (
-            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1"
-            and getattr(self, "use_rope", False)
-            and self.head_dim == 192
-            and not getattr(self, "use_dsa_backend", False)
+            os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1" and self.use_rope and self.head_dim == 192
         )
         if self.use_fused_qknorm_rope:
             self._fused_rotary_pairs = self.rotary_dim // 2
-            rotary_cache = self.rotary_emb.cos_sin_cache
-            self.rope_cos, self.rope_sin = rotary_cache.chunk(2, dim=-1)
+            self.rope_cos, self.rope_sin = self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
         else:
             self._fused_rotary_pairs = 0
             self.rope_cos = None
@@ -923,9 +1087,7 @@ class AscendStep5Attention(Step5Attention):
             extra_dims = None
         elif self.fuse_qkv_gate:
             qkvg, _ = self.qkvg_proj(hidden_states)
-            qkv, extra_dims = qkvg.split(
-                [self.q_size + 2 * self.kv_size, self.num_heads], dim=-1
-            )
+            qkv, extra_dims = qkvg.split([self.q_size + 2 * self.kv_size, self.num_heads], dim=-1)
             qkv = qkv.contiguous()
             extra_dims = extra_dims.contiguous()
         else:
@@ -950,46 +1112,26 @@ class AscendStep5Attention(Step5Attention):
                 norm_weight_bias=1.0 if self.zero_centered else 0.0,
             )
         else:
-            q, k, v = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size], dim=-1
-            )
-            q_by_head = q.view(
-                *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
-            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
             q_by_head = self.q_norm(q_by_head.contiguous())
             q = q_by_head.view(q.shape)
-            k_by_head = k.view(
-                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
-            )
+            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
             k_by_head = self.k_norm(k_by_head.contiguous())
             k = k_by_head.view(k.shape)
             if self.use_rope:
                 q, k = self.rotary_emb(positions, q, k)
 
         if self.sparse_attn is not None:
-            attn_output, extra_dims = self.sparse_attn.forward(
-                positions, hidden_states, q, k, v, qkzg=qkzg
-            )
+            attn_output, extra_dims = self.sparse_attn.forward(positions, hidden_states, q, k, v, qkzg=qkzg)
         else:
-            attn_output = self.attn(
-                q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep
-            )
+            attn_output = self.attn(q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep)
         if extra_dims is None and self.use_head_wise_attn_gate:
             extra_dims, _ = self.g_proj(hidden_states)
 
-        if extra_dims is not None:
-            attn_output = torch.ops.vllm.step5_materialize_gate_input(
-                attn_output
-            )
-            extra_dims = torch.ops.vllm.step5_materialize_gate_input(
-                extra_dims
-            )
-
         if self.use_head_wise_attn_gate:
             output = (
-                attn_output.view(
-                    *attn_output.shape[:-1], self.num_heads, self.head_dim
-                )
+                attn_output.view(*attn_output.shape[:-1], self.num_heads, self.head_dim)
                 * extra_dims.unsqueeze(-1).sigmoid()
             )
             attn_output = output.view(*attn_output.shape)
@@ -1033,9 +1175,7 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
 
         sliding_window = getattr(config, "sliding_window", None)
         if sliding_window is None:
-            sliding_window = getattr(
-                vllm_config.model_config.hf_text_config, "sliding_window", None
-            )
+            sliding_window = getattr(vllm_config.model_config.hf_text_config, "sliding_window", None)
         if sliding_window is None and cache_config is not None:
             sliding_window = cache_config.sliding_window
         if cache_config is not None:
@@ -1043,19 +1183,14 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
             cache_config.sliding_window = None
 
         sparse_config = get_step5_sparse_config(config)
-        checkpoint_has_dsa_layers = (
-            checkpoint_has_step5_sparse_config(config) and sparse_config is not None
-        )
-        use_dsa_for_layer = (
-            sparse_config is not None
-            and _is_step5_full_attention_layer(config, layer_idx, sparse_config)
+        checkpoint_has_dsa_layers = checkpoint_has_step5_sparse_config(config) and sparse_config is not None
+        use_dsa_for_layer = sparse_config is not None and _is_step5_full_attention_layer(
+            config, layer_idx, sparse_config
         )
         del checkpoint_has_dsa_layers  # dense layers must not opt into DSA wiring
         # Dense-fallback switch for A5 bring-up debugging: VLLM_STEP4_SPARSE=0
         # routes DSA layers through the platform dense backend as well.
-        use_dsa_for_layer = use_dsa_for_layer and (
-            os.environ.get("VLLM_STEP4_SPARSE", "1") != "0"
-        )
+        use_dsa_for_layer = use_dsa_for_layer and (os.environ.get("VLLM_STEP4_SPARSE", "1") != "0")
 
         norm_dtype = get_step5_norm_dtype(config)
         layer_types = _get_step5_layer_types(config)
@@ -1092,9 +1227,7 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
             layer_types=layer_types,
             use_rope_layers=getattr(config, "use_rope_layers", []),
             yarn_only_types=getattr(config, "yarn_only_types", []),
-            swa_num_attention_heads=getattr(
-                config, "swa_num_attention_heads", None
-            ),
+            swa_num_attention_heads=getattr(config, "swa_num_attention_heads", None),
             partial_rotary_factor=partial_rotary_factor,
             prefix=f"{prefix}.self_attn",
             zero_centered=config.zero_centered,
@@ -1109,16 +1242,12 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
         else:
             self.self_attn = AscendStep5Attention(
                 sparse_config=None,
-                model_has_dsa_layers=False,
                 **attn_kwargs,
             )
 
         self.use_moe = False
         self.tp_group = get_tp_group()
-        self.use_fused_all_reduce = (
-            get_tensor_model_parallel_world_size() > 1
-            and get_dp_group().world_size == 1
-        )
+        self.use_fused_all_reduce = get_tensor_model_parallel_world_size() > 1 and get_dp_group().world_size == 1
 
         moe_layers_idx = _get_step5_moe_layer_indices(config)
         if layer_idx in moe_layers_idx:
@@ -1133,9 +1262,7 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act="silu",
-                quant_config=quant_config
-                if quant_config and quant_config.get_name() != "fp8"
-                else None,
+                quant_config=quant_config if quant_config and quant_config.get_name() != "fp8" else None,
                 reduce_results=True,
                 prefix=f"{prefix}.mlp",
             )
@@ -1164,8 +1291,7 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
         self.use_attention_o_proj_reduce_scatter = self.use_sequence_parallel_moe
         if self.use_sequence_parallel_moe:
             logger.info_once(
-                "Step4 MoE sequence parallelism enabled (TP=%d, EP): "
-                "AG-attn-RS-MoE(shard) decoder loop.",
+                "Step4 MoE sequence parallelism enabled (TP=%d, EP): AG-attn-RS-MoE(shard) decoder loop.",
                 self.tp_group.world_size,
             )
 
@@ -1176,21 +1302,19 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
         residual: torch.Tensor | None = None,
         orig_num_tokens: int | None = None,
     ) -> torch.Tensor:
-        if not self.use_moe or not isinstance(self.moe, AscendStep5FusedMoEBlock):
-            return super()._forward_ffn(
-                hidden_states,
-                input_is_sequence_parallel=input_is_sequence_parallel,
-                residual=residual,
-                orig_num_tokens=orig_num_tokens,
-            )
+        if not self.use_moe:
+            # The dense MLP keeps complete token rows and performs its own
+            # TP reduction. swf's decoder FFN no longer accepts Ascend's
+            # sequence-parallel MoE arguments.
+            return self.mlp(hidden_states)
+        if not isinstance(self.moe, AscendStep5FusedMoEBlock):
+            return super()._forward_ffn(hidden_states)
         # AscendStep5FusedMoEBlock returns a single complete tensor: the
         # Ascend MoE combine kernel reduces the routed output across TP and
         # the runner reduces the shared-expert output to match, so no extra
         # all-reduce may be applied here (reducing the sum would count the
         # routed contribution once per TP rank, measured 8x).
-        ffn_output = self.moe(
-            hidden_states, input_is_sequence_parallel=input_is_sequence_parallel
-        )
+        ffn_output = self.moe(hidden_states, input_is_sequence_parallel=input_is_sequence_parallel)
         # On Ascend the MoE comm impls (MC2 / AllGather / All2All) fuse the
         # EP/TP reduction into the token combine, so the routed output is
         # already complete even though FusedMoEBlock requested
@@ -1237,15 +1361,11 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
             residual,
             self.post_attention_layernorm.weight,
             self.post_attention_layernorm.variance_epsilon,
-            zero_centered=getattr(
-                self.post_attention_layernorm, "zero_centered", False
-            ),
+            zero_centered=getattr(self.post_attention_layernorm, "zero_centered", False),
             fp32_residual=self.fp32_residual_connection,
         )
 
-    def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.use_attention_o_proj_reduce_scatter and hidden_states.dim() == 2:
             # DeepseekV32-style sequence-parallel loop: restore the full
             # sequence for attention, reduce-scatter the o_proj output back
@@ -1276,23 +1396,18 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
                 residual,
                 reduce_scatter_output=True,
             )
-            ffn_output = self._forward_ffn(
-                hidden_states, input_is_sequence_parallel=True
-            )
+            ffn_output = self._forward_ffn(hidden_states, input_is_sequence_parallel=True)
             ffn_output = self._cast_for_residual(ffn_output)
             return ffn_output + residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self._cast_for_param_op(hidden_states)
 
-        hidden_states, residual = self.forward_attention(
-            positions, hidden_states, residual
-        )
+        hidden_states, residual = self.forward_attention(positions, hidden_states, residual)
 
         ffn_output = self._forward_ffn(hidden_states)
         ffn_output = self._cast_for_residual(ffn_output)
         return ffn_output + residual
-
 
 
 class AscendStep5Model(Step5Model):
@@ -1310,9 +1425,7 @@ class AscendStep5Model(Step5Model):
         self.moe_num_experts = config.moe_num_experts
         self.parallel_config = vllm_config.parallel_config
 
-        if get_pp_group().is_first_rank or (
-            config.tie_word_embeddings and get_pp_group().is_last_rank
-        ):
+        if get_pp_group().is_first_rank or (config.tie_word_embeddings and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
                 config.hidden_size,
@@ -1399,9 +1512,7 @@ class AscendStep5Model(Step5Model):
                     residual,
                     layer.input_layernorm.weight,
                     layer.input_layernorm.variance_epsilon,
-                    zero_centered=getattr(
-                        layer.input_layernorm, "zero_centered", False
-                    ),
+                    zero_centered=getattr(layer.input_layernorm, "zero_centered", False),
                     fp32_residual=self.fp32_residual_connection,
                 )
                 if ffn_is_shard:
@@ -1423,9 +1534,7 @@ class AscendStep5Model(Step5Model):
             hidden_states, residual = layer.forward_attention(
                 positions, hidden_states, residual, reduce_scatter_output=use_sp
             )
-            ffn_output = layer._forward_ffn(
-                hidden_states, input_is_sequence_parallel=use_sp
-            )
+            ffn_output = layer._forward_ffn(hidden_states, input_is_sequence_parallel=use_sp)
             ffn_is_shard = use_sp
         hidden_states = self._cast_for_residual(ffn_output) + residual
         if ffn_is_shard:
@@ -1468,16 +1577,13 @@ class AscendStep5ForCausalLM(Step5ForCausalLM):
         config = model_config.hf_config
         self.config = config
         self.fp32_residual_connection = config.fp32_residual_connection
-        self.model = AscendStep5Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
+        self.model = AscendStep5Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=vllm_config.quant_config
-                if vllm_config.quant_config
-                and vllm_config.quant_config.get_name() != "fp8"
+                if vllm_config.quant_config and vllm_config.quant_config.get_name() != "fp8"
                 else None,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
@@ -1490,9 +1596,7 @@ class AscendStep5ForCausalLM(Step5ForCausalLM):
         else:
             self.lm_head = PPMissingLayer()
 
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
         # Set MoE hyperparameters
         self.moe_layers: list[Any] = []

@@ -11,6 +11,10 @@ def register_model():
         "vllm_ascend.models.step5:AscendStep5ForCausalLM",
     )
     ModelRegistry.register_model(
+        "Step5ForConditionalGeneration",
+        "vllm_ascend.models.step5.vl:AscendStep5ForConditionalGeneration",
+    )
+    ModelRegistry.register_model(
         "Step5MTP",
         "vllm_ascend.models.step5.mtp:AscendStep5MTP",
     )

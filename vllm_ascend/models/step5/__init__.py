@@ -6,12 +6,13 @@ from vllm_ascend.models.step5.dsa_attention import (
     AscendStep5DSAImpl,
 )
 from vllm_ascend.models.step5.model import (
-    AscendStep5DSAAttention,
     AscendStep5DecoderLayer,
+    AscendStep5DSAAttention,
     AscendStep5ForCausalLM,
     AscendStep5Model,
 )
 from vllm_ascend.models.step5.mtp import AscendStep5MTP
+from vllm_ascend.models.step5.vl import AscendStep5ForConditionalGeneration
 
 __all__ = [
     "AscendStep5DSABackend",
@@ -19,6 +20,7 @@ __all__ = [
     "AscendStep5DSAAttention",
     "AscendStep5DecoderLayer",
     "AscendStep5ForCausalLM",
+    "AscendStep5ForConditionalGeneration",
     "AscendStep5Model",
     "AscendStep5MTP",
 ]
