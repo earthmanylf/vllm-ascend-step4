@@ -356,7 +356,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         self.attn_backend = AscendStep5DSABackend
         # Mirror the upstream CUDA wiring (vllm.models.step5.model): the MTP
         # speculative token count is handed to the DSA impl so verify batches
-        # (K+1 rows per request) take the staged/deferred-flush summary path.
+        # (K+1 rows per request) use the persistent SWF request journal.
         num_speculative_tokens = 0
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.method == "mtp":
@@ -1556,12 +1556,10 @@ class AscendStep5Model(Step5Model):
 class AscendStep5ForCausalLM(Step5ForCausalLM):
     @staticmethod
     def get_model_state_cls():
-        # swf's Step5ForCausalLM.get_model_state_cls() returns the swf core
-        # Step5ModelState, which would bypass AscendModelState.prepare_attn on
-        # the v2 hot path. Pin the Ascend model state instead.
-        from vllm_ascend.worker.v2.model_states.default import AscendModelState
+        # Add SWF journal coordinates without bypassing NPU metadata setup.
+        from vllm_ascend.models.step5.model_state import AscendStep5ModelState
 
-        return AscendModelState
+        return AscendStep5ModelState
 
     def __init__(
         self,

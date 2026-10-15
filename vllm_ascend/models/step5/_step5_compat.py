@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # This file is a part of the vllm-ascend project.
-"""Local re-implementations of Step5 helpers removed by the Inferact/swf
-``step-5-preview-tracking`` fork from ``vllm.models.step5``.
+"""Ascend scratch/router helpers and the fixed SWF summary-cache contract.
 
-The Ascend Step5 DSA / sparse-summary-cache code owns the usage of these
-pure-Python (torch-only) helpers, so we vendor them here instead of importing
-from the (now restructured) upstream fork. They are copied from the
-stepfun/water18 vLLM fork (``vllm/models/step5/sparse_summary_cache.py``) where
-vllm-ascend was previously validated.
+The summary cache itself is imported from the fixed SWF implementation; only
+its NPU dispatch and Ascend owning-KV layout are adapted in summary_cache.
 """
 
 from __future__ import annotations
@@ -18,6 +14,7 @@ from dataclasses import dataclass, field
 
 import torch
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.models.step5.nvidia.sparse_summary_cache import Step5SparseSummaryCache
 
 
 @dataclass
@@ -57,17 +54,10 @@ class Step5DSAScratchWorkspace:
 
     @torch.inference_mode()
     def reset_runtime_state(self) -> int:
-        sentinel_minus_one = {
-            "csa_prefill_scratch_region_ids",
-            "csa_prefill_scratch_row_map",
-        }
         num_buffers = 0
         for buffers in self.tensor_buffers_by_engine.values():
-            for name, buffer in buffers.items():
-                if name in sentinel_minus_one:
-                    buffer.fill_(-1)
-                else:
-                    buffer.zero_()
+            for buffer in buffers.values():
+                buffer.zero_()
                 num_buffers += 1
         for token in self.order_tokens_by_engine.values():
             token.zero_()
@@ -93,6 +83,10 @@ class Step5SparseSummaryCacheConfig:
             value = int(getattr(self, name))
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}.")
+        if self.page_size % 8 or self.region_block_size != 8:
+            raise ValueError("Fixed SWF Step5 summaries require eight-token regions and aligned pages.")
+        if self.num_kv_heads != 1 or self.proxy_dim != 256:
+            raise ValueError("Fixed SWF Step5 summaries require one 256-dimensional proxy key head.")
 
     @staticmethod
     def max_region_fragments_per_block(
@@ -157,161 +151,13 @@ def step5_sparse_summary_cache_bytes_per_block(
     fragments = Step5SparseSummaryCacheConfig.max_region_fragments_per_block(
         block_size=block_size, region_block_size=region_block_size
     )
+    if int(block_size) % 8 or int(region_block_size) != 8 or proxy_dim != 256 or num_kv_heads != 1:
+        raise ValueError(
+            "Fixed SWF Step5 summaries require aligned pages, region=8, proxy_dim=256 and one proxy key head."
+        )
     del sum_dtype, count_dtype
-    return int(fragments * num_kv_heads * proxy_dim)
-
-
-class Step5SparseSummaryCache:
-    """Per-layer physical KV sidecar used by Step5 sparse selection.
-
-    FP8 means follow the owner scheduler pages through prefix hits and COW.
-    FP32 sum/count are shared producer scratch. Persistent partial regions
-    use the fixed-capacity active-slot arrays initialized by the Ascend DSA
-    implementation, rather than SWF's per-page request journal.
-    """
-
-    _step5_csa_active_region_ids: torch.Tensor
-
-    _step5_csa_active_slot_by_region: torch.Tensor
-
-    _step5_csa_allocation_success: torch.Tensor
-
-    _step5_csa_numerator_cache: torch.Tensor
-
-    _step5_csa_denominator_cache: torch.Tensor
-
-    _step5_csa_max_cache: torch.Tensor
-
-    mean_cache: torch.Tensor
-
-    def __init__(
-        self,
-        *,
-        config: Step5SparseSummaryCacheConfig,
-        sum_cache: torch.Tensor,
-        count_cache: torch.Tensor,
-        mean_cache: torch.Tensor | None = None,
-        blocks_per_scheduler_block: int = 1,
-    ) -> None:
-        self.config = config
-        self.sum_cache = sum_cache
-        self.count_cache = count_cache
-        self.mean_cache = (
-            mean_cache
-            if mean_cache is not None
-            else torch.zeros(
-                self.config.sum_shape,
-                device=sum_cache.device,
-                dtype=torch.uint8,
-            )
-        )
-        self.blocks_per_scheduler_block = max(1, int(blocks_per_scheduler_block))
-        expected_sum_shape = (
-            int(self.sum_cache.shape[0]),
-            1,
-            self.num_kv_heads,
-            self.proxy_dim,
-        )
-        if tuple(self.sum_cache.shape) != expected_sum_shape:
-            raise ValueError(
-                "Step5 sparse sum_cache shape mismatch: expected "
-                f"{expected_sum_shape}, got {tuple(self.sum_cache.shape)}."
-            )
-        expected_count_shape = (
-            int(self.count_cache.shape[0]),
-            1,
-            self.num_kv_heads,
-        )
-        if tuple(self.count_cache.shape) != expected_count_shape:
-            raise ValueError(
-                "Step5 sparse count_cache shape mismatch: expected "
-                f"{expected_count_shape}, got {tuple(self.count_cache.shape)}."
-            )
-        if tuple(self.mean_cache.shape) != self.config.sum_shape:
-            raise ValueError(
-                "Step5 sparse mean_cache shape mismatch: expected "
-                f"{self.sum_shape}, got {tuple(self.mean_cache.shape)}."
-            )
-        if self.mean_cache.dtype != torch.uint8:
-            raise ValueError(f"Step5 sparse mean_cache must be uint8 FP8 storage, got {self.mean_cache.dtype}.")
-
-    @property
-    def num_pages(self) -> int:
-        return self.config.num_pages
-
-    @property
-    def page_size(self) -> int:
-        return self.config.page_size
-
-    @property
-    def region_block_size(self) -> int:
-        return self.config.region_block_size
-
-    @property
-    def num_kv_heads(self) -> int:
-        return self.config.num_kv_heads
-
-    @property
-    def proxy_dim(self) -> int:
-        return self.config.proxy_dim
-
-    @property
-    def summaries_per_page(self) -> int:
-        return self.config.summaries_per_page
-
-    @property
-    def sum_shape(self) -> tuple[int, int, int, int]:
-        return self.config.sum_shape
-
-    @property
-    def count_shape(self) -> tuple[int, int, int]:
-        return self.config.count_shape
-
-    @torch.inference_mode()
-    def reset_runtime_state(
-        self,
-        *,
-        reset_producer_scratch: bool = True,
-    ) -> None:
-        """Clear persistent DSA state without reallocating captured tensors."""
-        if reset_producer_scratch:
-            self.sum_cache.zero_()
-            self.count_cache.zero_()
-        self.mean_cache.zero_()
-
-        fill_values = {
-            "_step5_csa_active_region_ids": -1,
-            "_step5_csa_active_slot_by_region": -1,
-            "_step5_csa_allocation_success": 1,
-            "_step5_csa_numerator_cache": 0,
-            "_step5_csa_denominator_cache": 0,
-            "_step5_csa_max_cache": float("-inf"),
-            "_step5_csa_active_token_k": 0,
-            "_step5_csa_active_token_z": 0,
-            "_step5_csa_active_token_valid": 0,
-        }
-        for name, value in fill_values.items():
-            tensor = getattr(self, name, None)
-            if isinstance(tensor, torch.Tensor):
-                tensor.fill_(value)
-
-        transaction = getattr(self, "_step5_mtp_transaction", None)
-        reset_transaction = getattr(transaction, "reset_runtime_state", None)
-        if reset_transaction is not None:
-            reset_transaction()
-
-    def _invalidate_mtp_transaction_for_reset(
-        self, block_ids: torch.Tensor, *, blocks_per_scheduler_block: int
-    ) -> None:
-        transaction = getattr(self, "_step5_mtp_transaction", None)
-        invalidate = getattr(transaction, "invalidate_scheduler_blocks", None)
-        if invalidate is None:
-            return
-        invalidate(
-            block_ids,
-            blocks_per_scheduler_block=int(blocks_per_scheduler_block),
-            summaries_per_page=int(self.summaries_per_page),
-        )
+    # FP8 means plus per-page FP32 numerator/denominator/maximum and int64 last.
+    return int(fragments * num_kv_heads * proxy_dim + 513 * 4 + 8)
 
 
 class Step5FP32RouterLinear(ReplicatedLinear):
