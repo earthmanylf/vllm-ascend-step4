@@ -17,7 +17,7 @@ torch==2.13.0
 torch-npu==2.13.0rc1
 torchvision==0.28.0
 # Audio is optional: torch 2.13-compatible torchaudio is not in this wheelhouse.
-triton-ascend==3.6.0+dev20261013182112
+triton-ascend==3.6.0+dev20261011191350
 wheel
 xgrammar>=0.1.30
 pandas-stubs
