@@ -40,12 +40,11 @@ serving, and the operator's consistent-count fast path does not apply.
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 from cann_ops_transformer.ops.attention.generic_block_sparse_attention import (
     generic_block_sparse_attention,
     generic_block_sparse_attention_metadata,
 )
+from vllm.triton_utils import tl, triton
 
 _SPARSE_PATTERN_PER_GROUP_PER_TOKEN = 4
 _MASK_CAUSAL = 1
