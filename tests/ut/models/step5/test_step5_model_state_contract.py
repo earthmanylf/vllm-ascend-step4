@@ -210,6 +210,7 @@ class TestStep5RequestMetadata(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), "metadata", "exec"), namespace)
         self.builder = namespace[builder.name]()
         self.builder.reorder_batch_threshold = 4
+        self.builder._prepare_gbsa_metadata = lambda metadata: None
         self.builder.context_len_buffer = Buffer([0] * 5)
         self.builder.step5_request_state = Buffer([5, 2, 4, -1, -1])
         self.common = types.SimpleNamespace(

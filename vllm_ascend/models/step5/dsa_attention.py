@@ -2,7 +2,7 @@
 """Ascend Step5 DSA with SWF per-page state and persistent request journal.
 
 The NPU summary producer follows the fixed SWF ordered FP32 update and
-request-indexed rollback contract. Paged indexer and sparse GQA kernels
+request-indexed rollback contract. Ascend IndexerRegionScore and GenericBlockSparseAttention operators
 consume the materialized FP8 summaries; each row excludes future regions,
 force-includes its current region and applies an exact token causal mask.
 """
@@ -28,15 +28,13 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
-
 from vllm_ascend.models.step5._step5_compat import Step5DSAScratchWorkspace
-from vllm_ascend.models.step5.dsa_kernels import (
-    decode_sparse_meta,
-    indexer_logits_paged,
-    prefill_sparse_meta,
-    sparse_attention_decode,
-    sparse_attention_prefill,
+from vllm_ascend.models.step5.generic_block_sparse_attention import (
+    gbsa_expected_counts,
+    gbsa_sparse_attention,
+    gbsa_sparse_attention_metadata,
 )
+from vllm_ascend.models.step5.indexer_region_score import indexer_score_topk
 from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache
 from vllm_ascend.models.step5.summary_kernels import build_prefill_groups
 
@@ -127,6 +125,11 @@ class AscendStep5DSAPrefillMetadata:
     """CPU copies produced by the builder's existing seq_lens transfer; the
     impl reads these instead of calling ``.tolist()`` on device tensors."""
 
+    gbsa_metadata: torch.Tensor | None = None
+    """Per-step AICPU schedule shared by every DSA layer in this group."""
+    cu_seqlens_q: torch.Tensor | None = None
+    """Int64 cumulative query lengths consumed by the native attention op."""
+
     step5_request_state: torch.Tensor | None = None
     """Persistent request indices for this prefill suffix, one per request."""
 
@@ -150,6 +153,11 @@ class AscendStep5DSADecodeMetadata:
     query_len: int = 1
     """Uniform decode query length K (1 for plain decode, 1+num_spec for
     MTP verify batches)."""
+
+    gbsa_metadata: torch.Tensor | None = None
+    """Per-step AICPU schedule shared by every DSA layer in this group."""
+    cu_seqlens_q: torch.Tensor | None = None
+    """Int64 cumulative query lengths consumed by the native attention op."""
 
     step5_request_state: torch.Tensor | None = None
     """Persistent request indices for this decode prefix, one per request."""
@@ -199,6 +207,110 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
             dtype=torch.int32,
             device=device,
         )
+
+        impl = vllm_config.compilation_config.static_forward_context[layer_names[0]].impl
+        self.gbsa_num_heads = impl.num_heads
+        self.gbsa_num_kv_groups = impl.num_kv_groups
+        self.gbsa_head_size = impl.head_size
+        self.gbsa_region_size = impl.region_size
+        self.gbsa_topk = impl.topk_regions
+        self.gbsa_block_size = kv_cache_spec.block_size
+        self.capture_sizes = set(vllm_config.compilation_config.cudagraph_capture_sizes or [])
+        self.gbsa_meta_buffers: dict[tuple, torch.Tensor] = {}
+        self.query_start_loc_int64_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens + 1,
+            dtype=torch.int64,
+            device=device,
+        )
+
+    def _build_gbsa_metadata(
+        self,
+        positions: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_kv: torch.Tensor,
+        block_table: torch.Tensor,
+        max_query_len: int,
+        *,
+        path: str,
+        graph_shape: bool,
+    ) -> torch.Tensor:
+        """One AICPU scheduling pass per step for these query positions.
+
+        On capture-sized shapes the fresh tensor is copied into a persistent
+        buffer keyed by the shape signature, so a captured graph replays
+        against a stable address whose content is refreshed every step.
+        """
+        counts = gbsa_expected_counts(
+            positions,
+            groups=self.gbsa_num_kv_groups,
+            region_size=self.gbsa_region_size,
+            topk=self.gbsa_topk,
+        )
+        metadata = gbsa_sparse_attention_metadata(
+            counts,
+            num_heads=self.gbsa_num_heads,
+            num_kv_groups=self.gbsa_num_kv_groups,
+            head_dim=self.gbsa_head_size,
+            region_size=self.gbsa_region_size,
+            topk=self.gbsa_topk,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_kv=seqused_kv,
+            max_query_len=max_query_len,
+            max_pages=int(block_table.shape[1]),
+            page_size=self.gbsa_block_size,
+        )
+        if not graph_shape:
+            return metadata
+        buffer_key = (
+            path,
+            tuple(counts.shape),
+            int(cu_seqlens_q.shape[0]) - 1,
+            max_query_len,
+        )
+        buffer = self.gbsa_meta_buffers.get(buffer_key)
+        if buffer is None:
+            self.gbsa_meta_buffers[buffer_key] = metadata
+            return metadata
+        buffer.copy_(metadata)
+        return buffer
+
+    def _prepare_gbsa_metadata(self, md: AscendStep5DSAMetadata) -> None:
+        """Schedule native attention outside the model, without touching journals."""
+        query_start_loc_int64 = self.query_start_loc_int64_buffer[: md.query_start_loc.shape[0]]
+        query_start_loc_int64.copy_(md.query_start_loc)
+        graph_shape = md.num_actual_tokens in self.capture_sizes
+        d = md.decode
+        if d is not None and md.num_decodes:
+            n = md.num_decodes
+            q_len = int(d.query_len)
+            total = n * q_len
+            row = torch.arange(total, device=d.seq_lens.device, dtype=torch.int64)
+            positions = (d.seq_lens.to(torch.int64) - q_len).repeat_interleave(q_len) + row % q_len
+            d.cu_seqlens_q = query_start_loc_int64[: n + 1]
+            d.gbsa_metadata = self._build_gbsa_metadata(
+                positions,
+                d.cu_seqlens_q,
+                d.seq_lens,
+                d.block_table,
+                q_len,
+                path="decode",
+                graph_shape=graph_shape,
+            )
+        p = md.prefill
+        if p is not None and md.num_prefills:
+            p.cu_seqlens_q = p.query_start_loc.to(torch.int64)
+            row = torch.arange(p.num_query_tokens, device=p.seq_lens.device, dtype=torch.int64)
+            requests = torch.searchsorted(p.cu_seqlens_q, row, right=True) - 1
+            positions = p.context_lens.to(torch.int64)[requests] + row - p.cu_seqlens_q[requests]
+            p.gbsa_metadata = self._build_gbsa_metadata(
+                positions,
+                p.cu_seqlens_q,
+                p.seq_lens,
+                p.block_table,
+                p.max_query_len,
+                path="prefill",
+                graph_shape=False,
+            )
 
     def build(
         self,
@@ -268,7 +380,7 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
                 step5_request_state=request_state[:active_decodes] if request_state is not None else None,
             )
 
-        return AscendStep5DSAMetadata(
+        metadata = AscendStep5DSAMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             num_decodes=active_decodes,
             num_decode_tokens=num_decode_tokens,
@@ -281,6 +393,8 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
             decode=decode_metadata,
             step5_request_state=request_state,
         )
+        self._prepare_gbsa_metadata(metadata)
+        return metadata
 
 
 def _active_decode_num_reqs(
@@ -432,7 +546,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         *,
         initialize_runtime_state: bool = True,
     ) -> None:
-        """Bind SWF state and reserve shared indexer workspace before capture."""
+        """Bind SWF state and reserve shared summary workspace before capture."""
         self._dsa_scratch_bound = False
         if initialize_runtime_state:
             self._summary_cache = summary_cache
@@ -449,13 +563,6 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             "summary_prefill_state",
             (rows, 513),
             device=device,
-            dtype=torch.float32,
-        )
-        decode_rows_per_req = self.num_speculative_tokens + 1
-        self._get_dsa_tensor_buffer_at_least(
-            "sparse_decode_logits",
-            (self.num_kv_groups * self.max_num_seqs * decode_rows_per_req, self._max_regions),
-            device=summary_cache.mean_cache.device,
             dtype=torch.float32,
         )
         self._dsa_scratch_bound = True
@@ -553,8 +660,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         summary_cache: AscendStep5SparseSummaryCache,
         md: AscendStep5DSAMetadata,
         query: torch.Tensor,
-        key_flat: torch.Tensor,
-        value_flat: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         index_q: torch.Tensor,
         weights: torch.Tensor,
         output: torch.Tensor,
@@ -575,44 +682,41 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             )
         n = md.num_decodes
         groups = self.num_kv_groups
-        # Region scoring over the static selector capacity, the whole batch
-        # in one kernel launch. Dead columns hold stale scores, but the
-        # selector only reads columns below each row's live history length.
-        logits = self._get_dsa_tensor_buffer_at_least(
-            "sparse_decode_logits",
-            (groups * n, self._max_regions),
-            device=index_q.device,
-            dtype=torch.float32,
-        )
-        indexer_logits_paged(
+        seq_lens_i32 = d.seq_lens.to(torch.int32)
+        # Fused score + causal topk + ascending sort via aclnn; the exact
+        # attention is the aclnn GenericBlockSparseAttention operator, which
+        # appends the current region (floor(pos / region_size)) and applies
+        # the per-token causal truncation itself. actual_kv_lengths is the
+        # effective KV length including the current query (seq_len); the
+        # query token's own 0-based position (seq_len - 1) feeds the
+        # attention operator's current-region append.
+        cu_seq_lens = md.query_start_loc[: n + 1]
+        positions = seq_lens_i32 - 1
+        actual_kv_lengths = seq_lens_i32
+        _scores, ids = indexer_score_topk(
             index_q[:n],
             weights[:n],
             summary_cache.mean_cache.view(torch.float8_e4m3fn),
             d.block_table,
-            torch.arange(n, device=index_q.device, dtype=torch.int32),
-            out=logits,
-            summaries_per_page=int(summary_cache.summaries_per_page),
-        )
-        seq_lens_i32 = d.seq_lens.to(torch.int32)
-        packed, counts = decode_sparse_meta(
-            logits,
-            seq_lens_i32,
-            d.block_table,
+            cu_seq_lens,
+            actual_kv_lengths,
+            max_region_len=self._max_regions,
             topk=self.topk_regions,
             region_size=self.region_size,
-            regions_per_page=self.regions_per_page,
         )
-        out, _ = sparse_attention_decode(
+        out = gbsa_sparse_attention(
             query,
-            key_flat,
-            value_flat,
-            packed,
-            counts,
+            key_cache,
+            value_cache,
+            ids,
+            positions,
+            d.block_table,
+            d.cu_seqlens_q,
             seq_lens_i32,
+            d.gbsa_metadata,
             num_kv_groups=groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            block_regions=16,
         )
         output[:n] = out.to(output.dtype)
 
@@ -622,8 +726,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         summary_cache: AscendStep5SparseSummaryCache,
         md: AscendStep5DSAMetadata,
         query: torch.Tensor,
-        key_flat: torch.Tensor,
-        value_flat: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         index_q: torch.Tensor,
         weights: torch.Tensor,
         positions: torch.Tensor,
@@ -631,127 +735,66 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
     ) -> None:
         """Sparse attention for an MTP verify batch (K+1 rows per request).
 
-        Follows the reference flow's flattened-decode design (its
-        ``_flatten_decode_q_le4_metadata`` path): every verify row becomes a
-        single-token decode request, runs its own indexer top-k selection,
-        and the exact attention goes through ``sparse_attention_decode``.
-        Each row's ``kv_seqlen`` is its own absolute position + 1, so the
-        decode kernel's per-slot visible length
-        ``clamp(kv_seqlen - start_token, 0, region_size)`` reproduces the
-        per-row causal mask the prefill kernel used to express through
-        per-region ``valid`` counts, while ``decode_sparse_meta`` keeps the
-        row's current region out of top-k competition and force-appends it
-        -- the same contract the single-token decode path guarantees.
-        Everything is device-driven on static per-bucket shapes, so uniform
-        verify batches stay ACL-graph capturable.
+        Each verify request stays one multi-token varlen request of
+        ``query_len = K+1`` rows spanning kv positions ``ctx..ctx+K`` with
+        ``ctx = seq_len - K - 1``. The exact attention goes through the
+        aclnn ``GenericBlockSparseAttention`` operator: its right-aligned
+        causal bound (``seqused_kv = seq_len``, ``q_len = K+1``) places
+        query row ``i`` at kv position ``ctx + i`` and truncates it to its
+        own position, and the operator appends each row's current region
+        ``floor((ctx + i) / region_size)`` with causal truncation. The
+        fused indexer's per-token mask3 bound ``floor((ctx + j) /
+        region_size)`` keeps the row's current region out of top-k
+        competition -- the same contract the single-token decode path
+        guarantees, evaluated once per request instead of once per row.
+        The requests retain their original varlen boundaries for both operators.
         """
-        d = md.decode
-        n = md.num_decodes
-        k = int(d.query_len)
-        total = n * k
+        decode_md = md.decode
+        num_decodes = md.num_decodes
+        query_len = int(decode_md.query_len)
+        total_tokens = num_decodes * query_len
         groups = self.num_kv_groups
-        logits = self._get_dsa_tensor_buffer_at_least(
-            "sparse_decode_logits",
-            (groups * total, self._max_regions),
-            device=index_q.device,
-            dtype=torch.float32,
-        )
-        # Token -> request map: each request contributes K consecutive rows.
-        token_to_req = torch.arange(total, device=index_q.device, dtype=torch.int32) // k
-        indexer_logits_paged(
-            index_q[:total],
-            weights[:total],
+        # Request-level varlen metadata: the committed context
+        # ctx = seq_len - query_len anchors both operators. seqused_kv is
+        # the full seq_len (right-aligned causal anchor); the indexer's
+        # actual_kv_lengths is the same effective KV length (seq_len),
+        # from which the operator restores the first query position
+        # ctx = actual_kv_lengths - q_len and applies the mask3 bound
+        # floor((ctx + j) / region_size). cu_seq_lens reuses the builder's
+        # start-loc copies -- int32 for the fused indexer, int64 for the
+        # GenericBlockSparseAttention operator's cu_seqlens_q contract --
+        # zero-kernel views refreshed in place by the builder. Static
+        # shapes, all device tensors: ACL-graph capturable.
+        seq_lens = decode_md.seq_lens[:num_decodes]
+        cu_seq_lens = md.query_start_loc[: num_decodes + 1]
+        cu_seqlens_q = decode_md.cu_seqlens_q
+        actual_kv_lengths = seq_lens
+        _scores, ids = indexer_score_topk(
+            index_q[:total_tokens],
+            weights[:total_tokens],
             summary_cache.mean_cache.view(torch.float8_e4m3fn),
-            d.block_table[:n],
-            token_to_req,
-            out=logits,
-            summaries_per_page=int(summary_cache.summaries_per_page),
-        )
-        # Flatten the verify rows to single-token decode requests: row r of
-        # request i carries its own context end, i.e. kv_seqlen = position +
-        # 1. The decode kernel then bounds each selected region by
-        # clamp(kv_seqlen - start_token, 0, region_size), which is the
-        # per-row causal mask.
-        row_kv_seqlens = positions[:total].to(torch.int32) + 1
-        # Per-row block-table rows, gathered on device so the flatten stays
-        # graph-capturable; this mirrors the reference's metadata-flatten
-        # kernel expanding per-request rows to per-token rows.
-        row_block_table = d.block_table[:n][token_to_req.to(torch.long)]
-        packed, counts = decode_sparse_meta(
-            logits,
-            row_kv_seqlens,
-            row_block_table,
+            decode_md.block_table[:num_decodes],
+            cu_seq_lens,
+            actual_kv_lengths,
+            max_region_len=self._max_regions,
             topk=self.topk_regions,
             region_size=self.region_size,
-            regions_per_page=self.regions_per_page,
         )
-        out, _ = sparse_attention_decode(
+        out = gbsa_sparse_attention(
             query,
-            key_flat,
-            value_flat,
-            packed,
-            counts,
-            row_kv_seqlens,
+            key_cache,
+            value_cache,
+            ids,
+            positions[:total_tokens],
+            decode_md.block_table[:num_decodes],
+            cu_seqlens_q,
+            seq_lens,
+            decode_md.gbsa_metadata,
             num_kv_groups=groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            block_regions=16,
         )
-        output[:total] = out.to(output.dtype)
-
-    def _score_regions(
-        self,
-        summary_cache: AscendStep5SparseSummaryCache,
-        index_q: torch.Tensor,
-        weights: torch.Tensor,
-        block_table: torch.Tensor,
-        num_tokens: int,
-        num_rows: int,
-        seq_lens_host: list,
-        context_lens_host: list,
-    ) -> torch.Tensor:
-        """Indexer scores for the prefill rows, against the paged summary.
-
-        Same contract as the reference ``score_regions``: a
-        [groups * total_q, width] fp32 tensor in group-major row order, width
-        sized to the live history. The whole packed batch is scored in one
-        kernel launch: each query token reads the fp8 summary pages through
-        its own request's block-table row (widened in-register). Dead columns
-        past a row's live history hold zeros or stale scores, which the
-        top-k stage never reads because each row's candidate range is bounded
-        by its own history length.
-        """
-        groups = self.num_kv_groups
-        # ``seq_lens`` from the common attention metadata hold each request's
-        # FULL history (past + this chunk's query tokens); the per-row query
-        # length is the difference.
-        query_lens_list = [int(seq_lens_host[row]) - int(context_lens_host[row]) for row in range(num_rows)]
-        last_positions = [int(seq_lens_host[row]) - 1 for row in range(num_rows) if query_lens_list[row] > 0]
-        width = max((position // self.region_size for position in last_positions), default=0)
-        logits = torch.zeros(
-            (groups * num_tokens, max(width, 1)),
-            device=index_q.device,
-            dtype=torch.float32,
-        )
-        if num_tokens == 0:
-            return logits
-        mean_cache = summary_cache.mean_cache.view(torch.float8_e4m3fn)
-        # Token -> block-table row map for the packed batch, built once on the
-        # host (the query lengths already live there) and shipped in one copy.
-        token_to_req = torch.repeat_interleave(
-            torch.arange(num_rows, dtype=torch.int32),
-            torch.tensor(query_lens_list, dtype=torch.int64),
-        ).to(index_q.device)
-        indexer_logits_paged(
-            index_q[:num_tokens],
-            weights[:num_tokens],
-            mean_cache,
-            block_table[:num_rows],
-            token_to_req,
-            out=logits,
-            summaries_per_page=int(summary_cache.summaries_per_page),
-        )
-        return logits
+        output[:total_tokens] = out.to(output.dtype)
 
     def _forward_sparse_gqa_prefill(
         self,
@@ -759,8 +802,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         summary_cache: AscendStep5SparseSummaryCache,
         md: AscendStep5DSAMetadata,
         query: torch.Tensor,
-        key_flat: torch.Tensor,
-        value_flat: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         index_q: torch.Tensor,
         weights: torch.Tensor,
         positions: torch.Tensor,
@@ -772,49 +815,56 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         num_reqs = md.num_prefills
         num_query_tokens = p.num_query_tokens
 
-        logits = self._score_regions(
-            summary_cache,
-            index_q,
-            weights,
-            p.block_table,
-            num_query_tokens,
-            num_reqs,
-            p.seq_lens_host,
-            p.context_lens_host,
+        # Live history width in logical regions (the furthest last-position
+        # of any request in this chunk), bounding what the fused operator
+        # needs to score.
+        query_lens_list = [int(p.seq_lens_host[row]) - int(p.context_lens_host[row]) for row in range(num_reqs)]
+        width = max(
+            (
+                (int(p.seq_lens_host[row]) - 1) // self.region_size
+                for row in range(num_reqs)
+                if query_lens_list[row] > 0
+            ),
+            default=0,
         )
-        groups = self.num_kv_groups
+
         q_positions = positions[token_offset : token_offset + num_query_tokens].to(torch.int32)
-        # Token -> request map straight from the device start-loc.
-        requests = (
-            torch.searchsorted(
-                p.query_start_loc,
-                torch.arange(num_query_tokens, device=index_q.device, dtype=p.query_start_loc.dtype),
-                right=True,
-            )
-            - 1
-        ).to(torch.int32)
-        if groups > 1:
-            q_positions = q_positions.repeat(groups).contiguous()
-            requests = requests.repeat(groups).contiguous()
-        packed, counts = prefill_sparse_meta(
-            logits,
-            q_positions,
-            p.block_table,
-            requests,
+
+        # Fused score + causal topk + ascending sort via aclnn. The
+        # operator's mask3 bound floor((context_lens[n] + j)/region_size) is
+        # each token's own position // region_size, so the current region
+        # never competes for a slot; the attention operator appends it and
+        # causally truncates it to the token's position.
+        # cu_seq_lens from the device start-loc; actual_kv_lengths is the
+        # effective KV length including this chunk (cached context plus
+        # query tokens), from which the indexer restores the first query
+        # position as seq_len - q_len.
+        cu_seq_lens = p.query_start_loc[: num_reqs + 1]
+        actual_kv_lengths = p.seq_lens[:num_reqs].to(torch.int32)
+        _scores, ids = indexer_score_topk(
+            index_q[:num_query_tokens],
+            weights[:num_query_tokens],
+            summary_cache.mean_cache.view(torch.float8_e4m3fn),
+            p.block_table[:num_reqs],
+            cu_seq_lens,
+            actual_kv_lengths,
+            max_region_len=width,
             topk=self.topk_regions,
             region_size=self.region_size,
-            regions_per_page=self.regions_per_page,
         )
-        out, _ = sparse_attention_prefill(
+        out = gbsa_sparse_attention(
             query,
-            key_flat,
-            value_flat,
-            packed,
-            counts,
-            num_kv_groups=groups,
+            key_cache,
+            value_cache,
+            ids,
+            q_positions,
+            p.block_table[:num_reqs],
+            p.cu_seqlens_q,
+            p.seq_lens[:num_reqs].to(torch.int32),
+            p.gbsa_metadata,
+            num_kv_groups=self.num_kv_groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
-            block_regions=2,
         )
         output[token_offset : token_offset + num_query_tokens] = out.to(output.dtype)
 
@@ -856,8 +906,6 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             key_cache, value_cache = kv_cache[0], kv_cache[1]
         else:
             key_cache, value_cache = kv_cache[0], kv_cache[1]
-        key_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
-        value_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
 
         if md.num_decodes > 0:
             n = md.num_decodes
@@ -870,8 +918,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                     summary_cache=summary_cache,
                     md=md,
                     query=query[:total].contiguous(),
-                    key_flat=key_flat,
-                    value_flat=value_flat,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
                     index_q=index_q[:total],
                     weights=weights[:total],
                     positions=positions,
@@ -882,8 +930,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                     summary_cache=summary_cache,
                     md=md,
                     query=query[:n].contiguous(),
-                    key_flat=key_flat,
-                    value_flat=value_flat,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
                     index_q=index_q[:n],
                     weights=weights[:n],
                     output=output,
@@ -895,8 +943,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 summary_cache=summary_cache,
                 md=md,
                 query=query[start:num_tokens].contiguous(),
-                key_flat=key_flat,
-                value_flat=value_flat,
+                key_cache=key_cache,
+                value_cache=value_cache,
                 index_q=index_q[start:num_tokens],
                 weights=weights[start:num_tokens],
                 positions=positions,
