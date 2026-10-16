@@ -1410,6 +1410,52 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
 
 
 class AscendStep5Model(Step5Model):
+    def load_weights(self, weights):
+        quant_config = self.vllm_config.quant_config
+        if quant_config is None or quant_config.get_name() != "ascend":
+            return super().load_weights(weights)
+
+        # ModelSlim flattens [expert, output, input] to [expert*output, input].
+        # The inherited loader expects the leading expert dimension for both
+        # weights and group scales. Use recipe coordinates because VLM mapping
+        # adds language_model.model while this loader receives local names.
+        description = quant_config.quant_description
+        pattern = re.compile(r"(?:^|\.)layers\.(\d+)\.moe\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale)$")
+        quantized_projections = set()
+        for name, recipe in description.items():
+            match = pattern.search(name)
+            if match and match[3] == "weight" and recipe == "W8A8_MXFP8":
+                quantized_projections.add((int(match[1]), match[2]))
+
+        def unpack_experts():
+            for name, weight in weights:
+                match = pattern.search(name)
+                if match and (int(match[1]), match[2]) in quantized_projections:
+                    is_scale = match[3] == "weight_scale"
+                    out_size, in_size = (
+                        (self.config.hidden_size, self.config.moe_intermediate_size)
+                        if match[2] == "down_proj"
+                        else (self.config.moe_intermediate_size, self.config.hidden_size)
+                    )
+                    if is_scale:
+                        group_size = description.get("group_size", 32)
+                        if not isinstance(group_size, int) or group_size <= 0 or in_size % group_size:
+                            raise ValueError(f"Invalid Step5 ModelSlim group_size={group_size!r} for {name}.")
+                        in_size //= group_size
+                    expected = (self.moe_num_experts, out_size, in_size)
+                    flat_shape = (self.moe_num_experts * out_size, in_size)
+                    expected_dtype = torch.uint8 if is_scale else torch.float8_e4m3fn
+                    if weight.dtype != expected_dtype or tuple(weight.shape) not in (flat_shape, expected):
+                        raise ValueError(
+                            f"Invalid Step5 ModelSlim expert tensor {name}: expected {expected_dtype} "
+                            f"with shape {flat_shape} or {expected}, got {weight.dtype} {tuple(weight.shape)}."
+                        )
+                    if weight.ndim == 2:
+                        weight = weight.view(expected)
+                yield name, weight
+
+        return super().load_weights(unpack_experts())
+
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
         # The @support_torch_compile wrapper on the upstream __init__ sets
