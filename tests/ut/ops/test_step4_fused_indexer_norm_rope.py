@@ -191,7 +191,20 @@ def test_fused_indexer_norm_rope_accuracy(
         subtract_mean_k=True,
     )
 
-    for name, ref, out in (("Q", q_ref, q_out), ("K", k_ref, k_out)):
+    # index_q lands in e4m3 (quantized at the kernel store): compare
+    # against the reference cast to the same dtype. The kernel rounds
+    # through the input precision before the e4m3 store, so the values
+    # match the unfused pipeline's bits up to one e4m3 ULP (3-bit
+    # mantissa) wherever the fp32 math itself differs by an ULP.
+    q_ref8 = q_ref.to(torch.float8_e4m3fn)
+    assert q_out.dtype == torch.float8_e4m3fn
+    match = torch.allclose(q_ref8.float(), q_out.float(), atol=0.02, rtol=0.13)
+    if not match:
+        err = (q_ref8.float() - q_out.float()).abs()
+        print(f"\n[Q] max_abs_err={err.max().item():.6f} "
+              f"mean_abs_err={err.mean().item():.6f}")
+        assert match, f"Q mismatch: max_abs_err={err.max().item():.6f}"
+    for name, ref, out in (("K", k_ref, k_out),):
         match = torch.allclose(ref, out, atol=1e-2, rtol=1e-2)
         if not match:
             err = (ref.float() - out.float()).abs()
@@ -239,5 +252,8 @@ def test_fused_indexer_norm_rope_pos0_is_identity(_import_kernel):
         q_norm_weight_bias=1.0, k_norm_weight_bias=0.0,
         subtract_mean_q=False, subtract_mean_k=True,
     )
-    assert torch.allclose(q_ref, q_out, atol=1e-2, rtol=1e-2)
+    # index_q is e4m3; one-ULP tolerance for the quantized comparison.
+    q_ref8 = q_ref.to(torch.float8_e4m3fn)
+    assert q_out.dtype == torch.float8_e4m3fn
+    assert torch.allclose(q_ref8.float(), q_out.float(), atol=0.02, rtol=0.13)
     assert torch.allclose(k_ref, k_out, atol=1e-2, rtol=1e-2)

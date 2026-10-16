@@ -507,8 +507,11 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Indexer norm+rope and head scores, all local shapes.
 
-        Returns index_q [t, groups, heads_per_group, proxy], index_k [t, 1, proxy],
-        index_z [t, 1, proxy], weights [t, groups, heads_per_group] fp32.
+        Returns index_q [t, groups, heads_per_group, proxy] (float8_e4m3fn
+        on the fused path -- the kernel quantizes at the store and the
+        scoring op consumes it directly; bf16 on the non-fused fallback),
+        index_k [t, 1, proxy], index_z [t, 1, proxy],
+        weights [t, groups, heads_per_group] fp32.
         """
         num_tokens = int(hidden_states.shape[0])
         proxy_dim = int(self.sparse_config.proxy_dim)

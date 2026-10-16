@@ -45,7 +45,9 @@ def indexer_score_topk(
     """Fused score + topk + sort via aclnnIndexerRegionScore.
 
     Args:
-        index_q:  [T, G, H, D] — quantized to float8_e4m3fn internally.
+        index_q:  [T, G, H, D] — float8_e4m3fn from the fused indexer
+            norm+rope kernel (quantized at the store); bf16 inputs from the
+            non-fused fallback path are quantized here.
         weights:  [T, G, H] fp32 — signed per-head weights.
         mean_cache: [P, S, 1, D] float8_e4m3fn — paged summary cache.
         block_table: [N, C] int32 — logical-to-physical page map.

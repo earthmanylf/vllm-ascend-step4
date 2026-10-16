@@ -400,8 +400,8 @@ def _norm_rope_tile_npu_chunk(
     if HAS_BIAS:
         real = real + b_real
         imaginary = imaginary + b_imag
-    real = real.to(out_ptr.dtype.element_ty).to(tl.float32)
-    imaginary = imaginary.to(out_ptr.dtype.element_ty).to(tl.float32)
+    real = real.to(x_ptr.dtype.element_ty).to(tl.float32)
+    imaginary = imaginary.to(x_ptr.dtype.element_ty).to(tl.float32)
     rotated_first = real * cos - imaginary * sin
     rotated_second = real * sin + imaginary * cos
 
@@ -413,20 +413,28 @@ def _norm_rope_tile_npu_chunk(
         block_shape=(ROWS_PER_PROGRAM, CH * head_dim),
         order=(1, 0),
     )
+    # Store through the input precision first: when the output is narrower
+    # (index_q lands in e4m3 while the norm+rope math stages in bf16), the
+    # double rounding reproduces the unfused pipeline's bits exactly
+    # (kernel-store bf16 -> later .to(float8_e4m3fn) cast). Same-dtype
+    # outputs take the second cast as a no-op.
     tl.store(
         out_bp,
-        tl.reshape(result_tail.to(out_ptr.dtype.element_ty), (ROWS_PER_PROGRAM, CH * head_dim)),
+        tl.reshape(
+            result_tail.to(x_ptr.dtype.element_ty).to(out_ptr.dtype.element_ty),
+            (ROWS_PER_PROGRAM, CH * head_dim),
+        ),
         boundary_check=(0,),
     )
     mask_half = row_ok[:, None] & half_ok[None, :]
     tl.store(
         out_ptr + out_base[:, None] + half[None, :],
-        rotated_first.to(out_ptr.dtype.element_ty),
+        rotated_first.to(x_ptr.dtype.element_ty).to(out_ptr.dtype.element_ty),
         mask=mask_half,
     )
     tl.store(
         out_ptr + out_base[:, None] + rotary_dim + half[None, :],
-        rotated_second.to(out_ptr.dtype.element_ty),
+        rotated_second.to(x_ptr.dtype.element_ty).to(out_ptr.dtype.element_ty),
         mask=mask_half,
     )
 
@@ -693,9 +701,16 @@ def _fused_indexer_qkz_norm_rope_impl(
             f"index_k and index_z must have shape ({tokens}, {num_k_heads * head_dim}), "
             f"got {tuple(index_k.shape)} and {tuple(index_z.shape)}"
         )
-    out_q = torch.empty((tokens, num_q_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
-    out_k = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
-    out_z = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
+    # index_q comes out pre-quantized to e4m3: its only consumer (the fused
+    # indexer scoring) wants fp8, so the quantization rides along with the
+    # norm+rope store instead of a separate cast at the scoring entry.
+    out_q = torch.empty(
+        (tokens, num_q_heads * head_dim),
+        device=index_q.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    out_k = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_k.dtype)
+    out_z = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_z.dtype)
 
     m_q = tokens * num_q_heads
     m_k = tokens * num_k_heads
@@ -777,9 +792,13 @@ def _fused_indexer_qkz_norm_rope_fake(
     subtract_mean_k: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = index_q.shape[0]
-    q = torch.empty((tokens, num_q_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
-    k = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
-    z = torch.empty((tokens, num_k_heads * head_dim), device=index_q.device, dtype=index_q.dtype)
+    q = torch.empty(
+        (tokens, num_q_heads * head_dim),
+        device=index_q.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    k = torch.empty((tokens, num_k_heads * head_dim), device=index_k.device, dtype=index_k.dtype)
+    z = torch.empty((tokens, num_k_heads * head_dim), device=index_z.device, dtype=index_z.dtype)
     return q, k, z
 
 
