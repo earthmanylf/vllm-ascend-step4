@@ -112,6 +112,14 @@ MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"
 # Note: Currently, only models that do not have the `packed_modules_mapping` attribute
 # in the vLLM upstream need to be added here.
 UPDATED_PACKED_MODULES_MAPPING: dict[str, dict[str, list[str]]] = {
+    # Step5 ModelSlim checkpoints pack all experts into three sibling 3-D
+    # projections instead of individual experts.<id>.* parameters.
+    "step5": {
+        "experts": ["gate_proj", "up_proj", "down_proj"],
+    },
+    "step5_vl": {
+        "experts": ["gate_proj", "up_proj", "down_proj"],
+    },
     # GLM-5.3-Flash (glm5_next): KDA layers ship a fused q/k/v/b/f_a/g_a
     # projection; sparse-MLA layers keep the DeepSeek-style q_a/kv_a pair.
     # Native HF FP8 checkpoints leave the KDA projections in bf16 via

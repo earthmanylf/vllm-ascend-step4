@@ -29,7 +29,7 @@ from vllm_ascend.distributed.parallel_state import get_mlp_tp_group, get_otp_gro
 from vllm_ascend.utils import mlp_tp_enable, oproj_tp_enable
 
 from .methods import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, is_mx_quant_type
-from .methods.base import PreparedLinearInput
+from .methods.base import PreparedLinearInput, QuantType
 
 # vLLM's typed parameter classes take these through their constructor and expose
 # them as read-only properties, so replaying them via set_weight_attrs raises.
@@ -316,6 +316,14 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             set_weight_attrs(param, extra_weight_attrs)
             if any(fields in param_key for fields in per_group_param):
                 param.quant_method = FusedMoeWeightScaleSupported.GROUP.value
+            # DummyModelLoader skips integer tensors unless this metadata
+            # is set. E8M0 byte 127 encodes a neutral scale of 1.0.
+            if (
+                self.quant_method.quant_type == QuantType.W8A8MXFP
+                and param_key in ("w13_weight_scale", "w2_weight_scale")
+                and param.dtype == torch.uint8
+            ):
+                param.dummy_weight_value = 127
 
     def apply(
         self,
