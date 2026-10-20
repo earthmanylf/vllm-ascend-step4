@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Ascend Step-4 MTP draft model.
+
+The upstream ``Step5MTP`` is CUDA-only (its ``__init__`` raises on
+non-CUDA platforms and its predictor blocks build the CUDA
+``Step5DecoderLayer``).  This fork keeps the upstream wire format and
+interfaces (``forward``/``compute_logits``/``get_top_tokens``/``load_weights``
+are all inherited untouched) and only re-creates the ``__init__`` paths so
+the draft transformer block runs through ``AscendStep5DecoderLayer`` --
+i.e. the platform Ascend attention backends plus the NPU MoE/rope fixes
+already proven on the target model.  The MTP layer is a dense sliding
+layer, so it lands on the platform sliding-window backend, not DSA.
+
+Weight loading, module names and parameter names mirror the upstream
+implementation exactly, so the checkpoint's ``model.layers.92.*`` MTP
+weights load unchanged.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+
+import torch
+import torch.nn as nn
+from vllm.config import VllmConfig
+from vllm.config.utils import replace
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.models.step5.nvidia.mtp import (
+    Step5MTP,
+    Step5MTPSharedHead,
+    Step5MultiTokenPredictor,
+    Step5MultiTokenPredictorLayer,
+    _build_mtp_norm,
+    _get_mtp_config,
+    _get_mtp_vllm_config,
+    _get_step5_mtp_moe_blocks,
+    _set_step5_moe_protocol_metadata,
+)
+from vllm_ascend.models.step5.model import AscendStep5DecoderLayer
+
+
+class AscendStep5MultiTokenPredictorLayer(Step5MultiTokenPredictorLayer):
+    """Upstream predictor layer with the draft block swapped to Ascend."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+    ) -> None:
+        # Bypass the parent __init__: it hardcodes the CUDA
+        # Step5DecoderLayer.  Everything else mirrors it verbatim so
+        # module/parameter names stay checkpoint-compatible.
+        nn.Module.__init__(self)
+        # The parent's @support_torch_compile wrapper reads this attribute
+        # in __call__; the attribute itself is normally set by the
+        # decorator's __init__ patch, which the bypass above skips.
+        self.do_not_compile = True
+        mtp_vllm_config = _get_mtp_vllm_config(vllm_config)
+        config = mtp_vllm_config.model_config.hf_text_config
+        self.fp32_residual_connection = config.fp32_residual_connection
+        quant_config = vllm_config.quant_config
+        self.enorm = _build_mtp_norm(config)
+        self.hnorm = _build_mtp_norm(config)
+        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.shared_head = Step5MTPSharedHead(config=config, quant_config=quant_config, prefix=f"{prefix}.shared_head")
+        self.mtp_block = AscendStep5DecoderLayer(
+            mtp_vllm_config,
+            prefix=f"{prefix}.mtp_block",
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_index: int = 0,
+    ) -> torch.Tensor:
+        assert inputs_embeds is not None
+        # Ascend's decoder returns the complete residual-added tensor. The
+        # swf predictor expects a sequence-sharded (FFN, residual) pair, so
+        # its inherited forward cannot be used with the Ascend block.
+        if self.fp32_residual_connection:
+            inputs_embeds = inputs_embeds.to(torch.bfloat16)
+            previous_hidden_states = previous_hidden_states.to(torch.bfloat16)
+        eh_input = torch.cat([self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)], dim=-1)
+        hidden_states = self.eh_proj(eh_input)
+        if self.fp32_residual_connection:
+            hidden_states = hidden_states.to(torch.float32)
+        return self.mtp_block(positions=positions, hidden_states=hidden_states)
+
+
+class AscendStep5MultiTokenPredictor(Step5MultiTokenPredictor):
+    """Upstream predictor whose layers use the Ascend draft blocks."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        nn.Module.__init__(self)
+        config = _get_mtp_config(vllm_config)
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+        )
+        self.mtp_start_layer_idx = config.num_hidden_layers
+        self.num_mtp_layers = config.num_nextn_predict_layers
+        if self.num_mtp_layers <= 0:
+            raise ValueError(f"Step5 MTP requires num_nextn_predict_layers > 0, got {self.num_mtp_layers}.")
+        # to map the exact layer index from weights
+        self.layers = torch.nn.ModuleDict(
+            {
+                str(idx): AscendStep5MultiTokenPredictorLayer(
+                    vllm_config=vllm_config,
+                    prefix=f"{prefix}.layers.{idx}",
+                )
+                for idx in range(
+                    self.mtp_start_layer_idx,
+                    self.mtp_start_layer_idx + self.num_mtp_layers,
+                )
+            }
+        )
+
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+
+class AscendStep5MTP(Step5MTP):
+    """Step5MTP for Ascend: same wire format, Ascend draft decoder layer."""
+
+    def _get_mtp_quantization_mapper(self, quant_description: dict) -> WeightsMapper:
+        # ModelSlim descriptions use checkpoint names. Match the inherited
+        # weight loader's per-layer rewrite before constructing draft modules;
+        # otherwise packed projections cannot find their quantization shards.
+        prefix_mapping = {}
+        for layer_idx in range(
+            self.config.num_hidden_layers,
+            self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
+        ):
+            layer_prefix = f"model.layers.{layer_idx}."
+            for name in quant_description:
+                mapped_name = f"model.{name}" if name.startswith("layers.") else name
+                if not mapped_name.startswith(layer_prefix):
+                    continue
+                if ".mtp_block." not in mapped_name:
+                    mapped_name = self._rewrite_spec_layer_name(layer_idx, mapped_name)
+                mapped_name = mapped_name.replace(".transformer.", ".")
+                mapped_name = mapped_name.replace("shared_head.output", "shared_head.head")
+                if mapped_name != name:
+                    prefix_mapping[name] = mapped_name
+        return WeightsMapper(orig_to_new_prefix=prefix_mapping)
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        # Bypass Step5MTP.__init__ (raises on non-CUDA platforms); the body
+        # below replicates it with the Ascend predictor.
+        nn.Module.__init__(self)
+        self.config = _get_mtp_config(vllm_config)
+        # Match the draft's module prefixes without changing the target's
+        # quantization exclusions (the target may be wrapped in language_model).
+        if vllm_config.quant_config is not None:
+            quant_config = deepcopy(vllm_config.quant_config)
+            quant_config.apply_vllm_mapper(WeightsMapper(orig_to_new_prefix={"language_model.": ""}))
+            quant_description = getattr(quant_config, "quant_description", None)
+            if quant_description:
+                quant_config.apply_vllm_mapper(self._get_mtp_quantization_mapper(quant_description))
+            vllm_config = replace(vllm_config, quant_config=quant_config)
+        self.vllm_config = vllm_config
+        self.model = AscendStep5MultiTokenPredictor(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self.lm_head = self.model.layers[str(self.model.mtp_start_layer_idx)].shared_head.head
+        moe_blocks = _get_step5_mtp_moe_blocks(self.model)
+        # Expose the actual draft topology so dense MTP forwards do not
+        # inherit the target model's DP collectives.
+        self.is_dense_mtp = not moe_blocks
+        self.moe_layers = [moe.experts for moe in moe_blocks]
+        _set_step5_moe_protocol_metadata(
+            self,
+            moe_blocks[0] if moe_blocks else None,
+        )
