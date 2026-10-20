@@ -79,20 +79,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveSpeculator):
-    """Shared Ascend spec-decode loop for AscendEagle/AscendMTPSpeculator.
+class AscendDraftSpeculatorMixin(LmheadTPDraftSamplingMixin):
+    """Shared draft-speculator plumbing for Ascend NPUs.
 
-    GQA, MLA, DSA, and SFA draft decode state share one path. The current MTP path
-    uses the draft attention backend recorded by ``set_attn``.
-
-    MLA and GQA DCP keep their per-step state in ``.decode``, cloned
-    before per-step updates. Both rebuild the base metadata for the padded
-    draft batch. MLA also forwards rotary ``positions`` into
-    build_attn_metadata. DSA and SFA manage their draft state in their metadata
-    builders and skip the generic MLA/GQA init and update logic.
+    Extracted from AscendAutoRegressiveSpeculator so that
+    AscendMultiModuleMTPSpeculator can reuse it (upstream vLLM provides
+    MultiModuleMTPSpeculator as a sibling of AutoRegressiveSpeculator).
     """
-
-    model_state: "AscendModelState"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         """Override the upstream __init__ for Ascend NPUs.
@@ -296,6 +289,54 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         )
         return attn_metadata, slot_mappings
 
+    def set_attn(
+        self,
+        model_state: ModelState,
+        kv_cache_config: KVCacheConfig,
+        block_tables: BlockTables,
+        target_input_buffers: InputBuffers,
+        target_attn_groups: list[list[AttentionGroup]],
+    ) -> None:
+        # Initialize the draft attention backend with its PCP=1 config.
+        with set_current_vllm_config(self.attn_vllm_config):
+            super().set_attn(
+                model_state,
+                kv_cache_config,
+                block_tables,
+                target_input_buffers,
+                target_attn_groups,
+            )
+
+            # Use the first executable draft attention layer as the architecture
+            # discriminator and cache it for ACL graph parameter updates.
+            self.attn_backend = _get_graph_update_backend(self.attn_groups)
+        if issubclass(self.attn_backend, AscendDSABackend):
+            self.attn_architecture = "DSA"
+        elif issubclass(self.attn_backend, AscendMLABackend):
+            self.attn_architecture = "MLA"
+        elif issubclass(self.attn_backend, (AscendSFABackend, AscendSFAIndexerBackend)):
+            self.attn_architecture = "SFA"
+        elif issubclass(self.attn_backend, AscendAttentionBackend):
+            self.attn_architecture = "GQA"
+        else:
+            raise ValueError(f"Unsupported attention backend: {self.attn_backend}")
+
+
+class AscendAutoRegressiveSpeculator(AscendDraftSpeculatorMixin, AutoRegressiveSpeculator):
+    """Shared Ascend spec-decode loop for AscendEagle/AscendMTPSpeculator.
+
+    GQA, MLA, DSA, and SFA draft decode state share one path. The current MTP path
+    uses the draft attention backend recorded by ``set_attn``.
+
+    MLA and GQA DCP keep their per-step state in ``.decode``, cloned
+    before per-step updates. Both rebuild the base metadata for the padded
+    draft batch. MLA also forwards rotary ``positions`` into
+    build_attn_metadata. DSA and SFA manage their draft state in their metadata
+    builders and skip the generic MLA/GQA init and update logic.
+    """
+
+    model_state: "AscendModelState"
+
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
             cudagraph_mode = CUDAGraphMode.NONE
@@ -426,38 +467,6 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
                     is_profile=is_profile,
                     num_speculative_tokens=num_speculative_tokens,
                 )
-
-    def set_attn(
-        self,
-        model_state: ModelState,
-        kv_cache_config: KVCacheConfig,
-        block_tables: BlockTables,
-        target_input_buffers: InputBuffers,
-        target_attn_groups: list[list[AttentionGroup]],
-    ) -> None:
-        # Initialize the draft attention backend with its PCP=1 config.
-        with set_current_vllm_config(self.attn_vllm_config):
-            super().set_attn(
-                model_state,
-                kv_cache_config,
-                block_tables,
-                target_input_buffers,
-                target_attn_groups,
-            )
-
-            # Use the first executable draft attention layer as the architecture
-            # discriminator and cache it for ACL graph parameter updates.
-            self.attn_backend = _get_graph_update_backend(self.attn_groups)
-        if issubclass(self.attn_backend, AscendDSABackend):
-            self.attn_architecture = "DSA"
-        elif issubclass(self.attn_backend, AscendMLABackend):
-            self.attn_architecture = "MLA"
-        elif issubclass(self.attn_backend, (AscendSFABackend, AscendSFAIndexerBackend)):
-            self.attn_architecture = "SFA"
-        elif issubclass(self.attn_backend, AscendAttentionBackend):
-            self.attn_architecture = "GQA"
-        else:
-            raise ValueError(f"Unsupported attention backend: {self.attn_backend}")
 
     def capture(self) -> None:
         logger.info("Capturing model for speculator...")
