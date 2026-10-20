@@ -469,12 +469,12 @@ class AscendConfig:
         # to enable the megamoe for testing capabilities.
         # These codes will be removed after megamoe is ready.
         global _MEGA_MOE_SUPPORTED
-        if self.enable_fused_mc2 in (0, 1):
-            # When enable_fused_mc2=1, roll back to dispatch_ffn_combine.
+        if self.enable_fused_mc2 == 0:
             _MEGA_MOE_SUPPORTED = False
-        elif self.enable_fused_mc2 == 2:
+        elif self.enable_fused_mc2 in (1, 2):
             _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not None
-            self.enable_fused_mc2 = 1
+            if self.enable_fused_mc2 == 2:
+                self.enable_fused_mc2 = 1
         return self
 
     # ---- derivations + cross-config downgrades/mutex ----
@@ -760,6 +760,12 @@ class AscendConfig:
 
     @staticmethod
     def _is_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
+        from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+        
+        if get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP):
+            mega_moe_supported_by_config = AscendConfig._is_a5_megamoe_supported_by_config(vllm_config)
+            logger.debug("mega moe operator is supported by current a5 config: %r", mega_moe_supported_by_config)
+            return mega_moe_supported_by_config
         hf_text_config = vllm_config.model_config.hf_text_config
         hidden_size = getattr(hf_text_config, "hidden_size", None)
         if hidden_size is None and hasattr(vllm_config.model_config, "get_hidden_size"):
@@ -771,6 +777,8 @@ class AscendConfig:
             return False
 
         moe_intermediate_size = getattr(hf_text_config, "moe_intermediate_size", None)
+        if moe_intermediate_size is None:
+            moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if moe_intermediate_size is None:
             return False
         if moe_intermediate_size < 1024 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0:
@@ -789,6 +797,92 @@ class AscendConfig:
             "quanttype.w4a8",
         }
         return quant_name in supported_quant_names
+
+    @staticmethod
+    def _is_a5_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
+        model_config = vllm_config.model_config
+        hf_text_config = model_config.hf_text_config
+        model_architectures = getattr(model_config, "architectures", None) or []
+        is_minimax_m3 = any(architecture.startswith("MiniMaxM3") for architecture in model_architectures)
+        is_kimi_k3 = any(
+            architecture in ("KimiK3ForCausalLM", "KimiLinearForCausalLM", "KimiK3ForConditionalGeneration")
+            for architecture in model_architectures
+        )
+        # K3 projects the residual stream before the routed FFN. Other models
+        # retain the existing hidden-size lookup and supported dimensions.
+        hidden_size = getattr(hf_text_config, "routed_expert_hidden_size", None) if is_kimi_k3 else None
+        if hidden_size is None:
+            hidden_size = getattr(hf_text_config, "hidden_size", None)
+        if hidden_size is None and hasattr(model_config, "get_hidden_size"):
+            hidden_size = model_config.get_hidden_size()
+        if hidden_size is None:
+            return False
+        supported_hidden_sizes = {1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192}
+        if is_kimi_k3:
+            supported_hidden_sizes.add(3584)
+        if int(hidden_size) not in supported_hidden_sizes:
+            logger.warning(
+                "MegaMoe requires hidden_size in %s; got %s.",
+                sorted(supported_hidden_sizes),
+                int(hidden_size),
+            )
+            return False
+
+        moe_intermediate_size = getattr(hf_text_config, "moe_intermediate_size", None)
+        if moe_intermediate_size is None and is_minimax_m3:
+            moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
+        if moe_intermediate_size is None:
+            return False
+        # intermediate_hidden == l1_weights.dim1 == 2 * moe_intermediate_size.
+        supported_intermediate_sizes = {1024, 2048, 3072, 4096, 7168}
+        if is_minimax_m3 or is_kimi_k3:
+            supported_intermediate_sizes.add(6144)
+        intermediate_hidden = 2 * int(moe_intermediate_size)
+        if intermediate_hidden not in supported_intermediate_sizes:
+            logger.warning(
+                "mega moe operator is not supported by current a5 config, for intermediate_hidden size %s is not in %s",
+                intermediate_hidden,
+                sorted(supported_intermediate_sizes),
+            )
+            return False
+
+        # num_experts must divide evenly across the EP group.
+        ep_world_size = (
+            vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
+        )
+        if ep_world_size < 2:
+            return False
+        num_experts = None
+        try:
+            num_experts = model_config.get_num_experts()
+        except Exception:
+            num_experts = None
+        if num_experts is None:
+            # Step5-style configs expose the expert count under custom attrs.
+            num_experts = getattr(hf_text_config, "moe_num_experts", None)
+            if num_experts is None:
+                num_experts = getattr(hf_text_config, "n_routed_experts", None)
+            if num_experts is None:
+                num_experts = getattr(hf_text_config, "num_local_experts", None)
+        if num_experts is None:
+            return False
+        if int(num_experts) % ep_world_size != 0:
+            return False
+
+        num_top_k = getattr(
+            hf_text_config,
+            "num_experts_per_tok",
+            getattr(hf_text_config, "top_k_experts", 1),
+        )
+        if is_kimi_k3:
+            num_top_k = getattr(hf_text_config, "num_experts_per_token", num_top_k)
+        if not (1 <= int(num_top_k) <= 32):
+            logger.warning(
+                "mega moe operator is not supported by current a5 config, for num_top_k %s is not between 1 and 32",
+                num_top_k,
+            )
+            return False
+        return True
 
     @staticmethod
     def _materialize_dump_config_to_file(dump_config: dict[str, Any]) -> str:
