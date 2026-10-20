@@ -252,6 +252,16 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if not self._use_v2_model_runner:
             self.init_eplb(n_shared_experts)
         self.return_with_event = False
+        runner_type = getattr(vllm_config.model_config, "runner_type", None)
+        if runner_type is None:
+            logger.warning_once(
+                "The runner_type is not set when initializing the model config in the prefill stage"
+            )
+        else:
+            if vllm_config.model_config.runner_type == "draft":
+                draft_model_config = vllm_config.speculative_config.draft_model_config
+                draft_model_config.draft_moe_quant_type = self.quant_type
+
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
         try:

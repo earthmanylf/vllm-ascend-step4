@@ -31,6 +31,25 @@ _CANN_ACL_INT8 = 258
 _CANN_ACL_INT4 = 285
 _CANN_MEGA_MOE_QUANT_MODE_None = 0
 _CANN_MEGA_MOE_QUANT_MODE_INT8 = 2
+_CANN_MEGA_MOE_QUANT_MODE_MXFP = 4
+_CANN_ACL_FLOAT8_E5M2 = 23
+_CANN_ACL_FLOAT8_E4M3FN = 24
+_CANN_ACL_FLOAT4_E2M1 = 296
+
+# Ascend 950 (A5) MegaMoe is MXFP-only (dispatch_quant_mode == 4). The
+# dispatch_quant_out_dtype binds to the activation dtype and the weight_type
+# to the weight dtype, per the A5 scenario table:
+#   W8A8MXFP -> A8W8-FP (act FP8, weight FP8)
+#   W4A8MXFP -> A8W4-FP (act FP8, weight FP4)
+#   W4A4MXFP -> A4W4-FP (act FP4, weight FP4)
+_QUANT_SETTING_MAP: dict[QuantType, tuple[int, int | None, int | None]] = {
+    QuantType.W8A8: (_CANN_MEGA_MOE_QUANT_MODE_INT8, _CANN_ACL_INT8, _CANN_ACL_INT8),
+    QuantType.W4A8: (_CANN_MEGA_MOE_QUANT_MODE_INT8, _CANN_ACL_INT8, _CANN_ACL_INT4),
+    QuantType.NONE: (_CANN_MEGA_MOE_QUANT_MODE_None, None, None),
+    QuantType.W8A8MXFP: (_CANN_MEGA_MOE_QUANT_MODE_MXFP, _CANN_ACL_FLOAT8_E4M3FN, _CANN_ACL_FLOAT8_E4M3FN),
+    QuantType.W4A8MXFP: (_CANN_MEGA_MOE_QUANT_MODE_MXFP, _CANN_ACL_FLOAT8_E4M3FN, _CANN_ACL_FLOAT4_E2M1),
+    QuantType.W4A4MXFP: (_CANN_MEGA_MOE_QUANT_MODE_MXFP, _CANN_ACL_FLOAT4_E2M1, _CANN_ACL_FLOAT4_E2M1),
+}
 
 
 def async_all_to_all(input_, output_split_sizes, input_split_sizes, group, event=None):
@@ -133,18 +152,13 @@ def _get_cann_mega_moe_quant_settings(quant_type: QuantType) -> tuple[int, int |
     # NOT fix the W4A8 accuracy issue and slowed graph capture (see bug_a3.md),
     # so keep the working values until the W4A8 accuracy root cause is found on
     # the operator side.
-    if quant_type == QuantType.W8A8:
-        return (_CANN_MEGA_MOE_QUANT_MODE_INT8, _CANN_ACL_INT8, _CANN_ACL_INT8)
-    if quant_type == QuantType.W4A8:
-        return (_CANN_MEGA_MOE_QUANT_MODE_INT8, _CANN_ACL_INT8, _CANN_ACL_INT4)
-    if quant_type == QuantType.NONE:
-        return (_CANN_MEGA_MOE_QUANT_MODE_None, None, None)
-
-    raise RuntimeError(
-        "MegaMoe integration supports W8A8/W4A8 INT on A2/A3 and MXFP on FP8-capable "
-        "MegaMoe platforms. "
-        f"Unsupported quant type: {quant_type}."
-    )
+    if quant_type not in _QUANT_SETTING_MAP:
+        raise RuntimeError(
+            "MegaMoe integration supports W8A8/W4A8 INT on A2/A3 and W8A8MXFP/W4A8MXFP/W4A4MXFP on A5 "
+            "MegaMoe platforms for now. "
+            f"Unsupported quant type: {quant_type}."
+        )
+    return _QUANT_SETTING_MAP[quant_type]
 
 
 def get_moe_num_logical_experts(
