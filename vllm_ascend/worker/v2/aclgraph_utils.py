@@ -342,9 +342,12 @@ class ModelWithContext(nn.Module):
     def get_original_model(self):
         return self.original_model
 
-    def compute_logits(self, hidden_states: torch.Tensor):
+    def compute_logits(self, hidden_states: torch.Tensor, *args, **kwargs):
         # draft model has `compute_logits`, which is not in ModelWithContext
-        return self.original_model.compute_logits(hidden_states)
+        return self.original_model.compute_logits(hidden_states, *args, **kwargs)
+
+    def get_top_tokens(self, hidden_states: torch.Tensor, *args, **kwargs):
+        return self.original_model.get_top_tokens(hidden_states, *args, **kwargs)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor):
         return self.original_model.compute_draft_logits(hidden_states)

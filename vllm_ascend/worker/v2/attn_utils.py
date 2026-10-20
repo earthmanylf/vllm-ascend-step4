@@ -86,6 +86,10 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
     supports_component_major_mla_pd,
 )
+from vllm_ascend.core.step5_kv_cache import (
+    allocate_step5_shared_kv_backing,
+    supports_step5_shared_kv_backing,
+)
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     allocate_shared_indexer_cache,
@@ -992,6 +996,8 @@ def _allocate_kv_cache(
             name: parts if isinstance(specs[name], AscendSFAIndexerCacheSpec) or len(parts) > 1 else parts[0]
             for name, parts in caches.items()
         }
+    if supports_step5_shared_kv_backing(vllm_config, kv_cache_config.kv_cache_groups):
+        return allocate_step5_shared_kv_backing(kv_cache_config, device)
     is_dsv4_model = _is_dsv4_model(vllm_config)
     # init kv cache tensors
     kv_cache_raw_tensors: dict[str, Any] = {}

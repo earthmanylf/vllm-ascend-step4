@@ -86,6 +86,7 @@ from vllm_ascend.core.kv_cache_placement import (
 from vllm_ascend.core.profiling_chunk_predictor import (
     _attach_profiling_chunk_execution_time,
 )
+from vllm_ascend.core.step5_kv_cache import supports_step5_shared_kv_backing
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device_allocator.camem import CaMemAllocator
@@ -757,6 +758,12 @@ class NPUWorker(WorkerBase):
             )
             if any(getattr(spec, "model_version", None) in {"deepseek_v4", "deepseek_v41"} for spec in specs):
                 return available_memory
+
+        # Step5's uniform BF16 pages use one group-shared backing while
+        # retaining contiguous K/V planes for native PA and sparse attention.
+        # Use the allocator's exact predicate before exposing the full budget.
+        if supports_step5_shared_kv_backing(self.vllm_config, kv_cache_groups):
+            return available_memory
 
         # vLLM #51718 overlays KV cache groups in one standardized backing
         # allocation. For the default layer/block-compact layout, Ascend can

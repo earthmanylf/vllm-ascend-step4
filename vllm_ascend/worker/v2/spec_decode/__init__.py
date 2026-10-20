@@ -61,6 +61,14 @@ def init_speculator(
         )
 
         return AscendDFlashSpeculator(vllm_config, device)
+    if speculative_config.use_multi_module_mtp() or (
+        speculative_config.use_step_mtp() and speculative_config.num_speculative_tokens == 1
+    ):
+        from vllm_ascend.worker.v2.spec_decode.multi_module_mtp.speculator import (
+            AscendMultiModuleMTPSpeculator,
+        )
+
+        return AscendMultiModuleMTPSpeculator(vllm_config, device)
     if (
         speculative_config.method == "mtp"
         and not speculative_config.use_gemma4_mtp()
@@ -72,7 +80,9 @@ def init_speculator(
 
         return AscendMTPSpeculator(vllm_config, device)
     if speculative_config.use_eagle():
-        from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
+        from vllm_ascend.worker.v2.spec_decode.eagle.speculator import (
+            AscendEagleSpeculator,
+        )
 
         return AscendEagleSpeculator(vllm_config, device)
     raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
