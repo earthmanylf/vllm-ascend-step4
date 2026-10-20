@@ -78,9 +78,19 @@ region_block_size/summaries_per_page/num_kv_heads/proxy_dim` 这 7 个 property�
 | `ci/`（含 82MB `source.bundle`） | 40 | **不搬**（复用 main 构建） |
 | `vllm_ascend/` 纯新增代码 | 19 | 搬 |
 | `tests/ut/` 纯新增 | 19 | 搬，合并为 6 个 |
-| `csrc/third_party/catlass`（submodule 指针） | 1 | **不搬**，见 §7.1 |
-| 已存在且 main 未动 | 8 | 干净应用 |
+| `csrc/third_party/catlass`（submodule 指针，base 与 main 均已存在） | 1 | **不搬**，见 §7.1 |
+| 已存在且 main 未动 | 7 | 干净应用 |
 | 已存在且 main 改过 | 21 | 需人工 port |
+
+合计 40 + 19 + 19 + 1 + 7 + 21 = 107。
+
+7 个 "main 未动" 文件：`.gitmodules`、`patch/worker/patch_bind_kv_cache.py`、
+`quantization/configs/fp8_config.py`、`quantization/method_adapters.py`、
+`quantization/methods/w8a8/fp8_block.py`、`quantization/quant_type.py`、
+`worker/v2/spec_decode/lmhead_tp_utils.py`。
+
+注意 `patch_bind_kv_cache.py` 虽属"干净应用"，但按 D9 **跳过**，
+故 L2 实际落地 6 个（含 `.gitmodules`，其内容随 catlass 不搬而保持 main 原样）。
 
 ---
 
@@ -108,8 +118,10 @@ githubupstream/main (399c30d3a)
         │
         └──► step5/tailring-rebase
                  L0  基线（已完成：分支已创建）
-                 L1  19 个纯新增代码文件 + 6 个合并后 UT + catlass 不动
-                 L2  8 个 main 未动文件（跳过 patch_bind_kv_cache，实为 7 个）
+                 L1  19 个纯新增代码文件 + 6 个合并后 UT
+                 L2  7 个 main 未动文件中落地 6 个
+                     （跳过 patch_bind_kv_cache 按 D9；.gitmodules 随 catlass
+                       不搬而保持 main 原样）
                  L3  低风险 port（envs / models 注册 / modelslim / quant_type /
                      fp8_config / fp8_block / method_adapters / sparse_offload_manager）
                  L4  中风险 port（aclgraph_utils / input_batch / attn_utils /
