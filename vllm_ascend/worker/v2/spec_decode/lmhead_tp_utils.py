@@ -5,8 +5,11 @@
 from typing import Any
 
 import torch
-
-from vllm_ascend.utils import lmhead_tp_enable, lmhead_tp_max_num_logits, lmhead_tp_pad_rows
+from vllm_ascend.utils import (
+    lmhead_tp_enable,
+    lmhead_tp_max_num_logits,
+    lmhead_tp_pad_rows,
+)
 
 
 class LmheadTPDraftSamplingMixin:
@@ -70,10 +73,19 @@ class LmheadTPDraftSamplingMixin:
         seeds: torch.Tensor,
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
+        spec_step_idx: int | None = None,
     ):
+        head_kwargs = {} if spec_step_idx is None else {"spec_step_idx": spec_step_idx}
         if not lmhead_tp_enable():
             return super().sample_draft(  # type: ignore[misc]
-                hidden_states, positions, idx_mapping, temperature, seeds, draft_step, draft_logits
+                hidden_states,
+                positions,
+                idx_mapping,
+                temperature,
+                seeds,
+                draft_step,
+                draft_logits,
+                **head_kwargs,
             )
         if draft_logits is not None:
             raise NotImplementedError(
@@ -90,6 +102,13 @@ class LmheadTPDraftSamplingMixin:
             "max_num_reqs * (num_speculative_steps + 1)",
         )
         out = super().sample_draft(  # type: ignore[misc]
-            padded, positions, idx_mapping, temperature, seeds, draft_step, draft_logits
+            padded,
+            positions,
+            idx_mapping,
+            temperature,
+            seeds,
+            draft_step,
+            draft_logits,
+            **head_kwargs,
         )
         return out[:num_logits]
