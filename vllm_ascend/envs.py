@@ -72,6 +72,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to run Step5 routed experts with the native fp8 block kernels
+    # (Step5Fp8BlockFusedMoEMethod). Default 0 -> AscendFp8BlockFusedMoEMethod. Valid "0"/"1".
+    "VLLM_ASCEND_ENABLE_STEP5_FP8": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_STEP5_FP8", "0"))),
 }
 
 # end-env-vars-definition
