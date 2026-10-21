@@ -90,9 +90,9 @@ from vllm.models.step5.nvidia.model import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
 from vllm_ascend.device.device_op import DeviceOperator
 
-import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
 from vllm_ascend import envs
 from vllm_ascend.models.step5._step5_compat import (
     Step5FP32RouterLinear,
