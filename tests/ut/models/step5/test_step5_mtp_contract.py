@@ -25,13 +25,45 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import numpy as np
 import torch
-from test_ar_graph_step_contract import ROOT, Mode, methods
 import ast
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import pytest
 import torch.nn as nn
+
+ROOT = REPO_ROOT
+
+
+def methods(path, class_name, names, base, namespace):
+    tree = ast.parse(path.read_text())
+    original = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
+    body = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert {n.name for n in body} == set(names)
+    cls = ast.ClassDef(
+        name=class_name,
+        bases=[ast.Name(id="TestBase", ctx=ast.Load())],
+        keywords=[],
+        body=body,
+        decorator_list=[],
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            cls,
+        ],
+        type_ignores=[],
+    )
+    namespace = dict(namespace, TestBase=base)
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)  # noqa: S102
+    return namespace[class_name]
+
+
+class Mode:
+    NONE = 0
+    FULL = 1
+    PIECEWISE = 2
+
 
 MULTI = ROOT / "vllm_ascend/worker/v2/spec_decode/multi_module_mtp/speculator.py"
 MIXIN = ROOT / "vllm_ascend/worker/v2/spec_decode/lmhead_tp_utils.py"
