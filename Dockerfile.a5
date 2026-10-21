@@ -18,7 +18,11 @@
 # CANN_QUAY_URL (optional): Registry URL of the CANN base image.
 ARG CANN_QUAY_URL="quay.io/ascend/cann"
 # CANN_VERSION (optional): CANN toolkit version used to select the base image tag.
-ARG CANN_VERSION="9.1.0"
+# Pinned to 9.2.0 to match what vllm-ascend main's CI daily builds against
+# (schedule_image_build_and_push.yaml uses 9.2.0_20261016144033 from SWR).
+# quay.io only publishes the untimestamped 9.2.0 tag for the 950 images, so the
+# SWR build timestamp is not reproduced here; the toolchain is the same 9.2.0.
+ARG CANN_VERSION="9.2.0"
 
 FROM ${CANN_QUAY_URL}:${CANN_VERSION}-950-ubuntu22.04-py3.12
 
