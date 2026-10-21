@@ -241,7 +241,7 @@ def test_captured_speculative_shape_refreshes_schedule_at_the_captured_address(q
     assert len(builder.gbsa_meta_buffers) == 1
 
 
-def test_mixed_metadata_preserves_request_boundaries_and_journal_views():
+def test_mixed_metadata_preserves_request_boundaries():
     fn = load_functions("dsa_attention.py", {"_prepare_gbsa_metadata"}, {"torch": torch})._prepare_gbsa_metadata
     records = []
     builder = types.SimpleNamespace(
@@ -249,12 +249,10 @@ def test_mixed_metadata_preserves_request_boundaries_and_journal_views():
         capture_sizes=set(),
         _build_gbsa_metadata=lambda *args, **kwargs: records.append((args, kwargs)) or torch.tensor([7]),
     )
-    states = torch.tensor([5, 2, 4, -1])
     d = types.SimpleNamespace(
         seq_lens=torch.tensor([18, 35], dtype=torch.int32),
         query_len=2,
         block_table=torch.tensor([[3, 8], [6, 1]], dtype=torch.int32),
-        step5_request_state=states[:2],
     )
     p = types.SimpleNamespace(
         seq_lens=torch.tensor([12], dtype=torch.int32),
@@ -263,7 +261,6 @@ def test_mixed_metadata_preserves_request_boundaries_and_journal_views():
         num_query_tokens=3,
         max_query_len=3,
         block_table=torch.tensor([[5]], dtype=torch.int32),
-        step5_request_state=states[2:3],
     )
     md = types.SimpleNamespace(
         query_start_loc=torch.tensor([0, 2, 4, 7, 7], dtype=torch.int32),
@@ -281,11 +278,6 @@ def test_mixed_metadata_preserves_request_boundaries_and_journal_views():
     assert records[1][0][1].tolist() == [0, 3]
     assert d.cu_seqlens_q.dtype == p.cu_seqlens_q.dtype == torch.int64
     assert d.cu_seqlens_q.data_ptr() == builder.query_start_loc_int64_buffer.data_ptr()
-    assert d.step5_request_state.data_ptr() == states.data_ptr()
-    assert d.step5_request_state.tolist() == [
-        5,
-        2,
-    ] and p.step5_request_state.tolist() == [4]
     assert md.query_start_loc.tolist() == [0, 2, 4, 7, 7]
 
 
@@ -351,7 +343,7 @@ def test_consumer_uses_paged_kv_and_request_varlen_without_flattening(path):
         query_start_loc=torch.tensor([0, qlen], dtype=torch.int32),
     )
     total = 3 if path == "prefill" else qlen
-    cache = types.SimpleNamespace(mean_cache=torch.zeros(3, 16, 1, 256, dtype=torch.uint8))
+    cache = types.SimpleNamespace(mean=torch.zeros(3, 16, 256, dtype=torch.uint8))
     key = torch.empty(3, 128, 1, 128)
     value = torch.empty_like(key)
     output = torch.zeros(5, 8, 128)
@@ -495,126 +487,16 @@ class Buffer:
         return self
 
 
-class BaseState:
-    def __init__(self, config, model, encoder_cache, device):
-        self.max_num_reqs = config.scheduler_config.max_num_seqs
-        self.preparations = []
-
-    def prepare_attn(self, *args, **kwargs):
-        builder = args[4][0][0].get_metadata_builder(0)
-        # Verify injection has happened before the NPU-specific superclass.
-        self.preparations.append((args, kwargs, builder.step5_request_state.tolist()))
-        return {"npu_metadata": (args[0].seq_lens_np, args[0].attn_state)}
-
-
-class TestStep5ModelState(unittest.TestCase):
-    def setUp(self):
-        self.builder_type = type("AscendStep5DSAMetadataBuilder", (), {})
-        self.builder = self.builder_type()
-        self.other_builder = types.SimpleNamespace()
-        self.groups = [
-            [
-                types.SimpleNamespace(get_metadata_builder=lambda idx: self.builder),
-                types.SimpleNamespace(get_metadata_builder=lambda idx: self.other_builder),
-            ]
-        ]
-        backend_module = types.ModuleType("vllm_ascend.models.step5.dsa_attention")
-        backend_module.AscendStep5DSAMetadataBuilder = self.builder_type
-        self.module_patch = patch.dict("sys.modules", {backend_module.__name__: backend_module})
-        self.module_patch.start()
-        self.addCleanup(self.module_patch.stop)
-        tree = ast.parse((MODEL_DIR / "model_state.py").read_text())
-        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
-        namespace = {
-            "AscendModelState": BaseState,
-            "torch": types.SimpleNamespace(int64="int64", full=lambda shape, fill, **kwargs: Buffer([fill] * shape[0])),
-        }
-        module = ast.Module(
-            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls],
-            type_ignores=[],
-        )
-        exec(compile(ast.fix_missing_locations(module), str(MODEL_DIR / "model_state.py"), "exec"), namespace)
-        config = types.SimpleNamespace(scheduler_config=types.SimpleNamespace(max_num_seqs=6))
-        self.state = namespace[cls.name](config, object(), None, "cpu")
-
-    def prepare(self, mapping, *, padded=None, for_capture=False, ubatch_idx=0):
-        batch = types.SimpleNamespace(
-            num_reqs=len(mapping),
-            num_reqs_after_padding=len(mapping) if padded is None else padded,
-            idx_mapping=Buffer(mapping),
-            seq_lens_np=[9] * len(mapping),
-            attn_state="NPU_DECODE",
-        )
-        output = self.state.prepare_attn(
-            batch,
-            "FULL",
-            ("blocks",),
-            "slots",
-            self.groups,
-            "kv_config",
-            for_capture=for_capture,
-            ubatch_idx=ubatch_idx,
-        )
-        return batch, output
-
-    def test_reorder_and_shrink_keep_persistent_indices_and_storage(self):
-        allocation = self.state.request_state.storage
-        self.prepare([5, 2, 4])
-        self.assertEqual(self.state.request_state.tolist(), [5, 2, 4, -1, -1, -1, -1])
-        self.prepare([2, 5])
-        self.assertEqual(self.state.request_state.tolist(), [2, 5, -1, -1, -1, -1, -1])
-        self.assertIs(self.state.request_state.storage, allocation)
-        self.assertIs(self.builder.step5_request_state, self.state.request_state)
-        self.assertFalse(hasattr(self.other_builder, "step5_request_state"))
-
-    def test_extra_fia_request_is_minus_one_and_ascend_metadata_survives(self):
-        batch, output = self.prepare([5, 4, 3, 2, 1, 0], padded=7, for_capture=True)
-        self.assertEqual(self.state.request_state[-1], -1)
-        self.assertEqual(output, {"npu_metadata": (batch.seq_lens_np, "NPU_DECODE")})
-        args, kwargs, mapping = self.state.preparations[-1]
-        self.assertEqual(args[1:], ("FULL", ("blocks",), "slots", self.groups, "kv_config"))
-        self.assertEqual(kwargs, {"for_capture": True, "ubatch_idx": 0})
-        self.assertEqual(mapping, [5, 4, 3, 2, 1, 0, -1])
-
-    def test_request_state_index_reuse_does_not_create_a_second_allocator(self):
-        self.prepare([5, 2])
-        self.prepare([2])
-        self.prepare([5])  # A new request can reuse upstream state index 5.
-        self.assertEqual(self.builder.step5_request_state.tolist(), [5, -1, -1, -1, -1, -1, -1])
-        # Journal invalidation remains in per-page cache lifecycle hooks.
-        self.assertEqual(len(self.state.preparations), 3)
-
-    def test_capacity_and_dbo_fail_before_superclass(self):
-        with self.assertRaises(ValueError):
-            self.prepare([0], padded=8)
-        with self.assertRaises(ValueError):
-            self.prepare(list(range(7)))
-        with self.assertRaisesRegex(AssertionError, "DBO"):
-            self.prepare([0], ubatch_idx=1)
-        self.assertEqual(self.state.preparations, [])
-
-    def test_both_model_frontends_choose_the_ascend_model_state(self):
-        # The SWF request journal is gone, so both frontends now return the
-        # default Ascend model state. The override stays because defining
-        # get_model_state_cls also keeps the model MRV2-only.
-        for filename, name in (
-            ("model.py", "AscendStep5ForCausalLM"),
-            ("vl.py", "AscendStep5ForConditionalGeneration"),
-        ):
-            tree = ast.parse((MODEL_DIR / filename).read_text())
-            cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
-            method = next(
-                node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "get_model_state_cls"
-            )
-            method.decorator_list = []
-            namespace = {}
-            exec(compile(ast.Module(body=[method], type_ignores=[]), filename, "exec"), namespace)
-            source = ast.unparse(method)
-            self.assertIn("AscendModelState", source, f"{filename} must return the Ascend model state")
-            self.assertNotIn("AscendStep5ModelState", source, f"{filename} must not reference the removed journal state")
-
-
 class TestStep5RequestMetadata(unittest.TestCase):
+    """Metadata carries no per-request journal state any more.
+
+    The TailRing design addresses summary updates through
+    ``ring.metadata().base / .slot_mapping``, computed per step, so neither
+    the builder nor the metadata dataclasses carry a persistent request
+    index. These tests pin that contract: the request-state fields are gone,
+    and the decode/prefill views still split by request rather than by token.
+    """
+
     def setUp(self):
         tree = ast.parse((MODEL_DIR / "dsa_attention.py").read_text())
         wanted = {"AscendStep5DSAPrefillMetadata", "AscendStep5DSADecodeMetadata", "AscendStep5DSAMetadata"}
@@ -641,7 +523,6 @@ class TestStep5RequestMetadata(unittest.TestCase):
         self.builder.reorder_batch_threshold = 4
         self.builder._prepare_gbsa_metadata = lambda metadata: None
         self.builder.context_len_buffer = Buffer([0] * 5)
-        self.builder.step5_request_state = Buffer([5, 2, 4, -1, -1])
         self.common = types.SimpleNamespace(
             query_start_loc=Buffer([0, 4, 8, 11, 11]),
             query_start_loc_cpu=Buffer([0, 4, 8, 11, 11]),
@@ -652,27 +533,26 @@ class TestStep5RequestMetadata(unittest.TestCase):
             slot_mapping=Buffer(range(11)),
         )
 
+    def test_no_request_state_field_survives(self):
+        # The journal is gone, so none of the metadata dataclasses may still
+        # expose a step5_request_state field.
+        import dataclasses as _dc
+
+        md = self.builder.build(0, self.common)
+        for holder, label in ((md, "metadata"), (md.decode, "decode"), (md.prefill, "prefill")):
+            names = {f.name for f in _dc.fields(holder)}
+            self.assertNotIn("step5_request_state", names, f"{label} must not carry journal state")
+        self.assertFalse(hasattr(self.builder, "step5_request_state"), "builder must not carry journal state")
+
     def test_decode_and_prefill_take_request_views_not_token_views(self):
         md = self.builder.build(0, self.common)
-        self.assertEqual(md.step5_request_state.tolist(), [5, 2, 4, -1])
-        self.assertEqual(md.decode.step5_request_state.tolist(), [5, 2])
+        # Views are still split by request, not by token row.
         self.assertEqual(md.decode.query_len, 4)
-        self.assertEqual(md.prefill.step5_request_state.tolist(), [4])
         self.assertEqual(md.prefill.query_start_loc.tolist(), [0, 3])
         self.assertEqual(md.prefill.context_lens.tolist(), [4])
-        # A new step rewrites the persistent storage observed by all views.
-        self.builder.step5_request_state[2:3].fill_(1)
-        self.assertEqual(md.prefill.step5_request_state.tolist(), [1])
-
-    def test_missing_state_stays_explicit_and_short_buffer_is_rejected(self):
-        self.builder.step5_request_state = None
-        md = self.builder.build(0, self.common)
-        self.assertIsNone(md.step5_request_state)
-        self.assertIsNone(md.decode.step5_request_state)
-        self.assertIsNone(md.prefill.step5_request_state)
-        self.builder.step5_request_state = Buffer([5, 2])
-        with self.assertRaisesRegex(ValueError, "request count"):
-            self.builder.build(0, self.common)
+        # The full-batch views keep their own shapes.
+        self.assertEqual(md.query_start_loc.tolist(), [0, 4, 8, 11, 11])
+        self.assertEqual(md.slot_mapping.tolist(), list(range(11)))
 
 
 if __name__ == "__main__":
