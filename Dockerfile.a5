@@ -142,9 +142,11 @@ RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[a
 #      opt-in: with the variable unset, vllm/plugins/__init__.py returns an
 #      empty list and only warns, producing the same silent failure.
 #
-# Weight load alone runs ~7 minutes on a JFS mount before CUDA-graph capture
-# and flashinfer JIT, which exceeds vLLM's 600s default engine-ready timeout
-# and aborts a healthy startup. 7200s is the measured value.
+# Note: weight load alone runs ~7 minutes on a JFS mount before CUDA-graph
+# capture and flashinfer JIT, which can exceed vLLM's 600s default
+# engine-ready timeout and abort a healthy startup. That timeout is left at
+# its default here; raise VLLM_ENGINE_READY_TIMEOUT_S manually when a run
+# needs it.
 RUN if [ -d /vllm-workspace/vllm/stepcast_plugin ]; then \
       python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
         /vllm-workspace/vllm/stepcast_plugin --extra-index-url ${ASCEND_INDEX_URL} && \
@@ -152,8 +154,7 @@ RUN if [ -d /vllm-workspace/vllm/stepcast_plugin ]; then \
     else \
       echo "NOTE: stepcast_plugin/ not in the vLLM source tree; StepFun internal routes will 404."; \
     fi
-ENV VLLM_PLUGINS=stepcast_platform,stepcast_rs \
-    VLLM_ENGINE_READY_TIMEOUT_S=7200
+ENV VLLM_PLUGINS=stepcast_platform,stepcast_rs
 
 # Install vllm-ascend
 # Limit cargo parallelism to avoid OOM in constrained build environments.
