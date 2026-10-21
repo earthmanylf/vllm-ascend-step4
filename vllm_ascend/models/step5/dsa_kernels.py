@@ -43,6 +43,15 @@ import torch
 import triton
 import triton.language as tl
 
+# triton-ascend 3.2.2 may not expose extension.parallel (main never uses it).
+# Fall back to a plain range loop when it is absent, so the kernel still
+# compiles on the baseline this branch targets.
+try:
+    _cann_parallel = tl.extra.cann.extension.parallel
+except AttributeError:  # pragma: no cover - depends on triton-ascend build
+    def _cann_parallel(start, stop):
+        return range(start, stop)
+
 # Step-4 compresses every 8 consecutive tokens into one summary vector. The CuTe kernels
 # hard-specialize on this; we keep it a parameter but never exercise anything else.
 REGION_BLOCK_SIZE = 8
@@ -2802,7 +2811,7 @@ def _sparse_attn_prefill_kernel(
         values = tl.zeros(
             (BLOCK_R * region_size, BLOCK_D), dtype=v_ptr.dtype.element_ty
         )
-        for page_iter in tl.extra.cann.extension.parallel(0, BLOCK_R):
+        for page_iter in _cann_parallel(0, BLOCK_R):
             # Scalar pointer -> scalar load; decode the fields inside this loop.
             page_slot = base + page_iter
             page_slot_ok = (page_slot < count) & (page_slot < topk)
@@ -3085,7 +3094,7 @@ def _sparse_attn_decode_kernel(
         values = tl.zeros(
             (BLOCK_R * region_size, BLOCK_D), dtype=v_ptr.dtype.element_ty
         )
-        for page_iter in tl.extra.cann.extension.parallel(0, BLOCK_R):
+        for page_iter in _cann_parallel(0, BLOCK_R):
             page_slot = base + page_iter
             page_slot_ok = (page_slot < window_end) & (page_slot < count) & (page_slot < topk)
             page_meta = tl.load(
