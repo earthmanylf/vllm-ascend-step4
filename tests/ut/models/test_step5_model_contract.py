@@ -685,6 +685,8 @@ if __name__ == "__main__":
 # from tests/ut/worker/v2/test_step5_dummy_input_contract.py
 # ========================================================================
 
+@pytest.mark.parametrize("is_padding", [False, True])
+@pytest.mark.parametrize("physical_tokens", [5, 8])
 def test_dummy_profile_and_graph_padding_keep_distinct_masks(monkeypatch, is_padding, physical_tokens):
     # Use the real Ascend buffers and the installed SWF make_dummy on CPU.
     # Rotary table setup is a device operation unrelated to this mask contract.

@@ -99,6 +99,7 @@ def _activation(x, limit=7.0):
     return (torch.nn.functional.silu(gate.float()).clamp(max=limit) * up.float().clamp(-limit, limit)).to(x.dtype)
 
 
+@pytest.fixture
 def api(monkeypatch):
     class Activation(Enum):
         SILU = "silu"
@@ -244,6 +245,8 @@ def _reference(layer, x, ids, weights):
     return result
 
 
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("group_type", [0, 1])
 def test_current_communication_pipeline_owns_weights_and_preserves_fp32_combine(api, native, group_type):
     layer = _layer(api)
     method = api.Step5Fp8BlockFusedMoEMethod((128, 128), None)
@@ -298,6 +301,8 @@ def test_current_communication_pipeline_owns_weights_and_preserves_fp32_combine(
         assert not api.grouped_calls
 
 
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("dummy", [False, True])
 def test_post_load_preserves_checkpoint_bytes_and_only_repairs_dummy_scales(api, native, dummy):
     layer = _layer(api)
     original = {name: value.detach().clone() for name, value in layer.named_parameters()}
@@ -320,6 +325,7 @@ def test_post_load_preserves_checkpoint_bytes_and_only_repairs_dummy_scales(api,
     assert method.use_aclnn_gmm == native
 
 
+@pytest.mark.parametrize("group_type", [0, 1])
 def test_global_expert_groups_are_windowed_to_owning_ep_rank(api, group_type):
     method = api.Step5Fp8BlockFusedMoEMethod((128, 128), None)
     counts = torch.tensor([8, 9, 10, 2, 0, 3], dtype=torch.int32)
@@ -330,6 +336,7 @@ def test_global_expert_groups_are_windowed_to_owning_ep_rank(api, group_type):
     assert prefix.tolist() == [2, 2, 5]
 
 
+@pytest.mark.parametrize("native", [False, True])
 def test_empty_dispatch_executes_current_mlp_without_quantizer_or_gemm_launch(api, native):
     layer = _layer(api)
     method = api.Step5Fp8BlockFusedMoEMethod((128, 128), None)
@@ -367,6 +374,7 @@ def test_fallback_rejects_capture_instead_of_synchronizing_host_counts(api, monk
         method.apply_gmm1(inputs)
 
 
+@pytest.mark.parametrize("comm_type", ["ALLGATHER", "MC2", "ALLTOALL"])
 def test_only_allgather_promotes_projection_for_fp32_weighted_combine(api, comm_type):
     layer = _layer(api)
     method = api.Step5Fp8BlockFusedMoEMethod((128, 128), None)
@@ -390,6 +398,7 @@ def test_invalid_group_contract_fails_explicitly(api):
         method._group_prefix(inputs, 3)
 
 
+@pytest.mark.parametrize("availability", [True, False, None])
 def test_native_capability_probe_handles_an_unpackaged_wrapper(availability):
     import builtins
 
@@ -470,6 +479,7 @@ def _stream(*, split_projection=False, omitted=None):
     yield "lm_head.weight", torch.full((1, 1), 3.0)
 
 
+@pytest.mark.parametrize("split_projection", [False, True])
 def test_interleaved_vlm_stream_validates_once_after_all_language_groups(split_projection):
     model = _vlm()
     loaded = model.load_weights(_stream(split_projection=split_projection))
@@ -482,6 +492,7 @@ def test_interleaved_vlm_stream_validates_once_after_all_language_groups(split_p
     assert is_mtp_completeness_check_enabled()
 
 
+@pytest.mark.parametrize("omitted", ["q", "index_q", "index_g"])
 def test_incomplete_reload_still_fails_and_cannot_reuse_previous_shards(omitted):
     model = _vlm()
     model.load_weights(_stream())
@@ -561,6 +572,8 @@ def _capture(model, weights):
         return model.load_weights(iter(weights))
 
 
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+@pytest.mark.parametrize("scale", [False, True])
 def test_flat_modelslim_tensors_are_unpacked_without_copy(projection, scale):
     out_size, in_size = (64, 32) if projection == "down_proj" else (32, 64)
     if scale:
@@ -575,24 +588,44 @@ def test_flat_modelslim_tensors_are_unpacked_without_copy(projection, scale):
     assert result[0][1]._base is tensor
 
 
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((127, 64), torch.float8_e4m3fn),
+        ((128, 63), torch.float8_e4m3fn),
+        ((4, 31, 64), torch.float8_e4m3fn),
+        ((128, 64), torch.bfloat16),
+    ],
+)
 def test_modelslim_loader_rejects_wrong_weight_dimensions_or_dtype(shape, dtype):
     tensor = torch.empty(shape, dtype=dtype, device="meta")
     with pytest.raises(ValueError, match="Invalid Step5 ModelSlim expert tensor"):
         _capture(_model(), [("model.layers.3.moe.gate_proj.weight", tensor)])
 
 
+@pytest.mark.parametrize("shape,dtype", [((128, 1), torch.uint8), ((128, 2), torch.float32)])
 def test_modelslim_loader_rejects_wrong_scale_dimensions_or_dtype(shape, dtype):
     tensor = torch.empty(shape, dtype=dtype, device="meta")
     with pytest.raises(ValueError, match="Invalid Step5 ModelSlim expert tensor"):
         _capture(_model(), [("layers.3.moe.gate_proj.weight_scale", tensor)])
 
 
+@pytest.mark.parametrize("group_size", [0, 3, "32"])
 def test_modelslim_loader_rejects_invalid_scale_groups(group_size):
     tensor = torch.empty((128, 2), dtype=torch.uint8, device="meta")
     with pytest.raises(ValueError, match="Invalid Step5 ModelSlim group_size"):
         _capture(_model(group_size=group_size), [("layers.3.moe.gate_proj.weight_scale", tensor)])
 
 
+@pytest.mark.parametrize(
+    "quant_name,recipe,name",
+    [
+        ("fp8", "W8A8_MXFP8", "layers.3.moe.gate_proj.weight"),
+        ("ascend", "FLOAT", "layers.3.moe.gate_proj.weight"),
+        ("ascend", "W8A8_MXFP8", "layers.3.share_expert.gate_proj.weight"),
+        ("ascend", "W8A8_MXFP8", "layers.3.moe.gate_proj.weight_scale_inv"),
+    ],
+)
 def test_original_hf_float_and_unrelated_tensors_are_unchanged(quant_name, recipe, name):
     tensor = torch.empty((4, 32, 64), dtype=torch.bfloat16, device="meta")
     assert _capture(_model(quant_name=quant_name, recipe=recipe), [(name, tensor)])[0][1] is tensor
@@ -618,6 +651,7 @@ def test_flat_scale_unpack_preserves_expert_order_and_bytes():
 # from tests/ut/quantization/configs/test_step5_modelslim_mapping.py
 # ========================================================================
 
+@pytest.fixture
 def description():
     # A quantized routed layer, a FLOAT routed layer, and a FLOAT shared expert.
     return {
@@ -627,6 +661,7 @@ def description():
     }
 
 
+@pytest.mark.parametrize("model_type", ["step5", "step5_vl"])
 def test_step5_packed_experts_preserve_quantized_and_float_layers(description, model_type):
     config = AscendModelSlimConfig(description)
     config.packed_modules_mapping = {}
@@ -640,6 +675,8 @@ def test_step5_packed_experts_preserve_quantized_and_float_layers(description, m
         )
 
 
+@pytest.mark.parametrize("model_type", ["step5", "step5_vl"])
+@pytest.mark.parametrize("malformation,exception", [("mixed", ValueError), ("missing", KeyError)])
 def test_step5_packed_experts_reject_incomplete_or_mixed_recipes(description, model_type, malformation, exception):
     if malformation == "mixed":
         description["model.layers.3.moe.up_proj.weight"] = "FLOAT"
@@ -721,6 +758,7 @@ def test_mxfp8_dummy_loader_initializes_finite_neutral_scale_bytes():
         torch.testing.assert_close(param, torch.full_like(param, 120))
 
 
+@pytest.mark.parametrize("quant_type", [QuantType.NONE, QuantType.W8A8, QuantType.W4A8MXFP, QuantType.FP8_BLOCK])
 def test_non_mxfp8_schemes_do_not_receive_dummy_scale_metadata(quant_type):
     layer = _create_layer(quant_type=quant_type)
     assert all(not hasattr(param, "dummy_weight_value") for param in layer.parameters())

@@ -482,6 +482,7 @@ def _extract(path, names, namespace):
     )
 
 
+@pytest.fixture
 def runtime():
     namespace = {
         "dataclass": dataclass,
@@ -532,6 +533,7 @@ def runtime():
     return SimpleNamespace(**namespace)
 
 
+@dataclass
 class Config:
     quant_config: object
     model_config: object
@@ -548,6 +550,7 @@ def _config(runtime, description, *, start=92, count=3):
     )
 
 
+@pytest.mark.parametrize("prefix", ["", "language_model."])
 def test_three_heads_map_real_packed_lookup_and_shared_head(runtime, prefix):
     description = {
         "optional": {"model.layers.92.self_attn.q_proj.weight": "metadata"},

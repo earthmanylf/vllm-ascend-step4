@@ -59,6 +59,7 @@ def load_functions(filename, names, namespace):
     return types.SimpleNamespace(**{name: namespace[name] for name in names})
 
 
+@pytest.mark.parametrize("region_len", [0, 2])
 def test_indexer_uses_current_tuple_api_and_preserves_fp8_summary_storage(region_len):
     calls = []
 
@@ -170,6 +171,7 @@ def test_native_metadata_counts_cover_first_region_and_topk_boundary():
     assert kwargs["is_consistent_topk"] is False
 
 
+@pytest.mark.parametrize("query_len,num_reqs", [(4, 2), (3, 2), (1, 5)])
 def test_captured_speculative_shape_refreshes_schedule_at_the_captured_address(query_len, num_reqs):
     """Actual capture descriptors can differ from raw graph token buckets."""
     functions = load_functions(
@@ -287,6 +289,7 @@ def test_mixed_metadata_preserves_request_boundaries_and_journal_views():
     assert md.query_start_loc.tolist() == [0, 2, 4, 7, 7]
 
 
+@pytest.mark.parametrize("path", ["decode", "verify", "prefill"])
 def test_consumer_uses_paged_kv_and_request_varlen_without_flattening(path):
     records = []
 
@@ -708,6 +711,7 @@ class Mode:
     PIECEWISE = 2
 
 
+@dataclass(frozen=True)
 class Desc:
     cg_mode: int
     num_tokens: int
