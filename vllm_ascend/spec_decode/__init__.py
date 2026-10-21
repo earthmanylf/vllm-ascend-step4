@@ -27,7 +27,12 @@ from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
 from vllm_ascend.spec_decode.gemma4_proposer import AscendGemma4Proposer
-from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
+try:
+    from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
+except ImportError:
+    # Upstream vLLM removed vllm.v1.spec_decode.medusa, which
+    # AscendMedusaProposer subclasses. Keep the package importable.
+    AscendMedusaProposer = None
 from vllm_ascend.spec_decode.multi_kv_cache_group_proposer import (
     AscendMultiKVCacheGroupMTPProposer,
     is_multi_kv_cache_group_mtp,
@@ -46,6 +51,11 @@ def get_spec_decode_method(method, vllm_config, device, runner):
     elif method == "suffix":
         return AscendSuffixDecodingProposer(vllm_config, runner)
     elif method == "medusa":
+        if AscendMedusaProposer is None:
+            raise ValueError(
+                "medusa speculative decoding is unsupported: upstream vLLM "
+                "removed vllm.v1.spec_decode.medusa"
+            )
         return AscendMedusaProposer(vllm_config, device)
     elif method == "dspark":
         return AscendDSparkProposer(vllm_config, device, runner)
