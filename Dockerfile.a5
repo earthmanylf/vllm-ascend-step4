@@ -121,6 +121,38 @@ RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[a
     python3 -m pip uninstall -y triton && \
     python3 -m pip cache purge
 
+# Install the StepFun out-of-tree vLLM plugin (stepcast_plugin).
+#
+# The plugin lives in the vllm-private repo, not here, so it must be present
+# in the build context. Either pass --build-arg STEPCAST_PLUGIN_DIR=<path> or
+# stage it next to this Dockerfile before building, e.g.
+#   cp -r ../vllm-private/stepcast_plugin .
+#
+# Three things are mandatory, all learned the hard way in
+# vllm-private/.tekton/stepplugin.Dockerfile:
+#   1. pip install, never a plain COPY. vLLM discovers plugins through the
+#      distribution's entry_points metadata (.dist-info/entry_points.txt), not
+#      by importing modules. Copying only .py files leaves
+#      entry_points(group="vllm.endpoint_plugins") empty, so the server starts,
+#      /health answers 200, and every internal route 404s -- silently.
+#   2. --no-deps. The only declared dependency is `regex`, which vLLM already
+#      pulls in; --force-reinstall keeps a rebuild idempotent.
+#   3. VLLM_PLUGINS must name BOTH entry-point groups. vLLM's plugin loading is
+#      opt-in: with the variable unset, vllm/plugins/__init__.py returns an
+#      empty list and only warns, producing the same silent failure.
+#
+# Weight load alone runs ~7 minutes on a JFS mount before CUDA-graph capture
+# and flashinfer JIT, which exceeds vLLM's 600s default engine-ready timeout
+# and aborts a healthy startup. 7200s is the measured value.
+ARG STEPCAST_PLUGIN_DIR="stepcast_plugin"
+COPY ${STEPCAST_PLUGIN_DIR}/ /tmp/stepcast_plugin/
+RUN python3 -m pip install --no-cache-dir --no-deps --force-reinstall /tmp/stepcast_plugin \
+        --extra-index-url ${ASCEND_INDEX_URL} && \
+    rm -rf /tmp/stepcast_plugin && \
+    python3 -m pip cache purge
+ENV VLLM_PLUGINS=stepcast_platform,stepcast_rs \
+    VLLM_ENGINE_READY_TIMEOUT_S=7200
+
 # Install vllm-ascend
 # Limit cargo parallelism to avoid OOM in constrained build environments.
 # Overridable via --build-arg CARGO_BUILD_JOBS=N (e.g. 32-CPU/128Gi buildkitd
