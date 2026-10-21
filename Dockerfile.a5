@@ -123,10 +123,11 @@ RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[a
 
 # Install the StepFun out-of-tree vLLM plugin (stepcast_plugin).
 #
-# The plugin lives in the vllm-private repo, not here, so it must be present
-# in the build context. Either pass --build-arg STEPCAST_PLUGIN_DIR=<path> or
-# stage it next to this Dockerfile before building, e.g.
-#   cp -r ../vllm-private/stepcast_plugin .
+# No separate COPY: the plugin ships inside the vLLM source tree. Point
+# VLLM_REPO at the internal vllm-private repo (remote URL or a local path --
+# git clone accepts both) and it arrives with vllm/ above. The public
+# vllm-project/vllm tree has no stepcast_plugin/, so the install is guarded
+# and simply skipped there.
 #
 # Three things are mandatory, all learned the hard way in
 # vllm-private/.tekton/stepplugin.Dockerfile:
@@ -144,12 +145,13 @@ RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[a
 # Weight load alone runs ~7 minutes on a JFS mount before CUDA-graph capture
 # and flashinfer JIT, which exceeds vLLM's 600s default engine-ready timeout
 # and aborts a healthy startup. 7200s is the measured value.
-ARG STEPCAST_PLUGIN_DIR="stepcast_plugin"
-COPY ${STEPCAST_PLUGIN_DIR}/ /tmp/stepcast_plugin/
-RUN python3 -m pip install --no-cache-dir --no-deps --force-reinstall /tmp/stepcast_plugin \
-        --extra-index-url ${ASCEND_INDEX_URL} && \
-    rm -rf /tmp/stepcast_plugin && \
-    python3 -m pip cache purge
+RUN if [ -d /vllm-workspace/vllm/stepcast_plugin ]; then \
+      python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
+        /vllm-workspace/vllm/stepcast_plugin --extra-index-url ${ASCEND_INDEX_URL} && \
+      python3 -m pip cache purge; \
+    else \
+      echo "NOTE: stepcast_plugin/ not in the vLLM source tree; StepFun internal routes will 404."; \
+    fi
 ENV VLLM_PLUGINS=stepcast_platform,stepcast_rs \
     VLLM_ENGINE_READY_TIMEOUT_S=7200
 
