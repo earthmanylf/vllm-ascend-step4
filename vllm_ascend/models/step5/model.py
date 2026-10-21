@@ -396,50 +396,34 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             self.rope_cos = None
             self.rope_sin = None
 
-        # Page-backed sparse summary sidecar, aligned with the upstream
-        # KV-cache extra-budget contract: the sidecar's per-page bytes shrink
-        # the KV block count, and its lifetime/zeroing/COW follow the owner
-        # KV blocks through the generic side-storage hooks.
-        self.kv_cache_requires_zeroing = True
+        # Page-backed sparse summary layer, aligned with the upstream
+        # KV-cache contract: it is an ordinary FullAttentionSpec layer with
+        # tokens_per_state=8 sharing this DSA layer's KV group and block IDs,
+        # so it is prefix cached and transferred like any other page. The
+        # ring that carries each request's open-region rows is created below
+        # and injected into the impl, mirroring upstream.
         self.sparse_summary_cache = AscendStep5SparseSummaryCacheLayer(
             prefix=f"{prefix}.attn.sparse_summary_cache",
             target_impl=self.impl,
-            sparse_config=sparse_config,
-            main_layer_name=self.layer_name,
             static_forward_context=compilation_config.static_forward_context,
         )
-        self.kv_cache_extra_budget_page_size_bytes = self.sparse_summary_cache._set_summary_cache_budget
-        self.kv_cache_extra_budget_fixed_size_bytes = self.sparse_summary_cache._fixed_runtime_state_budget
-        if cache_config is not None:
-            # A prefix-cache hit replays at least one page of the prompt so
-            # the recomputed tail rebuilds the summary state that the hit
-            # pages alone cannot carry (the in-flight region's active slot).
-            self.kv_cache_prefix_recompute_tokens = int(cache_config.block_size)
-        else:
-            self.kv_cache_prefix_recompute_tokens = 0
 
     def get_attn_backend(self) -> type[AscendStep5DSABackend]:
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # Upstream vLLM removed the side-storage API (``with_side_storage`` and
+        # ``KVCacheSideStorageSpec``) that the SWF port relied on. The summary
+        # is now an ordinary FullAttentionSpec layer sharing this layer's KV
+        # group, and the ring is its own CircularBufferSpec layer, so both are
+        # budgeted like any other page and no sidecar accounting is needed.
         block_size = vllm_config.cache_config.block_size
-        page_budget = self.kv_cache_extra_budget_page_size_bytes
-        if callable(page_budget):
-            page_budget = page_budget(block_size)
-        fixed_budget = self.kv_cache_extra_budget_fixed_size_bytes
-        if callable(fixed_budget):
-            fixed_budget = fixed_budget(block_size)
         return FullAttentionSpec(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
-        ).with_side_storage(
-            requires_zeroing=self.kv_cache_requires_zeroing,
-            extra_budget_page_size_bytes=int(page_budget or 0),
-            extra_budget_fixed_size_bytes=int(fixed_budget or 0),
-            prefix_cache_recompute_tokens=int(self.kv_cache_prefix_recompute_tokens or 0),
         )
 
     def _apply_sparse_indexer_rope(
