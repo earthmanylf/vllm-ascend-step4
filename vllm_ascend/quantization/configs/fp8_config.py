@@ -152,7 +152,7 @@ class Step5Fp8BlockConfig(AscendFp8Config):
     reference (see ``Step5Fp8BlockFusedMoEMethod``) instead of resolving to
     bf16 or requantizing to MXFP8. Dense linear layers keep the inherited
     behaviour; the Step5 model only hands this config to ``FusedMoEFactory``
-    when the ``VLLM_ASCEND_ENABLE_STEP4_FP8`` env var is set.
+    when the ``VLLM_ASCEND_ENABLE_STEP5_FP8`` env var is set.
     """
 
     def get_quant_method(

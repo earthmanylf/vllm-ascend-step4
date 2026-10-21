@@ -366,7 +366,7 @@ class TestStep5MoEConstructor(unittest.TestCase):
                 "get_dp_group": lambda: types.SimpleNamespace(world_size=1),
                 "extract_layer_index": lambda prefix: int(prefix.split(".")[1]),
                 "Step5FP32RouterLinear": FakeLinear,
-                "envs": types.SimpleNamespace(VLLM_ASCEND_ENABLE_STEP4_FP8=expected_bf16 is not None),
+                "envs": types.SimpleNamespace(VLLM_ASCEND_ENABLE_STEP5_FP8=expected_bf16 is not None),
                 "_step5_moe_reduce_policy": lambda tp_size, dp_size: (True, False),
                 "Step5MLP": StrictStep5MLP,
                 "AscendFp8Config": QuantConfig,

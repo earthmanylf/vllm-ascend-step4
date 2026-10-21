@@ -697,7 +697,7 @@ class AscendStep5FusedMoEBlock(Step5MoE):
             activation = "swiglustep"
 
         # Optional Step5-native fp8 expert execution, gated by the
-        # ``VLLM_ASCEND_ENABLE_STEP4_FP8`` env var (default off): the routed
+        # ``VLLM_ASCEND_ENABLE_STEP5_FP8`` env var (default off): the routed
         # experts keep the checkpoint's fp8 e4m3 weights and 128x128 block
         # scales and run them with the kernels vendored from the step5-hf
         # reference (Step5Fp8BlockFusedMoEMethod), instead of the default
@@ -705,7 +705,7 @@ class AscendStep5FusedMoEBlock(Step5MoE):
         # requantizes to MXFP8. Layers the checkpoint left in bf16
         # (modules_to_not_convert) stay unquantized either way.
         moe_quant_config = quant_config
-        enable_step5_fp8 = bool(envs.VLLM_ASCEND_ENABLE_STEP4_FP8)
+        enable_step5_fp8 = bool(envs.VLLM_ASCEND_ENABLE_STEP5_FP8)
         if enable_step5_fp8 and isinstance(quant_config, AscendFp8Config):
             bf16_expert_layers, _ = _step5_fp8_expert_layout(config, quant_config)
             if self.layer_idx in bf16_expert_layers:
