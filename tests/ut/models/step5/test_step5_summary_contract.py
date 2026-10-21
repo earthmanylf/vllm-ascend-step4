@@ -1,7 +1,9 @@
 """Step5 summary-cache contracts under main's TailRing architecture.
 
-AST isolation: the class definitions are compiled from source so these run on
-CPU-only hosts as well as in the NPU unit-test suite. Only the ring is faked.
+AST isolation: the class definitions are compiled straight from the source
+files, so importing ``vllm_ascend`` (and therefore its build-time
+``_build_info``) is never triggered. That keeps these runnable on CPU-only
+hosts as well as in the NPU unit-test suite.
 
 These replace the SWF-journal sources (test_summary_cache_contract.py,
 test_summary_update_dispatch_contract.py, test_summary_scratch_contract.py),
@@ -14,19 +16,8 @@ import ast
 import types
 from pathlib import Path
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SRC = REPO_ROOT / "vllm_ascend/models/step5/summary_cache.py"
-
-
-def _load_cache_cls():
-    """Compile AscendStep5SparseSummaryCache out of the source file."""
-    tree = ast.parse(SRC.read_text())
-    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendStep5SparseSummaryCache")
-    namespace = {"torch": __import__("torch")}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SRC), "exec"), namespace)  # noqa: S102
-    return namespace["AscendStep5SparseSummaryCache"]
 
 
 class FakeRing:
@@ -61,19 +52,43 @@ class FakeKernels:
         return record
 
 
+def _load_cache_cls(kernels):
+    """Compile AscendStep5SparseSummaryCache out of the source file.
+
+    The module-level ``from vllm_ascend...summary_kernels import ...`` inside
+    each method is redirected to the fake, and the ``from __future__`` import
+    is dropped because the class is compiled standalone.
+    """
+    tree = ast.parse(SRC.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendStep5SparseSummaryCache")
+    for fn in node.body:
+        if isinstance(fn, ast.FunctionDef):
+            fn.decorator_list = []
+            fn.body = [
+                stmt
+                for stmt in fn.body
+                if not (isinstance(stmt, ast.ImportFrom) and stmt.module and "summary_kernels" in stmt.module)
+            ]
+    namespace = {
+        "torch": __import__("torch"),
+        "vllm_ascend": types.SimpleNamespace(
+            models=types.SimpleNamespace(
+                step5=types.SimpleNamespace(summary_kernels=kernels),
+            ),
+        ),
+    }
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SRC), "exec"), namespace)  # noqa: S102
+    return namespace["AscendStep5SparseSummaryCache"]
+
+
 @pytest.fixture
-def kernels(monkeypatch):
-    fake = FakeKernels()
-    import vllm_ascend.models.step5.summary_kernels as mod
-
-    for name in ("update_decode", "update_verify", "update_prefill"):
-        monkeypatch.setattr(mod, name, getattr(fake, name), raising=False)
-    return fake
+def kernels():
+    return FakeKernels()
 
 
 @pytest.fixture
-def cache():
-    return _load_cache_cls()(mean=object())
+def cache(kernels):
+    return _load_cache_cls(kernels)(mean=object())
 
 
 def test_cache_holds_only_the_mean_tensor(cache):
