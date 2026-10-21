@@ -593,9 +593,10 @@ class TestStep5ModelState(unittest.TestCase):
             self.prepare([0], ubatch_idx=1)
         self.assertEqual(self.state.preparations, [])
 
-    def test_both_model_frontends_choose_the_ascend_journal_state(self):
-        state_module = types.ModuleType("vllm_ascend.models.step5.model_state")
-        state_module.AscendStep5ModelState = type(self.state)
+    def test_both_model_frontends_choose_the_ascend_model_state(self):
+        # The SWF request journal is gone, so both frontends now return the
+        # default Ascend model state. The override stays because defining
+        # get_model_state_cls also keeps the model MRV2-only.
         for filename, name in (
             ("model.py", "AscendStep5ForCausalLM"),
             ("vl.py", "AscendStep5ForConditionalGeneration"),
@@ -608,8 +609,9 @@ class TestStep5ModelState(unittest.TestCase):
             method.decorator_list = []
             namespace = {}
             exec(compile(ast.Module(body=[method], type_ignores=[]), filename, "exec"), namespace)
-            with patch.dict("sys.modules", {state_module.__name__: state_module}):
-                self.assertIs(namespace[method.name](), type(self.state))
+            source = ast.unparse(method)
+            self.assertIn("AscendModelState", source, f"{filename} must return the Ascend model state")
+            self.assertNotIn("AscendStep5ModelState", source, f"{filename} must not reference the removed journal state")
 
 
 class TestStep5RequestMetadata(unittest.TestCase):

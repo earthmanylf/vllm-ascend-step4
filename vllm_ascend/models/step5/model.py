@@ -407,6 +407,23 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
             target_impl=self.impl,
             static_forward_context=compilation_config.static_forward_context,
         )
+        # Circular buffer holding each request's open-region [key | z] rows.
+        # A region summary is computed once, by the row that closes it, by
+        # replaying these rows -- so no accumulators and no undo journal.
+        # required_rows = 7 + num_speculative_tokens: one verify step stores
+        # k+1 rows while the next may still replay the region's first seven.
+        # Sized to one main KV page so it shares the group's block size.
+        # Created with the model so memory profiling counts its workspace,
+        # and injected into the impl exactly as upstream does.
+        from vllm.models.step5.nvidia.csa_tail_ring import Step5CSATailRing
+
+        self.csa_tail_ring = Step5CSATailRing(
+            prefix=f"{prefix}.attn.csa_tail_ring",
+            main_layer_name=self.layer_name,
+            num_speculative_tokens=num_speculative_tokens,
+            static_forward_context=compilation_config.static_forward_context,
+        )
+        self.impl.csa_ring = self.csa_tail_ring
 
     def get_attn_backend(self) -> type[AscendStep5DSABackend]:
         return self.attn_backend
@@ -1586,10 +1603,13 @@ class AscendStep5Model(Step5Model):
 class AscendStep5ForCausalLM(Step5ForCausalLM):
     @staticmethod
     def get_model_state_cls():
-        # Add SWF journal coordinates without bypassing NPU metadata setup.
-        from vllm_ascend.models.step5.model_state import AscendStep5ModelState
+        # Keep this model on the Ascend v2 attention path. The SWF request
+        # journal is gone, so there is no Step5-specific state to expose and
+        # the default Ascend model state is used. Defining this method also
+        # keeps the model MRV2-only, which is why the override stays.
+        from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
-        return AscendStep5ModelState
+        return AscendModelState
 
     def __init__(
         self,

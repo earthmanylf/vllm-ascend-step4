@@ -36,6 +36,10 @@ class AscendStep5ForConditionalGeneration(Step5ForConditionalGeneration):
     @staticmethod
     def get_model_state_cls():
         # Keep multimodal input preparation on the Ascend v2 attention path.
-        from vllm_ascend.models.step5.model_state import AscendStep5ModelState
+        # The SWF request journal is gone, so there is no Step5-specific state
+        # to expose and the default Ascend model state is used. Defining this
+        # method also keeps the model MRV2-only, which is why the override
+        # stays.
+        from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
-        return AscendStep5ModelState
+        return AscendModelState

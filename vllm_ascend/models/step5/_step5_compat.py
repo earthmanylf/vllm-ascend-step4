@@ -9,12 +9,10 @@ its NPU dispatch and Ascend owning-KV layout are adapted in summary_cache.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 import torch
 from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm.models.step5.nvidia.sparse_summary_cache import Step5SparseSummaryCache
 
 
 @dataclass
@@ -64,102 +62,6 @@ class Step5DSAScratchWorkspace:
         return num_buffers
 
 
-@dataclass(frozen=True)
-class Step5SparseSummaryCacheConfig:
-    num_pages: int
-    page_size: int
-    region_block_size: int
-    num_kv_heads: int
-    proxy_dim: int
-
-    def __post_init__(self) -> None:
-        for name in (
-            "num_pages",
-            "page_size",
-            "region_block_size",
-            "num_kv_heads",
-            "proxy_dim",
-        ):
-            value = int(getattr(self, name))
-            if value <= 0:
-                raise ValueError(f"{name} must be positive, got {value}.")
-        if self.page_size % 8 or self.region_block_size != 8:
-            raise ValueError("Fixed SWF Step5 summaries require eight-token regions and aligned pages.")
-        if self.num_kv_heads != 1 or self.proxy_dim != 256:
-            raise ValueError("Fixed SWF Step5 summaries require one 256-dimensional proxy key head.")
-
-    @staticmethod
-    def max_region_fragments_per_block(
-        *,
-        block_size: int,
-        region_block_size: int,
-    ) -> int:
-        block_size = int(block_size)
-        region_block_size = int(region_block_size)
-        if block_size <= 0 or region_block_size <= 0:
-            raise ValueError(
-                "Step5 sparse requires positive block_size and "
-                "region_block_size, "
-                f"got block_size={block_size}, "
-                f"region_block_size={region_block_size}."
-            )
-        common = math.gcd(block_size, region_block_size)
-        return (block_size + region_block_size - common + region_block_size - 1) // region_block_size
-
-    @property
-    def max_region_fragments_per_page(self) -> int:
-        return self.max_region_fragments_per_block(
-            block_size=self.page_size,
-            region_block_size=self.region_block_size,
-        )
-
-    @property
-    def summaries_per_page(self) -> int:
-        return self.max_region_fragments_per_page
-
-    @property
-    def sum_shape(self) -> tuple[int, int, int, int]:
-        return (
-            self.num_pages,
-            self.summaries_per_page,
-            self.num_kv_heads,
-            self.proxy_dim,
-        )
-
-    @property
-    def count_shape(self) -> tuple[int, int, int]:
-        return (self.num_pages, self.summaries_per_page, self.num_kv_heads)
-
-
-def step5_sparse_summary_cache_bytes_per_block(
-    *,
-    block_size: int,
-    region_block_size: int,
-    proxy_dim: int,
-    num_kv_heads: int = 1,
-    sum_dtype: torch.dtype | None = None,
-    count_dtype: torch.dtype | None = None,
-) -> int:
-    proxy_dim = int(proxy_dim)
-    num_kv_heads = int(num_kv_heads)
-    if proxy_dim <= 0 or num_kv_heads <= 0:
-        raise ValueError(
-            "Step5 sparse summary cache requires positive proxy_dim and "
-            f"num_kv_heads, got proxy_dim={proxy_dim}, "
-            f"num_kv_heads={num_kv_heads}."
-        )
-    fragments = Step5SparseSummaryCacheConfig.max_region_fragments_per_block(
-        block_size=block_size, region_block_size=region_block_size
-    )
-    if int(block_size) % 8 or int(region_block_size) != 8 or proxy_dim != 256 or num_kv_heads != 1:
-        raise ValueError(
-            "Fixed SWF Step5 summaries require aligned pages, region=8, proxy_dim=256 and one proxy key head."
-        )
-    del sum_dtype, count_dtype
-    # FP8 means plus per-page FP32 numerator/denominator/maximum and int64 last.
-    return int(fragments * num_kv_heads * proxy_dim + 513 * 4 + 8)
-
-
 class Step5FP32RouterLinear(ReplicatedLinear):
     """Step5 router projection with FP32 accumulation."""
 
@@ -171,7 +73,4 @@ class Step5FP32RouterLinear(ReplicatedLinear):
 __all__ = [
     "Step5DSAScratchWorkspace",
     "Step5FP32RouterLinear",
-    "Step5SparseSummaryCacheConfig",
-    "Step5SparseSummaryCache",
-    "step5_sparse_summary_cache_bytes_per_block",
 ]
