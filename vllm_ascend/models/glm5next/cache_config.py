@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
     create_kv_cache_group_specs,
     may_override_num_blocks,
 )
