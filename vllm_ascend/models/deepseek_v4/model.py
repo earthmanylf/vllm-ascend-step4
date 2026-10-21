@@ -72,7 +72,9 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+from vllm.transformers_utils.configs.deepseek_v41 import (  # noqa: A004
+    DeepseekV41Config as DeepseekV4Config,
+)
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec

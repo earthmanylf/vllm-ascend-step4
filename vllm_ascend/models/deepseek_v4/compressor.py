@@ -34,7 +34,9 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
-from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+from vllm.transformers_utils.configs.deepseek_v41 import (  # noqa: A004
+    DeepseekV41Config as DeepseekV4Config,
+)
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec

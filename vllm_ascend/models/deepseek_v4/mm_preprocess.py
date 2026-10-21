@@ -46,7 +46,9 @@ from vllm.multimodal.processing.processor import (
     MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
 )
-from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+from vllm.transformers_utils.configs.deepseek_v41 import (  # noqa: A004
+    DeepseekV41Config as DeepseekV4Config,
+)
 
 IMAGE_START, IMAGE_PAD, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(5)
 COMPRESS_PAD_TO = 4
