@@ -16,6 +16,8 @@ import ast
 import types
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SRC = REPO_ROOT / "vllm_ascend/models/step5/summary_cache.py"
 
@@ -37,6 +39,30 @@ class FakeRing:
 
     def metadata(self):
         return types.SimpleNamespace(base=self.base, slot_mapping=self.slot_mapping)
+
+
+class Slice:
+    """Stand-in for a device tensor sliced by ``[:n]``.
+
+    The cache reads ``slots.shape[0]`` (and ``metadata.shape[0]``) only to
+    size the ring views, so a real tensor is unnecessary -- but the object
+    must carry a ``shape``.
+    """
+
+    def __init__(self, n: int):
+        self.shape = (n,)
+        self.n = n
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            return Slice(self.n)
+        raise TypeError(item)
+
+    def __eq__(self, other):
+        return isinstance(other, Slice) and other.n == self.n
+
+    def __repr__(self):
+        return f"Slice({self.n})"
 
 
 class FakeKernels:
@@ -76,6 +102,11 @@ def _load_cache_cls(kernels):
                 step5=types.SimpleNamespace(summary_kernels=kernels),
             ),
         ),
+        # Each method does ``from ...summary_kernels import update_*``; the
+        # import statement is stripped above, so bind the names directly.
+        "update_decode": kernels.update_decode,
+        "update_verify": kernels.update_verify,
+        "update_prefill": kernels.update_prefill,
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(SRC), "exec"), namespace)  # noqa: S102
     return namespace["AscendStep5SparseSummaryCache"]
@@ -100,11 +131,12 @@ def test_cache_holds_only_the_mean_tensor(cache):
 
 def test_update_decode_addresses_the_ring(cache, kernels):
     ring = FakeRing(3)
-    cache.update_decode("key", "z", "slots", "positions", ring)
+    cache.update_decode("key", "z", Slice(3), "positions", ring)
     name, args, _ = kernels.calls[0]
     assert name == "update_decode"
     # (key, z, slots, positions, ring_base, mean, ring_rows, capacity)
-    assert args[0:4] == ("key", "z", "slots", "positions")
+    assert args[0] == "key" and args[1] == "z" and args[3] == "positions"
+    assert args[2] == Slice(3)
     assert args[4] == ring.base[:3]
     assert args[5] is cache.mean
     assert args[6] is ring.rows
@@ -113,10 +145,11 @@ def test_update_decode_addresses_the_ring(cache, kernels):
 
 def test_update_verify_addresses_the_ring(cache, kernels):
     ring = FakeRing(4)
-    cache.update_verify("key", "z", "slots", "qsl", "seq_lens", ring)
+    cache.update_verify("key", "z", Slice(4), "qsl", "seq_lens", ring)
     name, args, _ = kernels.calls[0]
     assert name == "update_verify"
-    assert args[0:5] == ("key", "z", "slots", "qsl", "seq_lens")
+    assert args[0] == "key" and args[1] == "z" and args[3] == "qsl" and args[4] == "seq_lens"
+    assert args[2] == Slice(4)
     assert args[5] == ring.base[:4]
     assert args[6] is cache.mean
     assert args[7] is ring.rows
@@ -127,10 +160,11 @@ def test_update_prefill_passes_both_ring_views(cache, kernels):
     # Prefill is the only path that also consumes slot_mapping, because a
     # long chunk may store open-region rows after summarising closed ones.
     ring = FakeRing(5)
-    cache.update_prefill("key", "z", "metadata", "positions", ring)
+    cache.update_prefill("key", "z", Slice(5), "positions", ring)
     name, args, _ = kernels.calls[0]
     assert name == "update_prefill"
-    assert args[0:4] == ("key", "z", "metadata", "positions")
+    assert args[0] == "key" and args[1] == "z" and args[3] == "positions"
+    assert args[2] == Slice(5)
     assert args[4] == ring.base[:5]
     assert args[5] == ring.slot_mapping[:5]
     assert args[6] is cache.mean
