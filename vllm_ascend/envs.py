@@ -78,6 +78,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Ascend 950, MXFP8 requantize on Ascend 950). Valid values: "0" or "1".
     # Not sensitive.
     "VLLM_ASCEND_ENABLE_STEP4_FP8": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_STEP4_FP8", "0"))),
+    # Whether to run Step5 DSA prefill attention through the union
+    # sparse-attention path (GBSA mask_mode=3): the aclnn UnionSparseMeta
+    # operator merges each region's per-token top-K block selections into
+    # one deduplicated union, and the GenericBlockSparseAttention operator
+    # computes the union once and restores the per-token selections through
+    # the exactMask bitmasks. Pays off when adjacent tokens' selections
+    # overlap heavily (long prefills); decode and MTP verify rows always
+    # keep the plain per-token path. Requires the union GBSA and custom_nn
+    # vendor packages on ASCEND_CUSTOM_OPP_PATH plus the cann_ops_nn_custom
+    # wheel. If not set, the default value is 0 (off). Valid values: "0"
+    # or "1". Not sensitive.
+    "VLLM_ASCEND_ENABLE_STEP4_UNION_SPARSE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_STEP4_UNION_SPARSE", "0"))),
 }
 
 # end-env-vars-definition
