@@ -1095,7 +1095,6 @@ class AscendStep5Attention(Step5Attention):
             qkzg = None
             extra_dims = None
 
-        kv_cache_dummy_dep = None
         if self.use_fused_qknorm_rope:
             q, k, v = fused_qknorm_rope(
                 qkv,
@@ -1125,7 +1124,7 @@ class AscendStep5Attention(Step5Attention):
         if self.sparse_attn is not None:
             attn_output, extra_dims = self.sparse_attn.forward(positions, hidden_states, q, k, v, qkzg=qkzg)
         else:
-            attn_output = self.attn(q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep)
+            attn_output = self.attn(q, k, v)
         if extra_dims is None and self.use_head_wise_attn_gate:
             extra_dims, _ = self.g_proj(hidden_states)
 
