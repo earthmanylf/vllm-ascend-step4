@@ -8,6 +8,7 @@ import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
+from vllm.v1.core.kv_cache_config_builder import KVCacheConfigBuilder
 from vllm.v1.core.kv_cache_planning import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -593,16 +594,23 @@ else:
 
 
 def _ascend_max_memory_usage_bytes_from_groups(
+    builder: KVCacheConfigBuilder,
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
-    """Keep the pre-#51718 DSV4 admission formula for its shared tuples."""
+    """Keep the pre-#51718 DSV4 admission formula for its shared tuples.
+
+    Upstream added a leading ``builder`` argument to
+    ``_max_memory_usage_bytes_from_groups`` (the ``*_from_builder`` family
+    split). The Ascend formulas below only need ``vllm_config`` and the
+    groups, so ``builder`` is accepted and forwarded untouched.
+    """
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         return get_glm5_next_max_memory_usage(vllm_config, kv_cache_groups)
     if not _is_deepseek_v4_groups(kv_cache_groups):
-        return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
+        return _orig_max_memory_usage_bytes_from_groups(builder, vllm_config, kv_cache_groups)
 
     assert all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups)
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
