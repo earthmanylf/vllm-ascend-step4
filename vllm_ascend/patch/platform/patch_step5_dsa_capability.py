@@ -58,9 +58,12 @@
 #   Remove when upstream gates the DSA backend on a backend capability query
 #   rather than a CUDA compute capability.
 
+import importlib
+
 from vllm.logger import logger
 
 _MODULE = "vllm.models.step5.nvidia.model"
+_SPARSE_MODULE = "vllm.models.step5.nvidia.sparse_attention"
 _PROXY_ATTR = "_ascend_capability_proxy"
 
 
@@ -87,28 +90,40 @@ class _AscendPlatformProxy:
         setattr(object.__getattribute__(self, "_real"), name, value)
 
 
-def _apply_patch() -> None:
+def _patch_module(module_name: str) -> bool:
+    """Rebind one step5 module's `current_platform` to the capability proxy."""
     try:
-        import vllm.models.step5.nvidia.model as _step5_model
+        module = importlib.import_module(module_name)
     except ImportError:
-        logger.info("step5 nvidia model not available; skipping DSA capability patch")
-        return
+        logger.info("%s not available; skipping DSA capability patch", module_name)
+        return False
 
-    if getattr(_step5_model, _PROXY_ATTR, None) is not None:
-        return
+    if getattr(module, _PROXY_ATTR, None) is not None:
+        return True
 
-    real_platform = getattr(_step5_model, "current_platform", None)
+    real_platform = getattr(module, "current_platform", None)
     if real_platform is None:
-        logger.info("step5 model has no current_platform binding; skipping DSA capability patch")
-        return
+        logger.info("%s has no current_platform binding; skipping", module_name)
+        return False
 
     proxy = _AscendPlatformProxy(real_platform)
-    _step5_model.current_platform = proxy
-    setattr(_step5_model, _PROXY_ATTR, proxy)
+    module.current_platform = proxy
+    setattr(module, _PROXY_ATTR, proxy)
     logger.info(
         "Patched %s.current_platform to report SM90 for the step5 DSA capability gate",
-        _MODULE,
+        module_name,
     )
+    return True
+
+
+def _apply_patch() -> None:
+    # Two step5 modules carry the identical DSA capability guard, each with its
+    # own module-level `current_platform` binding:
+    #   model.py:1017           (Step5Attention.__init__)
+    #   sparse_attention.py:292 (Step5DSAAttentionImpl.__init__)
+    # Both must be patched or construction still dies on the second one.
+    for module_name in (_MODULE, _SPARSE_MODULE):
+        _patch_module(module_name)
 
 
 _apply_patch()
