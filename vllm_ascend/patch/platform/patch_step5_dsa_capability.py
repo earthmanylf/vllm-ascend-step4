@@ -15,25 +15,40 @@
 #
 # Patch target: vllm/models/step5/nvidia/model.py
 # - `Step5Attention.__init__` gates the DSA backend on
-#   `current_platform.get_device_capability()` returning a CUDA compute
-#   capability in (SM90, SM103). Ascend NPU has no SM version, so
-#   `vllm_ascend.platform.get_device_capability` returns None and the model
-#   raises `NotImplementedError: Step5 DSA requires SM90 or SM103; got None`
+#
+#       capability = current_platform.get_device_capability()
+#       if capability is None or not (
+#           Step5DSAAttentionBackend.supports_compute_capability(capability)
+#       ):
+#           raise NotImplementedError(...)
+#
+#   Ascend NPU has no SM version: `AscendPlatform.get_device_capability`
+#   returns None, so the `capability is None` short-circuit fires and model
+#   construction dies with
+#   `NotImplementedError: Step5 DSA requires SM90 or SM103; got None`
 #   before any Ascend code runs.
-#   The actual attention work is done by the Ascend backend
-#   (`AscendStep5DSABackend` in vllm_ascend), so the capability gate is a
-#   CUDA-specific precondition that does not apply here.
+#
+#   Note the short-circuit: patching `supports_compute_capability` alone is
+#   useless, because that function is never called when capability is None.
 #
 # Why a platform patch:
 #   The gate lives in upstream vllm's step5 model code and runs during model
-#   construction inside the worker process, long after CLI parsing. Patching
-#   `Step5DSAAttentionBackend.supports_compute_capability` keeps the upstream
-#   tree untouched while letting the DSA path proceed on Ascend.
+#   construction inside the worker process. The actual attention work is done
+#   by `AscendStep5DSABackend` in vllm-ascend, so the CUDA compute-capability
+#   precondition simply does not apply here.
 #
 # How:
-#   Wrap `supports_compute_capability` so it also returns True when the active
-#   platform is Ascend. Non-Ascend platforms keep the original SM90/SM103
-#   check exactly.
+#   `current_platform` is a module-level name binding in the step5 model
+#   module (line 81). Rebinding only that module's name to a delegating proxy
+#   keeps the change surgical -- the ~20 other vllm call sites of
+#   `get_device_capability` (compilation fusion, distributed all-reduce,
+#   other models) keep seeing the real Ascend platform and its None.
+#   The proxy returns DeviceCapability(9, 0) only for
+#   `get_device_capability`, which is exactly what the DSA guard needs;
+#   every other attribute delegates untouched.
+#
+#   Line 1254's `current_platform.is_device_capability(103)` is gated on
+#   `not self.use_dsa_backend`, so it is False either way and unaffected.
 #
 # Related PR (if no, explain why):
 #   No upstream PR: upstream step5 DSA is CUDA-only. Ascend support is
@@ -45,39 +60,55 @@
 
 from vllm.logger import logger
 
+_MODULE = "vllm.models.step5.nvidia.model"
+_PROXY_ATTR = "_ascend_capability_proxy"
+
+
+class _AscendPlatformProxy:
+    """Delegating proxy that reports an SM90 compute capability.
+
+    Only `get_device_capability` is overridden. Everything else -- including
+    `device_name` ("npu") and `device_type` -- is forwarded to the real
+    Ascend platform so unrelated behavior is unchanged.
+    """
+
+    def __init__(self, real):
+        object.__setattr__(self, "_real", real)
+
+    def get_device_capability(self, device_id: int = 0):
+        from vllm.platforms.interface import DeviceCapability
+
+        return DeviceCapability(9, 0)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_real"), name, value)
+
 
 def _apply_patch() -> None:
     try:
-        from vllm.models.step5.nvidia import sparse_attention as _sa
+        import vllm.models.step5.nvidia.model as _step5_model
     except ImportError:
-        logger.info("step5 sparse_attention not available; skipping DSA capability patch")
+        logger.info("step5 nvidia model not available; skipping DSA capability patch")
         return
 
-    backend_cls = getattr(_sa, "Step5DSAAttentionBackend", None)
-    if backend_cls is None:
-        logger.info("Step5DSAAttentionBackend not found; skipping DSA capability patch")
+    if getattr(_step5_model, _PROXY_ATTR, None) is not None:
         return
 
-    if getattr(backend_cls, "_ascend_dsa_capability_patched", False):
+    real_platform = getattr(_step5_model, "current_platform", None)
+    if real_platform is None:
+        logger.info("step5 model has no current_platform binding; skipping DSA capability patch")
         return
 
-    original = backend_cls.supports_compute_capability.__func__
-
-    def supports_compute_capability(cls, capability):
-        try:
-            from vllm.platforms import current_platform
-
-            # AscendPlatform.device_name is the literal "npu" (see
-            # vllm_ascend/platform.py); CUDA/ROCm report their own names.
-            if current_platform.device_name == "npu":
-                return True
-        except Exception:  # noqa: BLE001 - never block model construction on a probe
-            pass
-        return original(cls, capability)
-
-    backend_cls.supports_compute_capability = classmethod(supports_compute_capability)
-    backend_cls._ascend_dsa_capability_patched = True
-    logger.info("Patched Step5DSAAttentionBackend.supports_compute_capability for Ascend")
+    proxy = _AscendPlatformProxy(real_platform)
+    _step5_model.current_platform = proxy
+    setattr(_step5_model, _PROXY_ATTR, proxy)
+    logger.info(
+        "Patched %s.current_platform to report SM90 for the step5 DSA capability gate",
+        _MODULE,
+    )
 
 
 _apply_patch()
