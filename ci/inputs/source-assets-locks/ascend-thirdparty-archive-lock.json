@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "scope": "vllm-ascend csrc --pkg offline dependencies only; independent from ops-transformer json3.12.0",
+  "source_cmake_has_hash": {
+    "include.zip": false,
+    "makeself-release-2.5.0-patch1.tar.gz": true,
+    "abseil-cpp-20230802.1.tar.gz": false,
+    "protobuf-25.1.tar.gz": false
+  },
+  "archives": [
+    {
+      "file": "pkg/include.zip",
+      "url": "https://gitcode.com/cann-src-third-party/json/releases/download/v3.11.3/include.zip",
+      "bytes": 299825,
+      "sha256": "a22461d13119ac5c78f205d3df1db13403e58ce1bb1794edc9313677313f4a9d",
+      "origin": "canonical GitCode release"
+    },
+    {
+      "file": "pkg/makeself-release-2.5.0-patch1.tar.gz",
+      "url": "https://gitcode.com/cann-src-third-party/makeself/releases/download/release-2.5.0-patch1.0/makeself-release-2.5.0-patch1.tar.gz",
+      "bytes": 44457,
+      "sha256": "bfa730a5763cdb267904a130e02b2e48e464986909c0733ff1c96495f620369a",
+      "origin": "canonical GitCode release"
+    },
+    {
+      "file": "pkg/abseil-cpp-20230802.1.tar.gz",
+      "url": "https://gitcode.com/cann-src-third-party/abseil-cpp/releases/download/20230802.1/abseil-cpp-20230802.1.tar.gz",
+      "bytes": 2157158,
+      "sha256": "987ce98f02eefbaf930d6e38ab16aa05737234d7afbab2d5c4ea7adbe50c28ed",
+      "origin": "verified identical canonical release archive from ops-thirdparty"
+    },
+    {
+      "file": "pkg/protobuf-25.1.tar.gz",
+      "url": "https://gitcode.com/cann-src-third-party/protobuf/releases/download/v25.1/protobuf-25.1.tar.gz",
+      "bytes": 5878124,
+      "sha256": "9bd87b8280ef720d3240514f884e56a712f2218f0d693b48050c836028940a42",
+      "origin": "verified identical canonical release archive from ops-thirdparty"
+    }
+  ],
+  "install_layout": {
+    "json": "csrc/third_party/json/include/nlohmann/json.hpp (pre-extracted, accepted by find_path)",
+    "makeself": "csrc/third_party/makeself/{makeself.sh,makeself-header.sh} (pre-extracted, accepted by exists)",
+    "abseil": "csrc/third_party/pkg/abseil-cpp-20230802.1.tar.gz (ExternalProject applies native patch)",
+    "protobuf": "csrc/third_party/pkg/protobuf-25.1.tar.gz (ExternalProject applies native patch)"
+  },
+  "patch_dry_run_checks": {
+    "abseil-cpp-20230802.1.tar.gz": {
+      "patch": "protobuf-hide_absl_symbols.patch",
+      "patch_sha256": "ff1419dfcb83e9c9478f63e2ece972c0362b8ecda34535b8d2628cdaac81be92",
+      "dry_run_returncode": 0,
+      "patch_output": "(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file CMakeLists.txt\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file absl/base/options.h\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file absl/hash/internal/hash.cc\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file absl/hash/internal/hash.h\npatch unexpectedly ends in middle of line\nHunk #1 succeeded at 1159 with fuzz 1.\n"
+    },
+    "protobuf-25.1.tar.gz": {
+      "patch": "protobuf_25.1_change_version.patch",
+      "patch_sha256": "210033396c1a3551f4e24dd5d49b5b4588c53b450ab05fef27d31ae389d94c4f",
+      "dry_run_returncode": 0,
+      "patch_output": "(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file CMakeLists.txt\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/arenastring.cc\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/arenastring.h\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/compiler/cpp/field_generators/string_field.cc\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/compiler/cpp/helpers.cc\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/compiler/cpp/helpers.h\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/compiler/csharp/csharp_helpers.cc\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/compiler/java/names.cc\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/extension_set.h\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/message_lite.h\n(Stripping trailing CRs from patch; use --binary to disable.)\nchecking file src/google/protobuf/port_def.inc\npatch unexpectedly ends in middle of line\nHunk #1 succeeded at 572 with fuzz 1.\n"
+    }
+  }
+}

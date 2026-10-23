@@ -1,0 +1,11 @@
+ARG BASE_IMAGE=quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-624cc9d19a
+FROM ${BASE_IMAGE}
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN rm -rf /opt/upgrade/src/vllm-ascend
+ADD vllm-ascend.tar.gz /opt/upgrade/src/vllm-ascend/
+COPY revision2-native-reuse.py /opt/upgrade/
+RUN /opt/upgrade/.venv/bin/python /opt/upgrade/revision2-native-reuse.py
+LABEL step5.vllm_ascend.commit="143f3649d8181edae635091c5fe809eb51ff992c" \
+      step5.vllm_ascend.native.commit="624cc9d19a74dcb8c685c4c7c5b3b4829dbfbab3" \
+      step5.mtp.fix="fia-full-prebuilder-and-eager-real-prefix" \
+      step5.build.mode="same-native-python-revision"

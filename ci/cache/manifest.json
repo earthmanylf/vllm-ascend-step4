@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "storage": "git-lfs",
+  "profile": "tailring-cann9.2.0-143f3649d8",
+  "input_lock": "../pins/official-v030-cann92.json",
+  "archives": [
+    {
+      "path": "tailring-cann9.2.0-143f3649d8/vllm.tar.gz",
+      "bytes": 45954486,
+      "sha256": "38fd39ac79baf26b1dafe60e7bb6e259c8e56f6ebb3569be49a66c08c80ddd4a"
+    },
+    {
+      "path": "tailring-cann9.2.0-143f3649d8/vllm-ascend.tar.gz",
+      "bytes": 18523223,
+      "sha256": "94267bfa583259e2ed0a9f3928c65be5273c92c33417c17d52d8f9746a93da89"
+    },
+    {
+      "path": "tailring-cann9.2.0-143f3649d8/custom-assets.tar.gz",
+      "bytes": 113602072,
+      "sha256": "f90857070ab95da3e6f96f43f980f65ad6e548b2a6d12e0ffb4d94cc567aea85"
+    },
+    {
+      "path": "tailring-cann9.2.0-143f3649d8/ascend-catlass.tar.gz",
+      "bytes": 2245988,
+      "sha256": "aec7d389dec2145166599dbb47c1f8089a28632477e4cd94ea96cdb97489eb12"
+    },
+    {
+      "path": "tailring-cann9.2.0-143f3649d8/ops-git-metadata.tar.gz",
+      "bytes": 54623503,
+      "sha256": "aaaee649c89f050fb13739992e4f49fcc4d6e867580fb96bb392485db7005e47"
+    },
+    {
+      "path": "tailring-cann9.2.0-143f3649d8/cann92-release/cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz",
+      "bytes": 4806522202,
+      "sha256": "6068329c27a345701d5cb7c1f76b7264f2c3320df9cfe2f8673ff37186f45c8f"
+    },
+    {
+      "path": "tailring-cann9.2.0-143f3649d8/uv-0.9.5-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl",
+      "bytes": 20030908,
+      "sha256": "48a3542835d37882ff57d1ff91b757085525d98756712fa61cf9941d3dda8ebf"
+    }
+  ]
+}

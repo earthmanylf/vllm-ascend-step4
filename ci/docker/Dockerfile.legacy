@@ -1,0 +1,35 @@
+FROM docker.io/library/step5-fp8-a5:modelslim-a2ac-wheel-20261016@sha256:c139edabf0467dfaa0063eabf7e2d4cd229439b362525e8da5b21bd1871f6f4c AS candidate
+ARG FEATURE_COMMIT
+ARG FEATURE_TREE
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV TORCH_DEVICE_BACKEND_AUTOLOAD=0 PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+COPY source.bundle source.tar source-input.json feature-source-record.json candidate_probe.py /opt/step5/feature-inputs/
+WORKDIR /tmp
+RUN --network=none \
+    source /opt/step5/bin/step5-build-env.sh && \
+    python3 -B /opt/step5/feature-inputs/candidate_probe.py before && \
+    python3 -B /opt/step5/feature-inputs/candidate_probe.py advance && \
+    python3 -B /opt/step5/feature-inputs/candidate_probe.py source
+RUN --network=none --mount=type=cache,id=step5-cann92beta2-vf-static-torch210-ascend950-native,target=/vllm-workspace/vllm-ascend/csrc/build_cache,sharing=locked \
+    source /opt/step5/bin/step5-build-env.sh && \
+    cd /vllm-workspace/vllm-ascend && \
+    mkdir -p /opt/step5/feature-artifacts && \
+    COMPILE_CUSTOM_KERNELS=1 SETUPTOOLS_SCM_PRETEND_VERSION="$(python3 -c 'import json;print(json.load(open("/opt/step5/feature-inputs/source-input.json"))["wheel_version"])')" \
+    python3 -m pip wheel --no-build-isolation --no-deps --no-cache-dir --wheel-dir /opt/step5/feature-artifacts . && \
+    python3 -B /opt/step5/feature-inputs/candidate_probe.py wheel && \
+    python3 -m pip uninstall -y vllm-ascend && \
+    python3 -m pip install --no-deps --no-index /opt/step5/feature-artifacts/vllm_ascend-*.whl && \
+    cd /tmp && python3 -B /opt/step5/feature-inputs/candidate_probe.py relocate
+RUN --network=none \
+    source /opt/step5/bin/step5-build-env.sh && \
+    python3 -B /opt/step5/feature-inputs/candidate_probe.py after && \
+    python3 -B /opt/step5/feature-inputs/candidate_probe.py tests && \
+    rm -rf /tmp/step5-build-hal
+WORKDIR /workspace
+LABEL step5.ascend.commit=$FEATURE_COMMIT \
+      step5.ascend.tree=$FEATURE_TREE \
+      step5.ascend.installation=standard-wheel \
+      step5.base.manifest=sha256:c139edabf0467dfaa0063eabf7e2d4cd229439b362525e8da5b21bd1871f6f4c
+ENTRYPOINT ["/bin/bash", "/opt/step5/bin/entrypoint.sh"]
+CMD ["/bin/bash"]

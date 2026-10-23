@@ -1,0 +1,46 @@
+ARG BASE_IMAGE=quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-317c7fb99e
+FROM ${BASE_IMAGE}
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV TORCH_DEVICE_BACKEND_AUTOLOAD=0 SOC_VERSION=ascend950dt_9582 MAX_JOBS=16 CARGO_BUILD_JOBS=16
+# Retain verified CANN9.2/Flash/Step5 ops; replace source trees and rebuild Ascend native code.
+COPY uv-0.9.5-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl /opt/upgrade/bootstrap/
+RUN echo '48a3542835d37882ff57d1ff91b757085525d98756712fa61cf9941d3dda8ebf  /opt/upgrade/bootstrap/uv-0.9.5-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl' | sha256sum -c - && \
+    python3 -m zipfile -e /opt/upgrade/bootstrap/uv-*.whl /opt/upgrade/bootstrap/uv && \
+    install -m755 /opt/upgrade/bootstrap/uv/uv-*.data/scripts/uv /usr/local/bin/uv && \
+    uv venv --python /usr/local/python3.12.13/bin/python3 --system-site-packages /opt/upgrade/.venv
+ENV VIRTUAL_ENV=/opt/upgrade/.venv PATH=/opt/upgrade/.venv/bin:/root/.cargo/bin:$PATH
+RUN rm -rf /opt/upgrade/src/vllm /opt/upgrade/src/vllm-ascend /opt/upgrade/wheels/vllm_ascend-*.whl
+ADD vllm.tar.gz /opt/upgrade/src/vllm/
+ADD vllm-ascend.tar.gz /opt/upgrade/src/vllm-ascend/
+ADD ascend-catlass.tar.gz /opt/upgrade/src/vllm-ascend/csrc/third_party/catlass/
+RUN ln -s /opt/upgrade/source-assets/ascend-thirdparty/json /opt/upgrade/src/vllm-ascend/csrc/third_party/json && \
+    ln -s /opt/upgrade/source-assets/ascend-thirdparty/makeself /opt/upgrade/src/vllm-ascend/csrc/third_party/makeself && \
+    ln -s /opt/upgrade/source-assets/ascend-thirdparty/pkg /opt/upgrade/src/vllm-ascend/csrc/third_party/pkg
+COPY apply_dependency_profile.py probe_environment.py /opt/upgrade/
+RUN mkdir -p /opt/upgrade/evidence && /opt/upgrade/.venv/bin/python /opt/upgrade/apply_dependency_profile.py && \
+    source /opt/upgrade/cann92-env.sh && \
+    uv pip install --python /opt/upgrade/.venv/bin/python --no-deps \
+      --default-index https://mirrors.huaweicloud.com/repository/pypi/simple \
+      -r /opt/upgrade/src/vllm/requirements/common.txt \
+      -c /opt/upgrade/constraints-tailring.txt 'transformers==5.19.0' 'pytest==8.3.2' 'pytest-mock==3.14.0'
+RUN source /opt/upgrade/cann92-env.sh && \
+    CARGO_NET_OFFLINE=true SETUPTOOLS_SCM_PRETEND_VERSION=0.29.1rc1.dev2194+gca5e43ddcd VLLM_TARGET_DEVICE=empty \
+    uv pip install --python /opt/upgrade/.venv/bin/python -e /opt/upgrade/src/vllm --no-build-isolation --no-deps
+RUN source /opt/upgrade/cann92-build-env.sh && cd /opt/upgrade/src/vllm-ascend && \
+    find /opt/upgrade/src/vllm-ascend -exec touch -h -d '@0' {} + && \
+    COMPILE_CUSTOM_KERNELS=1 SETUPTOOLS_SCM_PRETEND_VERSION=0.19.1rc2.dev2977+g143f3649d8 \
+    /opt/upgrade/.venv/bin/python -m build --wheel --no-isolation --skip-dependency-check --outdir /opt/upgrade/wheels && \
+    uv pip install --python /opt/upgrade/.venv/bin/python --reinstall --no-deps /opt/upgrade/wheels/vllm_ascend-*.whl
+RUN source /opt/upgrade/cann92-env.sh && cd /tmp && \
+    /opt/upgrade/.venv/bin/python /opt/upgrade/probe_environment.py > /opt/upgrade/evidence/tailring-development.json && \
+    /opt/upgrade/.venv/bin/python -c 'import vllm, vllm_ascend; print(vllm.__file__, vllm_ascend.__file__)'
+LABEL step5.source.branch="step5-preview-tailring-npu" \
+      step5.vllm.commit="ca5e43ddcd5b04c91e3de451702eecc1632faea8" \
+      step5.vllm_ascend.commit="143f3649d8181edae635091c5fe809eb51ff992c" \
+      step5.catlass.commit="038b9315f3dd73b0a21200ee95fbaf314a1a9a1b" \
+      step5.mtp.fix="fia-full-prebuilder-and-eager-real-prefix" \
+      step5.build.mode="verified-cann92-source-rebase"
+WORKDIR /workspace
+ENTRYPOINT ["/bin/bash", "/opt/upgrade/cann92-entrypoint.sh"]
+CMD ["/bin/bash"]

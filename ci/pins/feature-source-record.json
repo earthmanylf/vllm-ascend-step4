@@ -1,0 +1,32 @@
+{
+  "base_commit": "a2ac749ee336294c162b05759f2c03d61c16b15e",
+  "commit": "7ae69ef36e5027a379ebbd1464503135a9a62034",
+  "tree": "c76cb2b0bdf6f68836096c72df5f52873602aae7",
+  "branch": "step5-v2-mtp-aclgraph",
+  "files": {
+    "tests/ut/models/step5/test_mtp_quantization_contract.py": "d266ae7b3955172f235886dbfd7b38bd9955612ef0815525b0ef1a55dafd02fe",
+    "tests/ut/models/step5/test_native_dsa_contract.py": "3f673105f7828c8c838ac889ff13787cc96bf7c843702830f7697129f7122900",
+    "tests/ut/worker/v2/test_aclgraph.py": "ca113d3beb4f712237c59c1ede4189fa7dc667888ee9257e9d5b0e353b470f98",
+    "tests/ut/worker/v2/test_ar_graph_step_contract.py": "07cb51d5a4450776c045336930fbe4b18a6e279bb8177e3f9307c6fbd7d788d3",
+    "tests/ut/worker/v2/test_multi_module_mtp_contract.py": "e0c25061dfa5caef23112b6de96fcf94db028f53e574b00f6674d94891b38b71",
+    "tests/ut/worker/v2/test_spec_decode.py": "6b782bacd5f28fa5baaacb4e070428ed5fa09306aaf586c3c37afc4b26940abf",
+    "tests/ut/worker/v2/test_speculator.py": "ef25bc29c7d57e95079e42fa7e3f8576fc1464c24725df6d015e2c61a0eb8f69",
+    "tests/ut/worker/v2/test_step5_shared_kv.py": "f5d5a07f449fb35932f580b8abb075c63c5d1eb2d66d50b7238cf207a7f9f80c",
+    "vllm_ascend/core/step5_kv_cache.py": "411043d248b1ed6657ee90c8295f646d06429c6f7869c178cde275f98e9ee531",
+    "vllm_ascend/models/step5/dsa_attention.py": "07c4036601ce0fcbc5b24eb16caa3b9163cff27a1a0c026238f3c55762f5d170",
+    "vllm_ascend/models/step5/mtp.py": "25fec9196cfb8e63c868767b805e382e1352bb609d3462a7caa075d83619d95d",
+    "vllm_ascend/worker/v2/aclgraph_utils.py": "23f09884cb606e61fb85380f921f6848b9071e31e785981d7bbb9d90a7b751f2",
+    "vllm_ascend/worker/v2/attn_utils.py": "b30701ed2e04ca79ab89c19520ec5f4a247b2b8a3a0b8ce8f2e9c783f59b85f8",
+    "vllm_ascend/worker/v2/spec_decode/__init__.py": "63669ea691c031687d1f0e8119437678a3bbb7fda749291e796f0de8ec679da8",
+    "vllm_ascend/worker/v2/spec_decode/autoregressive/aclgraph.py": "aa7852ee66dc86bc9d525ce0004bdb95b8c80f7f2d8de13a5bc0dbefd8e55997",
+    "vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py": "d41098587bda20bd681ca064d026ceaee8aa819d330a2f4f9952901b238ec4eb",
+    "vllm_ascend/worker/v2/spec_decode/lmhead_tp_utils.py": "705f7c1a00493bfe6534073cfa915ea601725761bc81f6d3ee67b9f7832cc8b8",
+    "vllm_ascend/worker/v2/spec_decode/multi_module_mtp/__init__.py": "cc1b9a6b2e6a291f7065a07579136b9ed9ae09cd424f78649dc04440ca9f2e2f",
+    "vllm_ascend/worker/v2/spec_decode/multi_module_mtp/speculator.py": "b05da9810ec4d77fb5d73102f9e7e548a2a165ae4b88cea0973c796fbcc778e4",
+    "vllm_ascend/worker/worker.py": "87f8400022b81cc6f5f36e61c22642e9584019a63a523986a5875b7d61d74175"
+  },
+  "format_ci_returncode": 1,
+  "local_contract_tests": "32 passed, 4 subtests; CPU only; real NPU validation pending",
+  "remote": "origin\t/data/chensiyu/hw_project/step4/950_build/vllm-ascend (fetch)\norigin\t/data/chensiyu/hw_project/step4/950_build/vllm-ascend (push)\nstep4\thttps://github.com/earthmanylf/vllm-ascend-step4.git (fetch)\nstep4\thttps://github.com/earthmanylf/vllm-ascend-step4.git (push)",
+  "runtime_fix": "MTP ModelSlim quant_description uses the same checkpoint-to-runtime mapping as inherited weight loader; original target quant_config unchanged"
+}

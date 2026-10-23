@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "session_id": "session-b5f168ee-ca7a-4022-a461-46e1867b75cb",
+  "base_image": "quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler",
+  "base_config_digest": "sha256:c9d3e4921ba2153a0b1cec0005d01c76f7acce3def96cd6bca20a185a54f94d9",
+  "cann_version": "9.2.0",
+  "cann_arm64_manifest": "sha256:811ca9bb37475ba1a8db6cd1f52731651c13f5860a4cfb58773a32e603e02f57",
+  "cann_image": "quay.io/ascend/cann:9.2.0-950-openeuler24.03-py3.12-devel",
+  "source_commits": {
+    "vllm": "ca5e43ddcd5b04c91e3de451702eecc1632faea8",
+    "vllm-ascend": "143f3649d8181edae635091c5fe809eb51ff992c"
+  },
+  "verified_session_image": "quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-317c7fb99e",
+  "verified_session_config_digest": "sha256:0a16c96cc8be9bacdd5028d35bed3623297b5313870d87229984c08062033483",
+  "successful_recovery_cache_config": "sha256:1046b891679b3590163b7a25fbeabbd81fb29ce6b8ef7c862206034d80f152fd",
+  "recipe_sha256": "4d69d487bfc883b0dd45417ff5bb6e3c1dc4c866062be9cec1f66ef8c206cc8c",
+  "runtime_sha256": {
+    "cann92-env.sh": "82882c7e0bb3ea64c94bc8326306ec477775d9d96c89ad3d6e13838c6ef71bf2",
+    "cann92-build-env.sh": "a4fe72808556136f909d91451167489c758e916f742a5e562b9532feeb2d809d",
+    "cann92-entrypoint.sh": "329e544409c682071d4192a9420570598be7c59a57b27d08389503a83f713977",
+    "normalize-cann92.py": "ad5d36ef6eeeac3e3bda0256f4de703b5140e9bb14825dec18b50f39a850d088",
+    "apply_dependency_profile.py": "c38c4b7ce693612bbd9d180ff005103f9bd7b0172bb2cf049162ccbf2bafe066",
+    "probe_environment.py": "a89b43513c86afa443d30f7906ebb761f49bf92026a1daecf72bcf791a38e46f",
+    "install_ops.py": "db0ccc707f876095348c25aeffe058dc7009b04093b6631ad335705163a032ab",
+    "patch_flash_hcc.py": "d7346ba333502a7a0c0048e870b7cbe404a4eb6e1aed06a3a9b0f6fc91dcf053"
+  },
+  "inputs": [
+    {
+      "file": "vllm.tar.gz",
+      "bytes": 45954486,
+      "sha256": "38fd39ac79baf26b1dafe60e7bb6e259c8e56f6ebb3569be49a66c08c80ddd4a"
+    },
+    {
+      "file": "vllm-ascend.tar.gz",
+      "bytes": 18523223,
+      "sha256": "94267bfa583259e2ed0a9f3928c65be5273c92c33417c17d52d8f9746a93da89"
+    },
+    {
+      "file": "custom-assets.tar.gz",
+      "bytes": 113602072,
+      "sha256": "f90857070ab95da3e6f96f43f980f65ad6e548b2a6d12e0ffb4d94cc567aea85"
+    },
+    {
+      "file": "ascend-catlass.tar.gz",
+      "bytes": 2245988,
+      "sha256": "aec7d389dec2145166599dbb47c1f8089a28632477e4cd94ea96cdb97489eb12"
+    },
+    {
+      "file": "ops-git-metadata.tar.gz",
+      "bytes": 54623503,
+      "sha256": "aaaee649c89f050fb13739992e4f49fcc4d6e867580fb96bb392485db7005e47"
+    },
+    {
+      "file": "cann92-release/cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz",
+      "bytes": 4806522202,
+      "sha256": "6068329c27a345701d5cb7c1f76b7264f2c3320df9cfe2f8673ff37186f45c8f",
+      "legacy_file": "cann92-release/ascend-payload.tar.gz"
+    },
+    {
+      "file": "uv-0.9.5-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl",
+      "bytes": 20030908,
+      "sha256": "48a3542835d37882ff57d1ff91b757085525d98756712fa61cf9941d3dda8ebf"
+    }
+  ],
+  "limitations": [
+    "New TailRing source snapshots are not the historical session code.",
+    "Source-rebase profile retains same-CANN Flash/Step5 custom ops, but rebuilds all vLLM-Ascend native code.",
+    "Native build and four-node inference acceptance tracked in the new receipt; historical validation is not inherited."
+  ],
+  "session_recipe_sha256": "54e547b4953a582d000d0880873396425f54b974e5113efd2d5446aff7c9ba0c",
+  "recipe_changes_from_session": [
+    "Version-readable CANN payload filename and source-image comment only; payload SHA256 and build steps unchanged."
+  ],
+  "cache_profile": "tailring-cann9.2.0-143f3649d8",
+  "historical_source_commits": {
+    "vllm": "e177c621f2b8ae1be06190bc34eef84646e54f11",
+    "vllm-ascend": "317c7fb99e06121cfb53846e47ce8c41eaca911f"
+  },
+  "source_branch": "step5-preview-tailring-npu",
+  "source_snapshots": {
+    "vllm": {
+      "branch": "step5-preview-tailring-npu",
+      "commit": "ca5e43ddcd5b04c91e3de451702eecc1632faea8",
+      "describe": "v0.29.1rc0-2194-gca5e43ddcd",
+      "source_repo": "/data/chensiyu/hw_project/step4/950_build/vllm",
+      "working_tree_status": "",
+      "snapshot_policy": "git archive of committed tracked files, excluding ci/",
+      "archive": "vllm.tar.gz",
+      "bytes": 45954486,
+      "sha256": "38fd39ac79baf26b1dafe60e7bb6e259c8e56f6ebb3569be49a66c08c80ddd4a"
+    },
+    "vllm-ascend": {
+      "branch": "step5-preview-tailring-npu",
+      "commit": "143f3649d8181edae635091c5fe809eb51ff992c",
+      "describe": "v0.19.1rc1-2977-g143f3649d8",
+      "source_repo": "/data/chensiyu/hw_project/step4/950_build/vllm-ascend",
+      "working_tree_status": "M csrc/third_party/catlass\n?? ci/",
+      "snapshot_policy": "git archive of committed tracked files, excluding ci/",
+      "archive": "vllm-ascend.tar.gz",
+      "bytes": 18523223,
+      "sha256": "94267bfa583259e2ed0a9f3928c65be5273c92c33417c17d52d8f9746a93da89"
+    },
+    "catlass": {
+      "branch": "",
+      "commit": "038b9315f3dd73b0a21200ee95fbaf314a1a9a1b",
+      "describe": "v1.5.0-12-g038b9315",
+      "source_repo": "/data/chensiyu/hw_project/step4/950_build/vllm-ascend/csrc/third_party/catlass",
+      "working_tree_status": "",
+      "snapshot_policy": "git archive of committed tracked files, excluding ci/",
+      "archive": "ascend-catlass.tar.gz",
+      "bytes": 2245988,
+      "sha256": "aec7d389dec2145166599dbb47c1f8089a28632477e4cd94ea96cdb97489eb12"
+    }
+  },
+  "package_versions": {
+    "vllm": "0.29.1rc1.dev2194+gca5e43ddcd.empty",
+    "vllm-ascend": "0.19.1rc2.dev2977+g143f3649d8"
+  },
+  "uv": {
+    "version": "0.9.5",
+    "file": "uv-0.9.5-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl",
+    "url": "https://files.pythonhosted.org/packages/48/8a/a990d9a39094d4d47bd11edff17573247f3791c33a19626e92c995498e68/uv-0.9.5-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl",
+    "sha256": "48a3542835d37882ff57d1ff91b757085525d98756712fa61cf9941d3dda8ebf",
+    "bytes": 20030908
+  },
+  "source_rebase_base_image": "quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-317c7fb99e",
+  "source_rebase_base_config_digest": "sha256:0a16c96cc8be9bacdd5028d35bed3623297b5313870d87229984c08062033483",
+  "source_rebase_recipe_sha256": "6c52c6226d50df929b003f504dfa1f801768081fcab9765d0b07749cd34abf71",
+  "previous_build_source_commits": {
+    "vllm": "ca5e43ddcd5b04c91e3de451702eecc1632faea8",
+    "vllm-ascend": "624cc9d19a74dcb8c685c4c7c5b3b4829dbfbab3"
+  },
+  "validated_incremental_image": {
+    "image": "quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-143f3649d8",
+    "config": "sha256:98c123dc3ca238bf22970447b67747c6157a33c932de7c82ba9a63020ecfd4fe",
+    "native_source_commit": "624cc9d19a74dcb8c685c4c7c5b3b4829dbfbab3",
+    "installed_distribution_version": "0.19.1rc2.dev2976+g624cc9d19a",
+    "note": "Incremental installed Python revision143f; unchanged1114native files; full recipe below rebuilds latest wheel metadata"
+  }
+}

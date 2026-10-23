@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_commit": "7ae69ef36e5027a379ebbd1464503135a9a62034",
+  "source_tree": "c76cb2b0bdf6f68836096c72df5f52873602aae7",
+  "selected_image_manifest_digest": "sha256:48868f7dd1ae9a822b8e325810483d227ea1065f9aa4e4525c1192c5aa5a0b96",
+  "selected_image_config_digest": "sha256:6488e24a5ec3667c857a730dda01b428aeff23339ea975aac8f60e0e1b478105",
+  "base": {
+    "commit": "a2ac749ee336294c162b05759f2c03d61c16b15e",
+    "tree": "a989585935258c30e54af366b62ab220efff2763",
+    "image": "step5-fp8-a5:modelslim-a2ac-wheel-20261016",
+    "image_alias": "docker.io/library/step5-fp8-a5:modelslim-a2ac-wheel-20261016",
+    "manifest_digest": "sha256:c139edabf0467dfaa0063eabf7e2d4cd229439b362525e8da5b21bd1871f6f4c",
+    "config_digest": "sha256:f08bc4a9db87295fa7465b4b6d847bbf851b12adb1e2a7f3023b3378a6f9fb00"
+  },
+  "context_files": {
+    "Dockerfile": "b543ee254c0d3e6ed950d897fd3371b7ce413c822d00725a3c52fbe298a76442",
+    "candidate_probe.py": "905bb5025085b08e7958e96c568547f8876951ea8fe845588c26a49ff3bdb6da",
+    "feature-source-record.json": "abd306b6528093564ad5f6b199e33902953b9c98aa2a2c22b75c1d5abed31ce3",
+    "source-input.json": "654aa9e07abae0656d0823758aa82d390e42d93e4ae1bd568e5814d39f9ff5f0",
+    "source.bundle": "4b3cdb14bb9473cdc40d5606593034ba57db9cceb59eb4e14cb7bd36944b7291",
+    "source.tar": "11d264d0d33eab14eed56990d5729b7ba2bb5eccf3e919f52d94417e54c88aea"
+  },
+  "source_lock_sha256": "ab4343c7e5065194ecbe5d28e58e0b405f6304a8bcd46fb039eeb2119c6eedbf",
+  "wheel_sha256": "3daa52b25552eaebe65013ebcfe1a4edcda3d41b7ff00fde1098a3aeb4695f2e",
+  "build_receipt_sha256": "7f76a940f67d85eb54ac34b5af0914d7b5c2c617612208617808256d88946372",
+  "preparation_sha256": "6a756df3690b3fd15efe0ff19c10f1bc14af57cd0b7f6ac22e7974c69c78089f"
+}

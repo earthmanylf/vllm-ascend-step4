@@ -1,0 +1,464 @@
+{
+  "image": "quay.io/ascend/cann:9.2.0-beta.2-950-openeuler24.03-py3.12-devel",
+  "index_digest": "sha256:64c949a7b278b4d86d2c77c8c1705f89456e148596c16965894005c33618db7c",
+  "manifest_digest": "sha256:0523f773498c81cf87b288b38c3c7626109463c798631d17d0ed9321c3c9fad0",
+  "manifest": {
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "config": {
+      "mediaType": "application/vnd.oci.image.config.v1+json",
+      "digest": "sha256:b24a8023360a25c5d79472baa15ac4ca911861d98a210057e073f60d78ef6694",
+      "size": 21218
+    },
+    "layers": [
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:283c34f82a2d511e751b71908e43d304a94ba9ad52bbd1a6c9850d4df23a4400",
+        "size": 68046982
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:0c3f823b61e8d2c667cb9d5780e46c5bf61f845c2ef13e92cd3ccba1151c3fc3",
+        "size": 1288
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:9f770859cece22eac741453b83f2b9be4888cce731ee1e17f499811ea803d215",
+        "size": 247484971
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:f6abae6bef966b9401bd3f41d27bcd8f8d175f1fc46162312cafe5dd70064842",
+        "size": 7888699
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:625eea665fa5a8993613a8769bb7408f6a3a2d6d14d762ed65eff5462c995d11",
+        "size": 182176839
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:9735e4842a98fd25d906d3bd349b3461fe5c3e631d485101861295ee325a98da",
+        "size": 4691731401
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:5f0fafc82f4b5f2deb0c1aeb4f3da674af66f014e8479f5f9961cdfc88516ae2",
+        "size": 222
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:f7145efeeea1c8e065d9d8a298b3827ee6371c0059358170590154141f28cbe1",
+        "size": 1407
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:1377fef2726aec9fb70fe6fd25699a6ce19fa49105099903ddf6d07827cdf0b0",
+        "size": 147
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:e4ef71ea26ca7f532fe402e0be67730289b4a6ffac3ed028d5672c79e9cd22db",
+        "size": 7959121
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:303446ec4d8358c6b0701d766ab5cf7bf3ee74af1b415d4b41946bdb15fc31aa",
+        "size": 723039
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:bc06bb4224cbf3d2e23567d1f6e747947d81621b2e7c1e1b4a091c174aff791d",
+        "size": 54095855
+      },
+      {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1",
+        "size": 32
+      }
+    ]
+  },
+  "config_digest": "sha256:b24a8023360a25c5d79472baa15ac4ca911861d98a210057e073f60d78ef6694",
+  "config": {
+    "architecture": "arm64",
+    "config": {
+      "User": "root",
+      "Env": [
+        "PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.2.0-beta.2/tools/msobjdump:/usr/local/Ascend/cann-9.2.0-beta.2/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/profiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ascend_system_advisor/asys:/usr/local/python3.12.14/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.2.0-beta.2",
+        "ASCEND_TOOLKIT_LATEST_HOME=/usr/local/Ascend/ascend-toolkit/latest",
+        "PYTHONPATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:/usr/local/Ascend/cann-9.2.0-beta.2/python/site-packages:/usr/local/Ascend/cann-9.2.0-beta.2/opp/built-in/op_impl/ai_core/tbe:",
+        "ASCEND_AICPU_PATH=/usr/local/Ascend/cann-9.2.0-beta.2",
+        "ASCEND_OPP_PATH=/usr/local/Ascend/cann-9.2.0-beta.2/opp",
+        "TOOLCHAIN_HOME=/usr/local/Ascend/cann-9.2.0-beta.2/toolkit",
+        "ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.2.0-beta.2",
+        "CMAKE_PREFIX_PATH=/usr/local/Ascend/cann-9.2.0-beta.2/toolkit/tools/tikicpulib/lib/cmake:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/cmake",
+        "ATB_HOME_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1",
+        "LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.2.0-beta.2/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:",
+        "ATB_STREAM_SYNC_EVERY_KERNEL_ENABLE=0",
+        "ATB_STREAM_SYNC_EVERY_RUNNER_ENABLE=0",
+        "ATB_STREAM_SYNC_EVERY_OPERATION_ENABLE=0",
+        "ATB_OPSRUNNER_KERNEL_CACHE_LOCAL_COUNT=1",
+        "ATB_OPSRUNNER_KERNEL_CACHE_GLOABL_COUNT=5",
+        "ATB_WORKSPACE_MEM_ALLOC_ALG_TYPE=1",
+        "ATB_COMPARE_TILING_EVERY_KERNEL=0",
+        "ATB_SHARE_MEMORY_NAME_SUFFIX=",
+        "ATB_MATMUL_SHUFFLE_K_ENABLE=1",
+        "LCCL_DETERMINISTIC=0",
+        "LCCL_PARALLEL=0",
+        "ATB_CXX_ABI=1",
+        "USER=root"
+      ],
+      "Entrypoint": [
+        "/bin/bash",
+        "-c",
+        "    source /usr/local/Ascend/ascend-toolkit/set_env.sh &&     source /usr/local/Ascend/cann-9.2.0-beta.2/share/info/ascendnpu-ir/bin/set_env.sh &&     source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=${ATB_CXX_ABI:-1} &&     if [ -x /usr/sbin/rsyslogd ]; then nohup /usr/sbin/rsyslogd >/dev/null 2>&1 & for i in $(seq 1 50); do [ -S /dev/log ] && break; sleep 0.1; done; fi;     exec \"$@\"",
+        "--"
+      ],
+      "WorkingDir": "/opt",
+      "ArgsEscaped": true,
+      "Shell": [
+        "/bin/bash",
+        "-c"
+      ]
+    },
+    "created": "2026-09-16T10:46:27.31232975Z",
+    "history": [
+      {
+        "created": "2026-07-01T23:50:30.032703189Z",
+        "created_by": "ARG TARGETARCH=arm64",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-07-01T23:50:30.032703189Z",
+        "created_by": "ADD openEuler-docker-rootfs.arm64.tar.xz / # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-07-01T23:50:32.717248057Z",
+        "created_by": "RUN |1 TARGETARCH=arm64 /bin/sh -c ln -sf /usr/share/zoneinfo/UTC /etc/localtime &&     sed -i \"s/TMOUT=300/TMOUT=0/g\" /etc/bashrc # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-07-01T23:50:32.717248057Z",
+        "created_by": "CMD [\"bash\"]",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ARG TARGETPLATFORM=linux/arm64",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV PATH=/usr/local/python3.12.14/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.2.0-beta.2",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ASCEND_TOOLKIT_LATEST_HOME=/usr/local/Ascend/ascend-toolkit/latest",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV PYTHONPATH=/usr/local/Ascend/cann-9.2.0-beta.2/python/site-packages:/usr/local/Ascend/cann-9.2.0-beta.2/opp/built-in/op_impl/ai_core/tbe:",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV PYTHONPATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:/usr/local/Ascend/cann-9.2.0-beta.2/python/site-packages:/usr/local/Ascend/cann-9.2.0-beta.2/opp/built-in/op_impl/ai_core/tbe:",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV PATH=/usr/local/Ascend/cann-9.2.0-beta.2/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/profiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ascend_system_advisor/asys:/usr/local/python3.12.14/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV PATH=/usr/local/Ascend/cann-9.2.0-beta.2/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.2.0-beta.2/tools/msobjdump:/usr/local/Ascend/cann-9.2.0-beta.2/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/profiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ascend_system_advisor/asys:/usr/local/python3.12.14/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV PATH=/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.2.0-beta.2/tools/msobjdump:/usr/local/Ascend/cann-9.2.0-beta.2/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/profiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ascend_system_advisor/asys:/usr/local/python3.12.14/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ASCEND_AICPU_PATH=/usr/local/Ascend/cann-9.2.0-beta.2",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ASCEND_OPP_PATH=/usr/local/Ascend/cann-9.2.0-beta.2/opp",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV TOOLCHAIN_HOME=/usr/local/Ascend/cann-9.2.0-beta.2/toolkit",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.2.0-beta.2",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV CMAKE_PREFIX_PATH=/usr/local/Ascend/cann-9.2.0-beta.2/toolkit/tools/tikicpulib/lib/cmake:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/cmake",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_HOME_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV LD_LIBRARY_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.2.0-beta.2/lib64:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.2.0-beta.2/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.2.0-beta.2/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.2.0-beta.2/tools/msobjdump:/usr/local/Ascend/cann-9.2.0-beta.2/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/profiler/bin:/usr/local/Ascend/cann-9.2.0-beta.2/tools/ascend_system_advisor/asys:/usr/local/python3.12.14/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_STREAM_SYNC_EVERY_KERNEL_ENABLE=0",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_STREAM_SYNC_EVERY_RUNNER_ENABLE=0",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_STREAM_SYNC_EVERY_OPERATION_ENABLE=0",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_OPSRUNNER_KERNEL_CACHE_LOCAL_COUNT=1",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_OPSRUNNER_KERNEL_CACHE_GLOABL_COUNT=5",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_WORKSPACE_MEM_ALLOC_ALG_TYPE=1",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_COMPARE_TILING_EVERY_KERNEL=0",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_SHARE_MEMORY_NAME_SUFFIX=",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_MATMUL_SHUFFLE_K_ENABLE=1",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV LCCL_DETERMINISTIC=0",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV LCCL_PARALLEL=0",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "ENV ATB_CXX_ABI=1",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "SHELL [/bin/bash -c]",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T09:51:44.567932589Z",
+        "created_by": "RUN |1 TARGETPLATFORM=linux/arm64 /bin/bash -c yum update -y &&     yum install -y         ca-certificates         bash         glibc         sqlite-devel         gcc         gcc-c++         make         cmake         git         vim         wget         jq         curl         numactl-devel     && yum clean all     && rm -rf /var/cache/yum     && rm -rf /tmp/* # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:01:07.681810697Z",
+        "created_by": "RUN |1 TARGETPLATFORM=linux/arm64 /bin/bash -c if [ \"${TARGETPLATFORM}\" = \"linux/arm64\" ]; then         yum install -y             rsyslog             umdk-urma-lib             umdk-urma-tools             umdk-urma-bin             ub-pkg-urma             umdk-urma-devel         && yum clean all         && rm -rf /var/cache/yum         && sed -i 's|SysSock.Use=\"off\"|SysSock.Name=\"/dev/log\"|' /etc/rsyslog.conf;     else         echo \"Non-arm64 platform, skipping URMA installation\";     fi # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:21:54.02904195Z",
+        "created_by": "COPY /usr/local/python3.12.14 /usr/local/python3.12.14 # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:23:20.716843582Z",
+        "created_by": "COPY /usr/local/Ascend /usr/local/Ascend # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:23:21.172516396Z",
+        "created_by": "COPY /etc/Ascend /etc/Ascend # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:23:21.224330551Z",
+        "created_by": "RUN |1 TARGETPLATFORM=linux/arm64 /bin/bash -c ARCH=$(case \"${TARGETPLATFORM}\" in         \"linux/amd64\") echo \"x86_64\" ;;         \"linux/arm64\") echo \"aarch64\" ;;         *) echo \"Unsupported TARGETPLATFORM: ${TARGETPLATFORM}\" && exit 1 ;;     esac) &&     ln -sf /usr/include/c++/12/${ARCH}-openEuler-linux /usr/include/c++/12/${ARCH}-linux-gnu &&     CANN_TOOLKIT_ENV_FILE=\"/usr/local/Ascend/ascend-toolkit/set_env.sh\" &&     CANN_BISHENG_ENV_FILE=\"/usr/local/Ascend/cann-9.2.0-beta.2/share/info/ascendnpu-ir/bin/set_env.sh\" &&     CANN_NNAL_ENV_FILE=\"/usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=${ATB_CXX_ABI:-1}\" &&     echo \"source ${CANN_TOOLKIT_ENV_FILE}\" >> /etc/profile &&     echo \"source ${CANN_TOOLKIT_ENV_FILE}\" >> ~/.bashrc &&     echo \"source ${CANN_BISHENG_ENV_FILE}\" >> /etc/profile &&     echo \"source ${CANN_BISHENG_ENV_FILE}\" >> ~/.bashrc &&     echo \"source ${CANN_NNAL_ENV_FILE}\" >> /etc/profile &&     echo \"source ${CANN_NNAL_ENV_FILE}\" >> ~/.bashrc # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:23:21.224330551Z",
+        "created_by": "ENTRYPOINT [\"/bin/bash\" \"-c\" \"    source /usr/local/Ascend/ascend-toolkit/set_env.sh &&     source /usr/local/Ascend/cann-9.2.0-beta.2/share/info/ascendnpu-ir/bin/set_env.sh &&     source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=${ATB_CXX_ABI:-1} &&     if [ -x /usr/sbin/rsyslogd ]; then nohup /usr/sbin/rsyslogd >/dev/null 2>&1 & for i in $(seq 1 50); do [ -S /dev/log ] && break; sleep 0.1; done; fi;     exec \\\"$@\\\"\" \"--\"]",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T10:42:24.69643169Z",
+        "created_by": "USER root",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T10:42:24.69643169Z",
+        "created_by": "ENV USER=root",
+        "comment": "buildkit.dockerfile.v0",
+        "empty_layer": true
+      },
+      {
+        "created": "2026-09-16T10:42:24.69643169Z",
+        "created_by": "RUN /bin/bash -c ln -sf bash /bin/sh # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:45:55.178289277Z",
+        "created_by": "RUN /bin/bash -c yum update -y &&     yum install -y vim     zip     tree     dos2unix     sudo     bzip2     pigz     gtest gtest-devel     gtest-devel     gawk     nlohmann-json-devel     patch     && yum clean all # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:46:05.427650079Z",
+        "created_by": "RUN /bin/bash -c git clone --depth 1 -b release-1.11.0 https://github.com/google/googletest.git /tmp/googletest &&     cd /tmp/googletest &&     mkdir build &&     cd build &&     cmake .. &&     make &&     make install &&     rm -rf /tmp/googletest # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:46:27.294619303Z",
+        "created_by": "RUN /bin/bash -c mkdir /root/.pip     && echo \"[global]\" > /root/.pip/pip.conf     && echo \"index-url=https://repo.huaweicloud.com/repository/pypi/simple\" >> /root/.pip/pip.conf     && echo \"trusted-host=repo.huaweicloud.com\" >> /root/.pip/pip.conf     && echo \"timeout=120\" >> /root/.pip/pip.conf     && pip3 install --upgrade pip && cd /tmp     && pip3 install wheel==0.38.4     && pip3 install pyyaml==6.0.1      && pip3 install setuptools==67.4.0      && pip3 install numpy==1.26.4      && pip3 install attrs     && pip3 install decorator     && pip3 install sympy     && pip3 install psutil     && pip3 install scipy     && pip3 install protobuf # buildkit",
+        "comment": "buildkit.dockerfile.v0"
+      },
+      {
+        "created": "2026-09-16T10:46:27.31232975Z",
+        "created_by": "WORKDIR /opt",
+        "comment": "buildkit.dockerfile.v0"
+      }
+    ],
+    "os": "linux",
+    "rootfs": {
+      "type": "layers",
+      "diff_ids": [
+        "sha256:a525d3a4f6aa6b957ac0fab17a2983c66765b412be676cc016788e2b590fe747",
+        "sha256:de243689bf4d9dd6b746c87371dbc71698737819b68cc60631cef837950fdc5c",
+        "sha256:132294fde99821259bf67ee80b385f374c2abe68011feb8587f84345f7adf77d",
+        "sha256:616668c782d09021d3c00994972c6e0abb71098a4ed146aa7be94987dfa5d9f5",
+        "sha256:ed629fa619c0765dd55b33706496d0a81f5233e0e6c81fa6e7c19a1f2bd1126c",
+        "sha256:4ab844670cac372c32af00c5115ddda3d977ef1b09ffaee2846ba706921419ca",
+        "sha256:5a3497d45ed36b70a4223fdc1313c60d370660b9de2795eeefb6d85b0fed4ff8",
+        "sha256:38ed15e7820c92048ab8b84fc1273bc22f03635a20611b2f42f28de467c513d2",
+        "sha256:5dcc9068808bbd595d2db98e717df726c42754a516102563a46408dab3931355",
+        "sha256:b5a23da38d6d3c247fa232c4d0f3009a910b26bbbc8260307b6e0d71beea01bd",
+        "sha256:8a9c7ffad0fc6a456fd252716e0bda5fd35430ba34c9b54844b55e52829f105e",
+        "sha256:0a1a87206b5376a605ca58d3ce45042ba69f4da241d4554427b05098fd6a8a49",
+        "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+      ]
+    }
+  },
+  "selected_payload_layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:9735e4842a98fd25d906d3bd349b3461fe5c3e631d485101861295ee325a98da",
+      "size": 4691731401
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:5f0fafc82f4b5f2deb0c1aeb4f3da674af66f014e8479f5f9961cdfc88516ae2",
+      "size": 222
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:f7145efeeea1c8e065d9d8a298b3827ee6371c0059358170590154141f28cbe1",
+      "size": 1407
+    }
+  ]
+}

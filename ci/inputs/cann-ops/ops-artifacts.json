@@ -1,0 +1,12 @@
+[
+  {
+    "file": "cann-ops-transformer-step5_ops_linux-aarch64.run",
+    "bytes": 8424828,
+    "sha256": "cda7c05a27b787491f1276d6a70ed7a43d738b7c9c6c0ac557a98b210095e922"
+  },
+  {
+    "file": "cann_ops_transformer-1.0.0-py3-none-any.whl",
+    "bytes": 581763,
+    "sha256": "904c125e46707badaca21deedf9444b1ee7d2934c66fff73d09b685bea566ccd"
+  }
+]
