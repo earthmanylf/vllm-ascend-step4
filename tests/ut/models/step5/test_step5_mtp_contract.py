@@ -89,6 +89,88 @@ def upstream_source():
 
 
 class MultiModuleContract(unittest.TestCase):
+    def test_rejection_stats_use_actual_logit_count_for_bonus_bounds(self):
+        source = ROOT / "vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py"
+        tree = ast.parse(source.read_text())
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "rejection_sample")
+        seen = []
+
+        class StopAtKernel(Exception):
+            pass
+
+        class Kernel:
+            def __getitem__(self, grid):
+                def launch(*args, **kwargs):
+                    seen.append(args[-1])
+                    raise StopAtKernel
+                return launch
+
+        ns = dict(torch=torch, triton=SimpleNamespace(cdiv=lambda n, b: (n+b-1)//b,
+                  next_power_of_2=lambda n: 1 << (n-1).bit_length()),
+                  _compute_block_stats_kernel=Kernel())
+        future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[future, fn], type_ignores=[])), str(source), "exec"), ns)
+        for rows in (1, 4, 8):
+            with self.assertRaises(StopAtKernel):
+                ns[fn.name](torch.zeros(rows, 16), None, torch.zeros(rows, dtype=torch.int64),
+                            torch.tensor([0, rows]), torch.arange(rows), torch.tensor([0]),
+                            torch.zeros(rows, dtype=torch.int32), torch.arange(rows),
+                            torch.zeros(1), torch.zeros(1, dtype=torch.int64), 3)
+            self.assertEqual(seen[-1], rows)
+
+    def test_graph_parameters_cover_each_independent_mtp_layer(self):
+        cls = methods(MULTI, "AscendMultiModuleMTPSpeculator", ["build_fia_params"], object, {})
+        layers = {
+            f"mtp.{step}": SimpleNamespace(
+                actual_seq_lengths_q=[4], seq_lens_list=[20], block_tables=torch.tensor([[step + 1]])
+            ) for step in range(3)
+        }
+        params = cls().build_fia_params(1, layers, True)
+        self.assertEqual([p["layer_name"] for p in params], list(layers))
+        for param, metadata in zip(params, layers.values()):
+            self.assertIs(param["block_table"], metadata.block_tables)
+            self.assertEqual(param["actual_seq_lengths"], [4])
+            self.assertEqual(param["actual_seq_lengths_kv"], [20])
+
+    def test_rejection_sampler_accepts_disabled_main_options_and_rejects_enabled_ones(self):
+        source = ROOT / "vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py"
+        tree = ast.parse(source.read_text())
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "rejection_sample")
+        class StopAfterValidation(Exception):
+            pass
+        class Logits:
+            @property
+            def shape(self):
+                raise StopAfterValidation
+        ns = dict(torch=torch)
+        future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[future, fn], type_ignores=[])), str(source), "exec"), ns)
+        args = [Logits(), None, None, SimpleNamespace(shape=(2,)), None, None, None, None, None, None, 3]
+        with self.assertRaises(StopAfterValidation):
+            ns[fn.name](*args, fly_window_size=0, fly_entropy_threshold=0.3, fly_entropy_top_k=3)
+        with self.assertRaises(NotImplementedError):
+            ns[fn.name](*args, fly_window_size=2)
+        with self.assertRaises(NotImplementedError):
+            ns[fn.name](*args, watermarking=torch.tensor([True]))
+
+    def test_propose_forwards_current_runner_keyword_arguments(self):
+        seen = []
+
+        class Base:
+            def propose(self, *args, **kwargs):
+                seen.append((args, kwargs))
+                return "drafts"
+
+        cls = methods(
+            MULTI, "AscendMultiModuleMTPSpeculator", ["propose"], Base,
+            {"build_attn_metadata_wrapper": nullcontext, "torch_gather_wrapper": nullcontext},
+        )
+        sync = object()
+        result = cls().propose(object(), *([None] * 10), dp_sync_state=sync, num_speculative_tokens=3)
+        self.assertEqual(result, "drafts")
+        self.assertIs(seen[0][1]["dp_sync_state"], sync)
+        self.assertEqual(seen[0][1]["num_speculative_tokens"], 3)
+
     def test_upstream_generation_uses_all_three_model_and_sampling_heads(self):
         def cache(*args, **kwargs):
             pass

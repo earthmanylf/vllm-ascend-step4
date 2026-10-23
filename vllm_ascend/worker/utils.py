@@ -44,7 +44,7 @@ def copy_kv_cache_blocks_inplace(
         return
 
     cache_tensors: list[torch.Tensor] = []
-    seen_tensors: set[int] = set()
+    seen_tensors: set[tuple] = set()
     for entry in kv_caches:
         if entry is None:
             continue
@@ -55,16 +55,17 @@ def copy_kv_cache_blocks_inplace(
         for tensor in tensors:
             if tensor is None:
                 continue
-            data_ptr = tensor.data_ptr()
-            if data_ptr in seen_tensors:
+            view_key = (tensor.data_ptr(), tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()))
+            if view_key in seen_tensors:
                 continue
-            seen_tensors.add(data_ptr)
+            seen_tensors.add(view_key)
             cache_tensors.append(tensor)
 
     if not cache_tensors:
         return
 
     device = cache_tensors[0].device
+    pending_copies = []
     for tensor in cache_tensors:
         assert tensor.device == device
         assert tensor.shape[0] % num_blocks == 0
@@ -83,6 +84,8 @@ def copy_kv_cache_blocks_inplace(
             storage_offset=tensor.storage_offset(),
         )
         source_blocks = torch.stack([blocks[copy.src_block_id] for copy in kv_cache_block_copies])
+        pending_copies.append((blocks, source_blocks))
+    for blocks, source_blocks in pending_copies:
         for index, copy in enumerate(kv_cache_block_copies):
             blocks[copy.dst_block_id].copy_(source_blocks[index])
 

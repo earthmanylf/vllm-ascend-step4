@@ -10,6 +10,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
 )
+
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_factory,
@@ -78,11 +79,12 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
         next_prefill_tokens: torch.Tensor,
         temperature: torch.Tensor,
         seeds: torch.Tensor,
-        dp_sync: DPSyncState | None = None,
+        dp_sync_state: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         self.input_batch = input_batch
         self._multi_module_attn_metadata = None
@@ -100,11 +102,12 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
                     next_prefill_tokens,
                     temperature,
                     seeds,
-                    dp_sync,
-                    dummy_run,
-                    skip_attn_for_dummy_run,
-                    mm_inputs,
+                    dp_sync_state=dp_sync_state,
+                    dummy_run=dummy_run,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    mm_inputs=mm_inputs,
                     is_profile=is_profile or (dummy_run and skip_attn_for_dummy_run),
+                    num_speculative_tokens=num_speculative_tokens,
                 )
         finally:
             self._multi_module_attn_metadata = None
@@ -148,6 +151,19 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
                 metadata.attn_state = self.draft_attn_state
         self._multi_module_attn_metadata = attn_metadata
         return attn_metadata
+
+    def build_fia_params(self, num_reqs_padded, draft_attn_metadata, is_draft_model_prefill):
+        """Resolve graph updates for every independent MTP attention layer."""
+        return [
+            {
+                "layer_name": layer_name,
+                "actual_seq_lengths": metadata.actual_seq_lengths_q,
+                "actual_seq_lengths_kv": metadata.seq_lens_list,
+                "block_table": metadata.block_tables,
+            }
+            for layer_name, metadata in draft_attn_metadata.items()
+            if metadata is not None
+        ]
 
     def build_draft_attn_metadatas(self, num_reqs_padded, num_tokens_padded, is_draft_model_prefill):
         # Each independent module has its own provider/layer name. All modules

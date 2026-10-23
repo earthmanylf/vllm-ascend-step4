@@ -14,18 +14,52 @@ that closed a region needs no rollback -- the next step overwrites its row and
 the region is recomputed when it closes again. The cache therefore holds no
 per-request state at all; ``mean`` is the only member.
 
-The Ascend delta is confined to dispatch: main's ``Step5SparseSummaryCache``
-calls ``.ops.summary_update``, whose triton kernels import
-``tl.extra.cuda.libdevice`` and do not compile on Ascend. The three update
-entry points are overridden to route to ``summary_kernels.py`` instead.
+The Ascend updates route to ``summary_kernels.py`` instead of main's CUDA
+kernels. Ascend also exposes the summary group's own addresses as metadata;
+physical page padding does not imply shared manager block IDs.
 """
 
 from __future__ import annotations
 
+import weakref
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-from vllm.models.step5.nvidia.sparse_summary_cache import Step5SparseSummaryCacheLayer
+from vllm.models.step5.nvidia.sparse_summary_cache import (
+    Step5SparseSummaryBackend,
+    Step5SparseSummaryCacheLayer,
+    Step5SparseSummaryMetadataBuilder,
+)
+from vllm.v1.attention.backend import AttentionMetadata, CommonAttentionMetadata
+
+
+@dataclass
+class AscendStep5SparseSummaryMetadata(AttentionMetadata):
+    """Addresses from the summary KV group, in full-batch token/request order."""
+
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+
+
+class AscendStep5SparseSummaryMetadataBuilder(Step5SparseSummaryMetadataBuilder):
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> AscendStep5SparseSummaryMetadata:
+        # Retain the runner's device buffers; graph replay refreshes them in place.
+        return AscendStep5SparseSummaryMetadata(
+            slot_mapping=common_attn_metadata.slot_mapping,
+            block_table=common_attn_metadata.block_table_tensor,
+        )
+
+
+class AscendStep5SparseSummaryBackend(Step5SparseSummaryBackend):
+    @staticmethod
+    def get_builder_cls() -> type[AscendStep5SparseSummaryMetadataBuilder]:
+        return AscendStep5SparseSummaryMetadataBuilder
 
 
 class AscendStep5SparseSummaryCache:
@@ -70,17 +104,18 @@ class AscendStep5SparseSummaryCache:
             ring.capacity,
         )
 
-    def update_prefill(self, key, z, metadata, positions, ring) -> None:
+    def update_prefill(self, key, z, metadata, positions, ring, *, token_offset=0) -> None:
         from vllm_ascend.models.step5.summary_kernels import update_prefill
 
         ring_metadata = ring.metadata()
+        token_end = token_offset + key.shape[0]
         update_prefill(
             key,
             z,
             metadata,
             positions,
-            ring_metadata.base[: metadata.shape[0]],
-            ring_metadata.slot_mapping[: metadata.shape[0]],
+            ring_metadata.base[token_offset:token_end],
+            ring_metadata.slot_mapping[token_offset:token_end],
             self.mean,
             ring.rows,
             ring.capacity,
@@ -98,8 +133,9 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
     and ``sparse_config`` arguments: main's layer needs neither, and the
     side-storage budget hooks they fed (``_set_summary_cache_budget`` /
     ``_fixed_runtime_state_budget``) do not exist in the TailRing design --
-    the summary is an ordinary FullAttentionSpec layer sharing the DSA
-    layer's KV group, so it is budgeted like any other page.
+    the summary is an ordinary FullAttentionSpec layer in its own KV group,
+    so it is budgeted like any other page. Physical padding does not make its
+    manager block IDs aliases of the main layer's block IDs.
     """
 
     def __init__(
@@ -107,6 +143,7 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
         *,
         prefix: str,
         target_impl: Any,
+        main_layer: Any,
         static_forward_context: dict[str, Any],
     ) -> None:
         super().__init__(
@@ -114,6 +151,21 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
             target_impl=target_impl,
             static_forward_context=static_forward_context,
         )
+        self._main_layer_ref = weakref.ref(main_layer)
+        self._target_impl.summary_layer_name = self.layer_name
+
+    def get_attn_backend(self) -> type[AscendStep5SparseSummaryBackend]:
+        return AscendStep5SparseSummaryBackend
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        main_layer = self._main_layer_ref()
+        if main_layer is None:
+            raise RuntimeError("Step5 summary main layer is no longer available")
+        main_spec = main_layer.get_kv_cache_spec(vllm_config)
+        if spec.block_size != main_spec.block_size:
+            raise ValueError("Step5 summary and main KV must use the same logical block size")
+        return replace(spec, page_size_padded=main_spec.page_size_bytes)
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [blocks, 1, block_size // 8, 256] -> [blocks, block_size // 8, 256]
@@ -122,6 +174,9 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
 
 
 __all__ = [
+    "AscendStep5SparseSummaryBackend",
+    "AscendStep5SparseSummaryMetadata",
+    "AscendStep5SparseSummaryMetadataBuilder",
     "AscendStep5SparseSummaryCache",
     "AscendStep5SparseSummaryCacheLayer",
 ]

@@ -70,7 +70,7 @@ def _replay_ring(Ring, base, first, last, dim, RING_CAPACITY: tl.constexpr):
     """Accumulate the ring rows at positions ``[first, last)`` in order."""
     numerator = tl.zeros((256,), tl.float32)
     denominator = tl.zeros((256,), tl.float32)
-    maximum = tl.max(tl.full((256,), -float("inf"), tl.float32), 0)
+    maximum = tl.full((), -float("inf"), tl.float32)
     for position in range(first, last):
         row = Ring + (base + position % RING_CAPACITY) * 512
         key = tl.load(row + dim).to(tl.float32)

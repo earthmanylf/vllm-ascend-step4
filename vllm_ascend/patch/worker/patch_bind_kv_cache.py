@@ -3,6 +3,8 @@ from collections.abc import Sequence
 import torch
 import vllm.v1.worker.utils as utils
 from vllm.model_executor.layers.attention import Attention
+from vllm.models.step5.nvidia.csa_tail_ring import Step5CSATailRing
+from vllm.models.step5.nvidia.sparse_summary_cache import Step5SparseSummaryCacheLayer
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.worker.utils import defaultdict, extract_layer_index
 
@@ -76,7 +78,7 @@ def bind_kv_cache_to_layers(
     """
     for layer_name, kv_cache in kv_caches.items():
         layer = forward_context[layer_name]
-        if isinstance(layer, DeepseekV41CacheLayer):
+        if isinstance(layer, (DeepseekV41CacheLayer, Step5SparseSummaryCacheLayer, Step5CSATailRing)):
             layer.bind_kv_cache(kv_cache)
         else:
             layer.kv_cache = kv_cache

@@ -60,7 +60,8 @@ def load_functions(filename, names, namespace):
 
 
 @pytest.mark.parametrize("region_len", [0, 2])
-def test_indexer_uses_current_tuple_api_and_preserves_fp8_summary_storage(region_len):
+@pytest.mark.parametrize("cache_rank", [3, 4])
+def test_indexer_uses_current_tuple_api_and_preserves_fp8_summary_storage(region_len, cache_rank):
     calls = []
 
     def native(query, weights, **kwargs):
@@ -80,6 +81,8 @@ def test_indexer_uses_current_tuple_api_and_preserves_fp8_summary_storage(region
     weights = torch.full((2, 1, 4), -0.5)
     storage = torch.zeros(3, 16, 1, 256, dtype=torch.uint8)
     mean = storage.view(torch.float8_e4m3fn)
+    if cache_rank == 3:
+        mean = mean.squeeze(2)
     qsl, seq = (
         torch.tensor([0, 2], dtype=torch.int32),
         torch.tensor([18], dtype=torch.int32),
@@ -98,6 +101,8 @@ def test_indexer_uses_current_tuple_api_and_preserves_fp8_summary_storage(region
     assert calls[0][0].dtype == torch.float8_e4m3fn
     kwargs = calls[0][2]
     assert kwargs["paged_key_summary"].data_ptr() == storage.data_ptr()
+    assert kwargs["paged_key_summary"].shape == (3, 16, 1, 256)
+    assert kwargs["paged_key_summary"].stride(0) == storage.stride(0)
     assert kwargs["cu_seq_lens"] is qsl and kwargs["actual_kv_lengths"] is seq
     assert (
         kwargs["mask_mode"],
@@ -349,6 +354,7 @@ def test_consumer_uses_paged_kv_and_request_varlen_without_flattening(path):
     output = torch.zeros(5, 8, 128)
     kwargs = dict(
         summary_cache=cache,
+        summary_metadata=types.SimpleNamespace(block_table=torch.tensor([[7], [9]], dtype=torch.int32)),
         md=md,
         query=torch.empty(total, 8, 128),
         key_cache=key,
@@ -365,6 +371,8 @@ def test_consumer_uses_paged_kv_and_request_varlen_without_flattening(path):
     _, inputs, _ = records[0]
     _, attn_inputs, _ = records[1]
     assert attn_inputs[1] is key and attn_inputs[2] is value
+    assert inputs[3].tolist() == ([[9]] if path == "prefill" else [[7]])
+    assert torch.equal(attn_inputs[5], d.block_table)
     assert inputs[3].shape[0] == 1 and inputs[4].tolist() == [0, total]
     assert inputs[5].tolist() == ([12] if path == "prefill" else [18])
     assert attn_inputs[6].tolist() == [0, total]

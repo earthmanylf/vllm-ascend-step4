@@ -26,9 +26,7 @@ def vllm_source_file(relative):
         return Path(source_root) / "vllm" / relative
     installed = importlib.util.find_spec("vllm")
     if installed is None or installed.origin is None:
-        raise RuntimeError(
-            "Install vLLM or set VLLM_SOURCE_ROOT to its source repository."
-        )
+        raise RuntimeError("Install vLLM or set VLLM_SOURCE_ROOT to its source repository.")
     return Path(installed.origin).parent / relative
 
 
@@ -47,10 +45,7 @@ class AttentionSpec:
     @property
     def page_size_bytes(self):
         return self.page_size_padded or (
-            self.block_size
-            * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
-            * self.dtype.itemsize
+            self.block_size * self.num_kv_heads * (self.head_size + self.head_size_v) * self.dtype.itemsize
         )
 
 
@@ -62,6 +57,10 @@ class SlidingWindowSpec(AttentionSpec):
     pass
 
 
+class CircularBufferSpec(AttentionSpec):
+    pass
+
+
 class UniformTypeKVCacheSpecs:
     def __init__(self, specs):
         self.kv_cache_specs = specs
@@ -69,6 +68,7 @@ class UniformTypeKVCacheSpecs:
 
 stub = ModuleType("vllm.v1.kv_cache_interface")
 stub.FullAttentionSpec = FullAttentionSpec
+stub.CircularBufferSpec = CircularBufferSpec
 stub.SlidingWindowSpec = SlidingWindowSpec
 stub.UniformTypeKVCacheSpecs = UniformTypeKVCacheSpecs
 module_spec = importlib.util.spec_from_file_location(
@@ -86,9 +86,7 @@ def config():
         model_config=NS(hf_text_config=NS(model_type="step5")),
         kv_transfer_config=None,
         additional_config={},
-        parallel_config=NS(
-            decode_context_parallel_size=1, prefill_context_parallel_size=1
-        ),
+        parallel_config=NS(decode_context_parallel_size=1, prefill_context_parallel_size=1),
         cache_config=NS(get_resolved_kv_cache_layout=lambda: layout),
     )
 
@@ -125,11 +123,7 @@ def caches():
 
 def extract(path, name, globals_dict):
     tree = ast.parse(path.read_text())
-    node = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
-    )
+    node = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
     exec(  # noqa: S102 - execute only the named function from the reviewed local source
         compile(
             ast.fix_missing_locations(
@@ -155,13 +149,294 @@ def extract(path, name, globals_dict):
 
 def shaped(raw, cfg):
     dims = (cfg.num_blocks, 128, 1, 192)
-    return {
-        name: tuple(part.view(torch.bfloat16).view(dims) for part in pair)
-        for name, pair in raw.items()
-    }
+    return {name: tuple(part.view(torch.bfloat16).view(dims) for part in pair) for name, pair in raw.items()}
+
+
+def sidecar_view(name, spec, raw, blocks, *, is_ring=False):
+    namespace = dict(torch=torch, get_dtype_size=lambda dtype: dtype.itemsize)
+    source = ROOT / "vllm_ascend/worker/utils.py"
+    namespace["row_major_strides"] = extract(source, "row_major_strides", {})
+    extract(source, "make_page_strided_cache_view", namespace)
+    view = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "view_step5_sidecar_cache", namespace)
+    return view(name, spec, raw, blocks, is_ring=is_ring)
 
 
 class SharedCacheTests(unittest.TestCase):
+    def test_tailring_shared_backing_uses_descriptor_offsets_and_one_allocation(self):
+        page = 98304
+        specs = {
+            "dsa": FullAttentionSpec(),
+            "summary": FullAttentionSpec(
+                head_size=256, head_size_v=0, dtype=torch.uint8, tokens_per_state=8, page_size_padded=page
+            ),
+            "ring": CircularBufferSpec(head_size=384, head_size_v=0),
+        }
+        groups = [NS(layer_names=[name], kv_cache_spec=spec) for name, spec in specs.items()]
+        kv = NS(
+            num_blocks=4,
+            kv_cache_groups=groups,
+            kv_cache_tensors=[
+                NS(
+                    size=4 * page,
+                    layers=[name],
+                    offset=0,
+                    layer_stride=4 * page,
+                    block_stride=page,
+                    host_resident=False,
+                )
+                for name in specs
+            ],
+        )
+        self.assertTrue(helper.supports_step5_tailring_shared_backing(config(), groups))
+        with patch.object(helper.torch, "zeros", wraps=torch.zeros) as allocation:
+            caches = helper.allocate_step5_tailring_shared_backing(kv, "cpu")
+        self.assertEqual(allocation.call_count, 1)
+        k, v = caches["dsa"]
+        self.assertEqual(k.stride(0), page // 2)
+        self.assertEqual(caches["summary"].shape, (4, 1, 16, 256))
+        self.assertEqual(caches["ring"].shape, (4, 1, 128, 384))
+        k[1].fill_(7)
+        v[1].fill_(9)
+        caches["summary"][2].fill_(11)
+        caches["ring"][3].fill_(13)
+        self.assertTrue(torch.all(k[1] == 7))
+        self.assertTrue(torch.all(v[1] == 9))
+        self.assertTrue(torch.all(caches["summary"][2] == 11))
+        self.assertTrue(torch.all(caches["ring"][3] == 13))
+        self.assertEqual(k.untyped_storage().nbytes(), 4 * page)
+        env = dict(
+            get_current_vllm_config=config,
+            supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
+            allocate_step5_tailring_shared_backing=helper.allocate_step5_tailring_shared_backing,
+        )
+        allocate = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "allocate_kv_cache_main", env)
+        allocated = allocate(kv, "cpu", None, [128] * 3)
+        self.assertEqual(allocated["summary"].shape, (4, 1, 16, 256))
+        env.update(get_kv_cache_groups=lambda *_: groups, UniformTypeKVCacheSpecs=UniformTypeKVCacheSpecs)
+        scale = extract(ROOT / "vllm_ascend/worker/worker.py", "_scale_kv_cache_memory_for_multi_group", env)
+        worker = NS(vllm_config=config(), get_kv_cache_spec=lambda: specs)
+        self.assertEqual(scale(worker, 123456), 123456)
+        for mutate in (
+            lambda c: setattr(c.kv_cache_tensors[0], "offset", -page),
+            lambda c: setattr(c.kv_cache_tensors[0], "block_stride", page // 2),
+            lambda c: setattr(c.kv_cache_tensors[0], "host_resident", True),
+        ):
+            invalid = copy.deepcopy(kv)
+            mutate(invalid)
+            with patch.object(helper.torch, "zeros", side_effect=AssertionError("validate before allocating")):
+                with self.assertRaises(ValueError):
+                    helper.allocate_step5_tailring_shared_backing(invalid, "cpu")
+
+    def test_step5_summary_page_view_preserves_padding_and_block_ids(self):
+        spec = NS(
+            dtype=torch.uint8,
+            num_heads=1,
+            num_states=16,
+            state_content_size_bytes=256,
+            page_size_bytes=8192,
+        )
+        raw = torch.full((3 * spec.page_size_bytes,), 91, dtype=torch.int8)
+        view = sidecar_view("summary", spec, raw, 3)
+        self.assertEqual(view.shape, (3, 1, 16, 256))
+        self.assertEqual(view.stride(0), spec.page_size_bytes)
+        view[1].fill_(12)
+        self.assertTrue(torch.all(raw[:8192] == 91))
+        self.assertTrue(torch.all(raw[8192:12288] == 12))
+        self.assertTrue(torch.all(raw[12288:] == 91))
+
+    def test_step5_ring_view_uses_typed_page_stride_and_rejects_short_storage(self):
+        spec = NS(
+            dtype=torch.bfloat16,
+            num_heads=1,
+            num_states=128,
+            state_content_size_bytes=768,
+            page_size_bytes=98304,
+        )
+        raw = torch.zeros(3 * spec.page_size_bytes, dtype=torch.int8)
+        view = sidecar_view("ring", spec, raw, 3)
+        self.assertEqual(view.shape, (3, 1, 128, 384))
+        self.assertEqual(view.stride(0), 49152)
+        self.assertEqual(view[0].numel() // 512, 96)
+        with self.assertRaises(ValueError):
+            sidecar_view("ring", spec, raw[:-1], 3)
+        with self.assertRaises(ValueError):
+            sidecar_view("ring", spec, raw[:98304], 3)
+
+    def test_reshape_step5_sidecar_does_not_require_backend_shape_hook(self):
+        spec = FullAttentionSpec(
+            head_size=256,
+            head_size_v=0,
+            dtype=torch.uint8,
+            num_heads=1,
+            num_states=16,
+            state_content_size_bytes=256,
+            page_size_padded=8192,
+        )
+        kv = NS(num_blocks=3, kv_cache_groups=[NS(layer_names=["summary"])])
+        backend = NS(get_name=lambda: "STEP5_CSA_SUMMARY")
+        group = NS(kv_cache_group_id=0, kv_cache_spec=spec, layer_names=["summary"], backend=backend)
+        unused = type("UnusedSpec", (), {})
+        env = dict(
+            torch=torch,
+            get_current_vllm_config=config,
+            _is_dsv4_model=lambda _: False,
+            is_deepseek_v41_cache=lambda _: False,
+            _get_layer_kv_cache_specs=lambda _: {"summary": spec},
+            get_storage_block_size=lambda s: s.block_size,
+            FullAttentionSpec=FullAttentionSpec,
+            AttentionSpec=AttentionSpec,
+            is_c8_mxfp_kv_quant=lambda _: False,
+            is_hidden_state_cache_spec=lambda _: False,
+            AscendSFAIndexerCacheSpec=unused,
+            AscendIndexerKPoolTailSpec=unused,
+            AscendMLAAttentionSpec=unused,
+            AscendSlidingWindowMLASpec=unused,
+            MambaSpec=unused,
+            get_single_raw_mla_backing=lambda _: None,
+            view_step5_sidecar_cache=sidecar_view,
+        )
+        reshape = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "_reshape_kv_cache_v2", env)
+        raw = torch.zeros(3 * spec.page_size_bytes, dtype=torch.int8)
+        cache = reshape([group], {"summary": raw}, "auto", [128], {}, kv)["summary"]
+        self.assertIsInstance(cache, torch.Tensor)
+        self.assertEqual(cache.shape, (3, 1, 16, 256))
+        self.assertEqual(cache.stride(0), 8192)
+
+    def test_allocator_step5_sidecars_use_one_tensor_per_layer(self):
+        spec = AttentionSpec(head_size=256, head_size_v=0, dtype=torch.uint8)
+        specs = {"summary": spec, "ring": spec}
+        cfg = config()
+        layers = {name: NS(get_attn_backend=lambda: NS(get_name=lambda: "STEP5_CSA_SUMMARY")) for name in specs}
+        descriptor = NS(layers=list(specs), layer_stride=spec.page_size_bytes * 3)
+        kv = NS(
+            num_blocks=3,
+            kv_cache_groups=[NS(layer_names=list(specs))],
+            kv_cache_tensors=[descriptor],
+        )
+        unused = type("UnusedSpec", (), {})
+        env = dict(
+            torch=torch,
+            get_current_vllm_config=lambda: cfg,
+            KVPPConfig=NS(from_vllm_config=lambda _: NS(size=1)),
+            supports_step5_shared_kv_backing=lambda *_: False,
+            _is_dsv4_model=lambda _: False,
+            _get_layer_kv_cache_specs=lambda _: specs,
+            is_deepseek_v41_cache=lambda _: False,
+            MambaSpec=unused,
+            AttentionSpec=AttentionSpec,
+            AscendSFAIndexerCacheSpec=unused,
+            AscendIndexerKPoolTailSpec=unused,
+            get_layerwise_reuse_config=lambda _: None,
+            get_kv_cache_tensor_layers=lambda d: d.layers,
+            get_layers_from_vllm_config=lambda *_: layers,
+            AttentionLayerBase=object,
+            _allocate_int8_cache_tensor=lambda size, _, device: torch.zeros(size, dtype=torch.int8, device=device),
+            is_hidden_state_cache_spec=lambda _: False,
+            _uses_single_raw_mla_cache=lambda *_: False,
+            enable_sfa=lambda _: False,
+            FullAttentionSpec=FullAttentionSpec,
+            is_c8_mxfp_kv_quant=lambda _: False,
+            requires_contiguous_pa_kv_cache=lambda *_: False,
+            _get_attention_kv_cache_dims=lambda *_: (256, 0),
+            enable_fa_quant=lambda _: False,
+            calc_split_factor=lambda _: (_ for _ in ()).throw(ZeroDivisionError("zero V must not be split")),
+        )
+        allocator = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "_allocate_kv_cache", env)
+        raw = allocator(kv, {}, torch.device("cpu"))
+        for cache in raw.values():
+            self.assertIsInstance(cache, torch.Tensor)
+            self.assertEqual(cache.numel(), 3 * spec.page_size_bytes)
+        self.assertNotEqual(raw["summary"].data_ptr(), raw["ring"].data_ptr())
+
+    def test_real_ring_binding_addresses_each_manager_page(self):
+        spec = NS(
+            dtype=torch.bfloat16,
+            num_heads=1,
+            num_states=128,
+            state_content_size_bytes=768,
+            page_size_bytes=98304,
+        )
+        raw = torch.zeros(3 * spec.page_size_bytes, dtype=torch.int8)
+        cache = sidecar_view("ring", spec, raw, 3)
+        binder = extract(
+            vllm_source_file("models/step5/nvidia/csa_tail_ring.py"),
+            "bind_kv_cache",
+            {"torch": torch, "_ROW_ELEMENTS": 512},
+        )
+        ring = NS()
+        binder(ring, cache)
+        self.assertEqual(ring.capacity, 96)
+        self.assertEqual(ring.rows_per_block, 96)
+        self.assertEqual(ring.rows.shape, (288, 512))
+        ring.rows[96].fill_(17)
+        self.assertTrue(torch.all(cache[1].flatten()[:512] == 17))
+        self.assertTrue(torch.all(cache[0] == 0))
+        self.assertTrue(torch.all(cache[2] == 0))
+
+    def test_ring_padding_is_rejected_before_metadata_capacity_can_diverge(self):
+        spec = NS(
+            dtype=torch.bfloat16,
+            num_heads=1,
+            num_states=128,
+            state_content_size_bytes=768,
+            page_size_bytes=196608,
+        )
+        raw = torch.zeros(3 * spec.page_size_bytes, dtype=torch.int8)
+        with self.assertRaisesRegex(ValueError, "ring.*padding"):
+            sidecar_view("ring", spec, raw, 3, is_ring=True)
+
+    def test_sidecar_filter_keeps_original_descriptor_layer_offsets(self):
+        class StateSpec:
+            page_size_bytes = 98304
+
+        dense = FullAttentionSpec()
+        summary = AttentionSpec(head_size=256, head_size_v=0, dtype=torch.uint8)
+        specs = {"summary": summary, "attention": dense, "state": StateSpec()}
+        size = dense.page_size_bytes * 3
+        descriptors = [
+            NS(
+                layers=["summary", "attention"],
+                size=2 * size,
+                offset=0,
+                layer_stride=size,
+                block_stride=dense.page_size_bytes,
+            ),
+            NS(layers=["state"], size=2 * size, offset=0, layer_stride=size, block_stride=dense.page_size_bytes),
+        ]
+        cfg = config()
+        layers = {
+            "summary": NS(get_attn_backend=lambda: NS(get_name=lambda: "STEP5_CSA_SUMMARY")),
+            "attention": NS(get_attn_backend=lambda: NS(get_name=lambda: "ASCEND")),
+            "state": NS(get_attn_backend=lambda: NS(get_name=lambda: "MAMBA")),
+        }
+        kv = NS(num_blocks=3, kv_cache_tensors=descriptors, kv_cache_groups=[NS(layer_names=list(specs))])
+        unused = type("UnusedSpec", (), {})
+        env = dict(
+            torch=torch,
+            get_current_vllm_config=lambda: cfg,
+            KVPPConfig=NS(from_vllm_config=lambda _: NS(size=1)),
+            supports_step5_shared_kv_backing=lambda *_: False,
+            _is_dsv4_model=lambda _: False,
+            _get_layer_kv_cache_specs=lambda _: specs,
+            is_deepseek_v41_cache=lambda _: False,
+            MambaSpec=StateSpec,
+            AttentionSpec=AttentionSpec,
+            AscendSFAIndexerCacheSpec=unused,
+            AscendIndexerKPoolTailSpec=unused,
+            AttentionLayerBase=object,
+            get_layerwise_reuse_config=lambda _: None,
+            get_kv_cache_tensor_layers=lambda d: d.layers,
+            get_layers_from_vllm_config=lambda *_: layers,
+            _allocate_int8_cache_tensor=lambda count, _, device: torch.zeros(count, dtype=torch.int8, device=device),
+            is_hidden_state_cache_spec=lambda _: False,
+        )
+        allocator = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "_allocate_kv_cache", env)
+        raw = allocator(kv, {}, torch.device("cpu"))
+        self.assertEqual(raw["attention"].data_ptr() - raw["state"].data_ptr(), size)
+        raw["attention"].fill_(19)
+        self.assertTrue(torch.all(raw["state"] == 0))
+        self.assertTrue(torch.all(raw["summary"] == 0))
+
     def test_budget_and_allocator_use_same_predicate(self):
         cfg = config()
         kv = caches()
@@ -171,18 +446,15 @@ class SharedCacheTests(unittest.TestCase):
             "get_current_vllm_config": lambda: cfg,
             "KVPPConfig": NS(from_vllm_config=lambda _: NS(size=1)),
         }
-        allocator = extract(
-            ROOT / "vllm_ascend/worker/v2/attn_utils.py", "_allocate_kv_cache", env
-        )
+        allocator = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "_allocate_kv_cache", env)
         raw = allocator(kv, {}, torch.device("cpu"))
         self.assertEqual(
-            len(
-                {x.untyped_storage().data_ptr() for pair in raw.values() for x in pair}
-            ),
+            len({x.untyped_storage().data_ptr() for pair in raw.values() for x in pair}),
             1,
         )
         env.update(
             get_kv_cache_groups=lambda *_: kv.kv_cache_groups,
+            supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
             UniformTypeKVCacheSpecs=UniformTypeKVCacheSpecs,
         )
         budget = extract(
@@ -215,14 +487,34 @@ class SharedCacheTests(unittest.TestCase):
         self.assertTrue(torch.all(views["swa1"][1] == 0))
         self.assertEqual(raw["dsa0"][0].data_ptr(), raw["swa0"][0].data_ptr())
 
+    def test_overlaid_block_copy_is_independent_of_view_order(self):
+        page_elements = 128 * 192 * 2
+        for summary_first in (True, False):
+            raw = torch.zeros(4 * page_elements, dtype=torch.bfloat16)
+            k = raw.as_strided((4, 128, 1, 192), (page_elements, 192, 192, 1))
+            v = raw.as_strided((4, 128, 1, 192), (page_elements, 192, 192, 1), 128 * 192)
+            summary = raw.view(torch.uint8).as_strided((4, 1, 16, 256), (page_elements * 2, 4096, 256, 1))
+            ring = raw.as_strided((4, 1, 128, 384), (page_elements, page_elements, 384, 1))
+            k[1].fill_(7)
+            v[1].fill_(11)
+            k[2].fill_(17)
+            v[2].fill_(19)
+            original = raw.clone().reshape(4, page_elements)
+            entries = [summary, (k, v), ring] if summary_first else [(k, v), ring, summary]
+            copy_blocks = extract(ROOT / "vllm_ascend/worker/utils.py", "copy_kv_cache_blocks_inplace", {"torch": torch})
+            copy_blocks(entries, 4, [NS(src_block_id=1, dst_block_id=2), NS(src_block_id=2, dst_block_id=3)])
+            actual = raw.reshape(4, page_elements)
+            self.assertTrue(torch.equal(actual[0], original[0]))
+            self.assertTrue(torch.equal(actual[1], original[1]))
+            self.assertTrue(torch.equal(actual[2], original[1]))
+            self.assertTrue(torch.equal(actual[3], original[2]))
+
     def test_only_one_backing_has_exact_upstream_size(self):
         kv = caches()
         with patch.object(helper.torch, "zeros", wraps=torch.zeros) as allocate:
             raw = helper.allocate_step5_shared_kv_backing(kv, "cpu")
         self.assertEqual(allocate.call_count, 1)
-        self.assertEqual(
-            raw["mtp"][0].untyped_storage().nbytes(), kv.kv_cache_tensors[0].size
-        )
+        self.assertEqual(raw["mtp"][0].untyped_storage().nbytes(), kv.kv_cache_tensors[0].size)
 
     def test_original_reshape_consumes_pairs_without_block_interleaving(self):
         kv = caches()
@@ -232,9 +524,7 @@ class SharedCacheTests(unittest.TestCase):
             "get_current_vllm_config": config,
             "_is_dsv4_model": lambda _: False,
             "is_deepseek_v41_cache": lambda _: False,
-            "_get_layer_kv_cache_specs": lambda _: helper._layer_specs(
-                kv.kv_cache_groups
-            ),
+            "_get_layer_kv_cache_specs": lambda _: helper._layer_specs(kv.kv_cache_groups),
             "get_storage_block_size": lambda spec: spec.block_size,
             "get_kv_cache_compression_ratio": lambda _: 1,
             "is_hidden_state_cache_spec": lambda _: False,
@@ -242,27 +532,30 @@ class SharedCacheTests(unittest.TestCase):
             "AscendIndexerKPoolTailSpec": unused,
             "MambaSpec": unused,
             "AttentionSpec": AttentionSpec,
+            "FullAttentionSpec": FullAttentionSpec,
+            "is_c8_mxfp_kv_quant": lambda _: False,
+            "AscendSlidingWindowMLASpec": unused,
+            "get_single_raw_mla_backing": lambda _: None,
             "AscendMLAAttentionSpec": unused,
             "MLAAttentionSpec": unused,
             "enable_sfa": lambda _: False,
             "torch": torch,
         }
-        reshape = extract(
-            ROOT / "vllm_ascend/worker/v2/attn_utils.py", "_reshape_kv_cache_v2", env
-        )
+        reshape = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "_reshape_kv_cache_v2", env)
         groups = [
             NS(
                 kv_cache_group_id=i,
                 kv_cache_spec=g.kv_cache_spec,
                 layer_names=g.layer_names,
                 backend=NS(
+                    get_name=lambda: "ASCEND_STEP5_DSA",
                     get_kv_cache_shape=lambda blocks, bs, heads, dim, _: (
                         2,
                         blocks,
                         bs,
                         heads,
                         dim,
-                    )
+                    ),
                 ),
             )
             for i, g in enumerate(kv.kv_cache_groups)
@@ -296,26 +589,16 @@ class SharedCacheTests(unittest.TestCase):
         self.assertTrue(torch.all(views["dsa1"][0][2] == 21))
         self.assertTrue(torch.all(views["dsa1"][1][2] == 22))
 
-    def test_real_zeroer_retains_group_sidecar_hooks_without_main_writes(self):
+    def test_real_zeroer_without_segments_does_not_write_main_cache(self):
         kv = caches()
         raw = helper.allocate_step5_shared_kv_backing(kv, "cpu")
         for pair in raw.values():
             for tensor in pair:
                 tensor.fill_(7)
-        sidecache = torch.full((kv.num_blocks,), 42, dtype=torch.int64)
-        zeroer = NS(
-            _meta=None,
-            device="cpu",
-            _side_storage_zero_hooks={
-                0: [lambda ids: sidecache.index_fill_(0, ids, 0)]
-            },
-        )
+        zeroer = NS(_meta=None, device="cpu")
         source = vllm_source_file("v1/worker/utils.py")
-        zero = extract(
-            source, "zero_block_ids", {"async_tensor_h2d": torch.tensor, "torch": torch}
-        )
-        zero(zeroer, [1, 2], [[1], [2], []])
-        self.assertEqual(sidecache.tolist(), [42, 0, 42, 42])
+        zero = extract(source, "zero_block_ids", {"async_tensor_h2d": torch.tensor, "torch": torch})
+        zero(zeroer, [1, 2])
         for pair in raw.values():
             self.assertTrue(all(torch.all(tensor == 7) for tensor in pair))
 
@@ -332,55 +615,33 @@ class SharedCacheTests(unittest.TestCase):
 
     def test_geometry_model_runner_and_layout_mismatch_fallback(self):
         kv = caches()
-        self.assertTrue(
-            helper.supports_step5_shared_kv_backing(config(), kv.kv_cache_groups)
-        )
+        self.assertTrue(helper.supports_step5_shared_kv_backing(config(), kv.kv_cache_groups))
         cases = [
             lambda c, k: setattr(c, "use_v2_model_runner", False),
-            lambda c, k: setattr(
-                c.model_config.hf_text_config, "model_type", "step3p5"
-            ),
+            lambda c, k: setattr(c.model_config.hf_text_config, "model_type", "step3p5"),
             lambda c, k: setattr(c, "kv_transfer_config", object()),
             lambda c, k: c.additional_config.update(enable_kvpp=True),
-            lambda c, k: c.additional_config.update(
-                sparse_kv_offload_config={"enabled": True}
-            ),
+            lambda c, k: c.additional_config.update(sparse_kv_offload_config={"enabled": True}),
             lambda c, k: setattr(c.parallel_config, "decode_context_parallel_size", 2),
-            lambda c, k: setattr(
-                c.cache_config.get_resolved_kv_cache_layout(), "is_block_compact", False
-            ),
+            lambda c, k: setattr(c.cache_config.get_resolved_kv_cache_layout(), "is_block_compact", False),
             lambda c, k: setattr(k.kv_cache_groups[1].kv_cache_spec, "num_kv_heads", 2),
-            lambda c, k: setattr(
-                k.kv_cache_groups[1].kv_cache_spec, "dtype", torch.float16
-            ),
+            lambda c, k: setattr(k.kv_cache_groups[1].kv_cache_spec, "dtype", torch.float16),
             lambda c, k: setattr(k.kv_cache_groups[1].kv_cache_spec, "block_size", 256),
-            lambda c, k: setattr(
-                k.kv_cache_groups[1].kv_cache_spec, "page_size_padded", 196608
-            ),
-            lambda c, k: setattr(
-                k.kv_cache_groups[1].kv_cache_spec, "kv_quant_mode", 1
-            ),
+            lambda c, k: setattr(k.kv_cache_groups[1].kv_cache_spec, "page_size_padded", 196608),
+            lambda c, k: setattr(k.kv_cache_groups[1].kv_cache_spec, "kv_quant_mode", 1),
         ]
         for mutate in cases:
             c, k = config(), caches()
             mutate(c, k)
-            self.assertFalse(
-                helper.supports_step5_shared_kv_backing(c, k.kv_cache_groups)
-            )
+            self.assertFalse(helper.supports_step5_shared_kv_backing(c, k.kv_cache_groups))
 
     def test_uniform_group_preserves_per_layer_geometry_checks(self):
         kv = caches()
         group = kv.kv_cache_groups[0]
-        group.kv_cache_spec = UniformTypeKVCacheSpecs(
-            {name: FullAttentionSpec() for name in group.layer_names}
-        )
-        self.assertTrue(
-            helper.supports_step5_shared_kv_backing(config(), kv.kv_cache_groups)
-        )
+        group.kv_cache_spec = UniformTypeKVCacheSpecs({name: FullAttentionSpec() for name in group.layer_names})
+        self.assertTrue(helper.supports_step5_shared_kv_backing(config(), kv.kv_cache_groups))
         group.kv_cache_spec.kv_cache_specs["dsa1"].head_size = 128
-        self.assertFalse(
-            helper.supports_step5_shared_kv_backing(config(), kv.kv_cache_groups)
-        )
+        self.assertFalse(helper.supports_step5_shared_kv_backing(config(), kv.kv_cache_groups))
 
     def test_host_resident_group_falls_back_before_descriptor_validation(self):
         for group_index in range(3):
@@ -388,9 +649,7 @@ class SharedCacheTests(unittest.TestCase):
             kv.kv_cache_groups[group_index].host_resident = True
             # Descriptors remain device-resident and otherwise valid. The
             # budget gate itself must reject the host-resident group.
-            self.assertFalse(
-                helper.supports_step5_shared_kv_backing(config(), kv.kv_cache_groups)
-            )
+            self.assertFalse(helper.supports_step5_shared_kv_backing(config(), kv.kv_cache_groups))
 
     def test_common_backing_rejects_empty_negative_and_partial_layer_slots(self):
         reference = caches().kv_cache_tensors[0].size

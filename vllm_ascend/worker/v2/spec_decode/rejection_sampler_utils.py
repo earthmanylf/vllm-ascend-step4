@@ -301,7 +301,18 @@ def rejection_sample(
     synthetic_conditional_rates: torch.Tensor | None = None,
     use_fp64: bool = False,
     use_block_verification: bool = False,
+    contexts: torch.Tensor | None = None,
+    watermarking: torch.Tensor | None = None,
+    watermarking_skip_mask: torch.Tensor | None = None,
+    watermark_key: int | None = None,
+    fly_window_size: int = 0,
+    fly_entropy_threshold: float = 0.3,
+    fly_entropy_top_k: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if fly_window_size != 0:
+        raise NotImplementedError("FLY rejection sampling is not supported on NPU.")
+    if any(value is not None for value in (contexts, watermarking, watermarking_skip_mask, watermark_key)):
+        raise NotImplementedError("Watermarked rejection sampling is not supported on NPU.")
     if use_fp64:
         raise NotImplementedError("FP64 rejection sampling is not supported on NPU.")
     if use_block_verification:
@@ -354,7 +365,7 @@ def rejection_sample(
         expanded_local_pos,
         temperature,
         vocab_size,
-        num_speculative_steps,
+        num_logits,
         BLOCK_SIZE=VOCAB_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
         # TODO: Remove this workaround after the Triton Ascend AutoBlockify

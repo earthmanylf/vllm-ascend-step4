@@ -88,7 +88,9 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.core.step5_kv_cache import (
     allocate_step5_shared_kv_backing,
+    allocate_step5_tailring_shared_backing,
     supports_step5_shared_kv_backing,
+    supports_step5_tailring_shared_backing,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -1135,8 +1137,28 @@ def _allocate_kv_cache(
                 kv_cache_raw_tensors[layer_name] = raw_tensor
             continue
 
+        descriptor_layer_indices = {name: index for index, name in enumerate(shared_names)}
         example_layer_name = shared_names[0]
         example_spec = layer_kv_cache_spec[example_layer_name]
+
+        if getattr(vllm_config.model_config.hf_text_config, "model_type", None) == "step5":
+            if attn_layers is None:
+                attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+            sidecar_names = [
+                name
+                for name in shared_names
+                if name in attn_layers
+                and attn_layers[name].get_attn_backend().get_name() in ("STEP5_CSA_SUMMARY", "STEP5_CSA_TAIL_RING")
+            ]
+            for name in sidecar_names:
+                kv_cache_raw_tensors[name] = _allocate_int8_cache_tensor(
+                    kv_cache_config.num_blocks * layer_kv_cache_spec[name].page_size_bytes, alignment, device
+                )
+            shared_names = [name for name in shared_names if name not in sidecar_names]
+            if not shared_names:
+                continue
+            example_layer_name = shared_names[0]
+            example_spec = layer_kv_cache_spec[example_layer_name]
 
         # extract_hidden_states dumps are live at the same time as the target
         # model's Attention/Mamba caches. Keep HiddenStateCacheSpec off the
@@ -1153,7 +1175,7 @@ def _allocate_kv_cache(
                     )
                     continue
                 layer_size = kv_cache_config.num_blocks * layer_spec.page_size_bytes
-                start = kv_cache_tensor.offset + layer_idx * kv_cache_tensor.layer_stride
+                start = kv_cache_tensor.offset + descriptor_layer_indices[layer_name] * kv_cache_tensor.layer_stride
                 end = start + layer_size
                 if end > hybrid_backing.numel():
                     raise ValueError(f"Hybrid KV cache view for {layer_name} exceeds the backing allocation.")
@@ -1175,7 +1197,7 @@ def _allocate_kv_cache(
                         f"{kv_cache_tensor.block_stride}, page_size="
                         f"{layer_spec.page_size_bytes}."
                     )
-                start = kv_cache_tensor.offset + layer_idx * kv_cache_tensor.layer_stride
+                start = kv_cache_tensor.offset + descriptor_layer_indices[layer_name] * kv_cache_tensor.layer_stride
                 end = start + layer_size
                 if end > hybrid_backing.numel():
                     raise ValueError(f"Hybrid KV cache view for {layer_name} exceeds the backing allocation.")
@@ -1358,6 +1380,8 @@ def allocate_kv_cache_main(
     """
     del layout
     vllm_config = get_current_vllm_config()
+    if supports_step5_tailring_shared_backing(vllm_config, kv_cache_config.kv_cache_groups):
+        return allocate_step5_tailring_shared_backing(kv_cache_config, device)
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
     shared_layers = {
         layer_name: target_layer
@@ -1426,6 +1450,36 @@ def _reshape_mamba_kv_cache(
     )
 
 
+def view_step5_sidecar_cache(
+    layer_name: str,
+    spec: KVCacheSpec,
+    raw_cache: torch.Tensor,
+    required_blocks: int,
+    *,
+    is_ring: bool = False,
+) -> torch.Tensor:
+    """View Step5 summary/ring states in manager-page coordinates."""
+    if not isinstance(raw_cache, torch.Tensor) or raw_cache.element_size() != 1:
+        raise ValueError(f"Step5 sidecar {layer_name} requires one byte tensor.")
+    page_bytes = spec.page_size_bytes
+    dtype_bytes = get_dtype_size(spec.dtype)
+    content_bytes = spec.state_content_size_bytes
+    if page_bytes <= 0 or page_bytes % dtype_bytes or content_bytes % dtype_bytes:
+        raise ValueError(f"Step5 sidecar {layer_name} has an unaligned page or state.")
+    if raw_cache.numel() % page_bytes:
+        raise ValueError(f"Step5 sidecar {layer_name} must contain whole pages.")
+    num_blocks = raw_cache.numel() // page_bytes
+    if num_blocks < required_blocks:
+        raise ValueError(f"Step5 sidecar {layer_name} has fewer blocks than KVCacheManager.")
+    shape = (num_blocks, spec.num_heads, spec.num_states, content_bytes // dtype_bytes)
+    payload_bytes = spec.num_heads * spec.num_states * content_bytes
+    if payload_bytes > page_bytes:
+        raise ValueError(f"Step5 sidecar {layer_name} states exceed the physical page.")
+    if is_ring and payload_bytes != page_bytes:
+        raise ValueError(f"Step5 ring {layer_name} does not support page padding.")
+    return make_page_strided_cache_view(raw_cache, shape, spec.dtype, page_bytes)
+
+
 def _reshape_kv_cache_v2(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, Any],
@@ -1481,6 +1535,19 @@ def _reshape_kv_cache_v2(
                 continue
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+            if group.backend.get_name() in ("STEP5_CSA_SUMMARY", "STEP5_CSA_TAIL_RING"):
+                raw_cache = kv_cache_raw_tensors[layer_name]
+                if isinstance(raw_cache, tuple) and len(raw_cache) == 1:
+                    raw_cache = raw_cache[0]
+                kv_caches[layer_name] = view_step5_sidecar_cache(
+                    layer_name,
+                    kv_cache_spec,
+                    raw_cache,
+                    kv_cache_config.num_blocks,
+                    is_ring=group.backend.get_name() == "STEP5_CSA_TAIL_RING",
+                )
+                continue
 
             if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
                 raw_cache = kv_cache_raw_tensors[layer_name]

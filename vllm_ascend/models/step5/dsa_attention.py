@@ -36,7 +36,7 @@ from vllm_ascend.models.step5.generic_block_sparse_attention import (
     gbsa_sparse_attention_metadata,
 )
 from vllm_ascend.models.step5.indexer_region_score import indexer_score_topk
-from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache
+from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache, AscendStep5SparseSummaryMetadata
 from vllm_ascend.models.step5.summary_kernels import build_prefill_groups
 
 logger = init_logger(__name__)
@@ -69,7 +69,7 @@ class AscendStep5DSABackend(AttentionBackend):
         return [128, 192]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec: AttentionSpec | None = None) -> list[int | MultipleOf]:
         # Unify with the sliding-window layers' backend (AscendAttentionBackend
         # declares [128]) and the scheduler block size: with hybrid virtual
         # block splitting the runner reshapes the owner KV tensor to this
@@ -330,11 +330,15 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
         block_table = common_attn_metadata.block_table_tensor
         qsl_cpu = common_attn_metadata.query_start_loc_cpu
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
-            common_attn_metadata,
-            decode_threshold=self.reorder_batch_threshold,
-            require_uniform=True,
-        )
+        # The upstream uniform splitter indexes the first query length.
+        if common_attn_metadata.num_reqs == 0:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = 0, 0, 0, 0
+        else:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=True,
+            )
 
         prefill_metadata: AscendStep5DSAPrefillMetadata | None = None
         active_prefills = 0
@@ -479,7 +483,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         self._decode_out_dtype = decode_out_dtype or torch.bfloat16
         # Selector width: every region a max-length sequence can fill.
         self._max_regions = -(-self.max_model_len // self.region_size)
-        self._summary_cache: AscendStep5SparseSummaryCache | None = None
+        self.summary_cache: AscendStep5SparseSummaryCache | None = None
+        self.summary_layer_name: str | None = None
         # Injected by the model (mirrors upstream model.py): the ring that
         # carries each request's open-region rows and addresses the summary
         # updates. Created with the model so memory profiling counts it.
@@ -556,7 +561,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         cache layer and the summary is written straight into ``mean``.
         """
         if initialize_runtime_state:
-            self._summary_cache = summary_cache
+            self.summary_cache = summary_cache
 
     # -- SWF summary producer -------------------------------------------------
 
@@ -564,51 +569,41 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         self,
         *,
         summary_cache: AscendStep5SparseSummaryCache,
+        summary_metadata: AscendStep5SparseSummaryMetadata,
         md: AscendStep5DSAMetadata,
         index_k: torch.Tensor,
         index_z: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        """Update all requests before any indexer consumes their summaries.
-
-        Speculative requests always use the persistent journal, including
-        one-token windows. Long/mixed batches are restored first, then their
-        non-journal prefix is folded, then their last W rows are journaled.
-        The cache owns that three-phase ordering, identical to fixed SWF.
-        """
+        """Update summaries with token-local ring metadata for each batch part."""
         num_tokens = int(md.num_actual_tokens)
         if num_tokens <= 0:
             return
         key = index_k[:num_tokens].contiguous()
         z = index_z[:num_tokens].contiguous()
-        slots = md.slot_mapping[:num_tokens]
+        slots = summary_metadata.slot_mapping[:num_tokens]
         ring = self.csa_ring
         if ring is None:
             raise RuntimeError("Step5 DSA requires the CSA tail ring to be bound before the summary update")
-        if self.num_speculative_tokens > 0:
-            # MTP verify: one program per request fills its open region in
-            # order. A region closed by a rejected draft is summarized again
-            # when it recloses, so no undo journal is needed.
-            summary_cache.update_verify(
-                key,
-                z,
-                slots,
-                md.query_start_loc,
-                md.seq_lens,
-                ring,
-            )
-            return
         decode_rows = int(md.num_decode_tokens) if md.decode is not None else 0
         if decode_rows:
-            # positions are 0-based context offsets; the last token of each
-            # decode request sits at seq_len - 1.
-            summary_cache.update_decode(
-                key[:decode_rows],
-                z[:decode_rows],
-                slots[:decode_rows],
-                (md.seq_lens[:decode_rows] - 1).to(torch.int64),
-                ring,
-            )
+            if md.decode.query_len > 1:
+                summary_cache.update_verify(
+                    key[:decode_rows],
+                    z[:decode_rows],
+                    slots[:decode_rows],
+                    md.query_start_loc[: md.num_decodes + 1],
+                    md.seq_lens[: md.num_decodes],
+                    ring,
+                )
+            else:
+                summary_cache.update_decode(
+                    key[:decode_rows],
+                    z[:decode_rows],
+                    slots[:decode_rows],
+                    positions[:decode_rows],
+                    ring,
+                )
         if md.num_prefills > 0:
             # Local QSL matches local key/z rows. Grouping is device-only and
             # uses true positions, including chunked partial-region tails.
@@ -627,6 +622,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 metadata,
                 positions[decode_rows:num_tokens],
                 ring,
+                token_offset=decode_rows,
             )
 
     @staticmethod
@@ -640,6 +636,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         self,
         *,
         summary_cache: AscendStep5SparseSummaryCache,
+        summary_metadata: AscendStep5SparseSummaryMetadata,
         md: AscendStep5DSAMetadata,
         query: torch.Tensor,
         key_cache: torch.Tensor,
@@ -679,7 +676,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             index_q[:n],
             weights[:n],
             summary_cache.mean.view(torch.float8_e4m3fn),
-            d.block_table,
+            summary_metadata.block_table[:n],
             cu_seq_lens,
             actual_kv_lengths,
             max_region_len=self._max_regions,
@@ -706,6 +703,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         self,
         *,
         summary_cache: AscendStep5SparseSummaryCache,
+        summary_metadata: AscendStep5SparseSummaryMetadata,
         md: AscendStep5DSAMetadata,
         query: torch.Tensor,
         key_cache: torch.Tensor,
@@ -755,7 +753,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             index_q[:total_tokens],
             weights[:total_tokens],
             summary_cache.mean.view(torch.float8_e4m3fn),
-            decode_md.block_table[:num_decodes],
+            summary_metadata.block_table[:num_decodes],
             cu_seq_lens,
             actual_kv_lengths,
             max_region_len=self._max_regions,
@@ -782,6 +780,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         self,
         *,
         summary_cache: AscendStep5SparseSummaryCache,
+        summary_metadata: AscendStep5SparseSummaryMetadata,
         md: AscendStep5DSAMetadata,
         query: torch.Tensor,
         key_cache: torch.Tensor,
@@ -827,7 +826,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             index_q[:num_query_tokens],
             weights[:num_query_tokens],
             summary_cache.mean.view(torch.float8_e4m3fn),
-            p.block_table[:num_reqs],
+            summary_metadata.block_table[md.num_decodes : md.num_decodes + num_reqs],
             cu_seq_lens,
             actual_kv_lengths,
             max_region_len=width,
@@ -869,15 +868,25 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         if not isinstance(md, AscendStep5DSAMetadata):
             return output.zero_()
 
-        summary_cache = self._summary_cache
+        summary_cache = self.summary_cache
         if summary_cache is None:
             raise RuntimeError(
                 "Step5 sparse summary cache must be bound during KV cache initialization before attention forward."
             )
         num_tokens = md.num_actual_tokens
+        output[num_tokens:].zero_()
+        if num_tokens == 0:
+            return output
+
+        summary_metadata = attn_metadata.get(self.summary_layer_name)
+        if not isinstance(summary_metadata, AscendStep5SparseSummaryMetadata):
+            raise RuntimeError(
+                f"Step5 summary group metadata is missing or invalid for layer {self.summary_layer_name!r}."
+            )
 
         self._maybe_update_summary_cache(
             summary_cache=summary_cache,
+            summary_metadata=summary_metadata,
             md=md,
             index_k=index_k,
             index_z=index_z,
@@ -898,6 +907,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 total = n * decode_query_len
                 self._forward_sparse_gqa_verify(
                     summary_cache=summary_cache,
+                    summary_metadata=summary_metadata,
                     md=md,
                     query=query[:total].contiguous(),
                     key_cache=key_cache,
@@ -910,6 +920,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             else:
                 self._forward_sparse_gqa_decode(
                     summary_cache=summary_cache,
+                    summary_metadata=summary_metadata,
                     md=md,
                     query=query[:n].contiguous(),
                     key_cache=key_cache,
@@ -923,6 +934,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             start = md.num_decode_tokens
             self._forward_sparse_gqa_prefill(
                 summary_cache=summary_cache,
+                summary_metadata=summary_metadata,
                 md=md,
                 query=query[start:num_tokens].contiguous(),
                 key_cache=key_cache,

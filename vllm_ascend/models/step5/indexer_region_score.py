@@ -17,6 +17,7 @@ the operator output.
 from __future__ import annotations
 
 import torch
+
 # REQUIRES: cann_ops_transformer (Ascend native sparse attention ops).
 # Not in vllm-ascend requirements. See models/step5/generic_block_sparse_attention.py.
 try:
@@ -74,6 +75,10 @@ def indexer_score_topk(
     tokens, groups, heads, proxy_dim = index_q.shape
     if (groups != 1 and groups % 4 != 0) or heads < 4 or heads > 128 or heads % 4 != 0 or proxy_dim != 256:
         raise ValueError("IndexerRegionScore requires G=1 or a multiple of 4, H=4..128 divisible by 4, D=256")
+    if mean_cache.ndim == 3:
+        mean_cache = mean_cache.unsqueeze(2)
+    if mean_cache.ndim != 4 or mean_cache.shape[2:] != (1, 256):
+        raise ValueError("Step5 summary cache must have shape [P,S,256] or [P,S,1,256]")
     selected_ids = torch.empty(
         (groups, tokens, topk),
         device=index_q.device,

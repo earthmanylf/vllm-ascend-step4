@@ -405,6 +405,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         self.sparse_summary_cache = AscendStep5SparseSummaryCacheLayer(
             prefix=f"{prefix}.attn.sparse_summary_cache",
             target_impl=self.impl,
+            main_layer=self,
             static_forward_context=compilation_config.static_forward_context,
         )
         # Circular buffer holding each request's open-region [key | z] rows.

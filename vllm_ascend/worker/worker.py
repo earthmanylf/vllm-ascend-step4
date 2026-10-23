@@ -86,7 +86,7 @@ from vllm_ascend.core.kv_cache_placement import (
 from vllm_ascend.core.profiling_chunk_predictor import (
     _attach_profiling_chunk_execution_time,
 )
-from vllm_ascend.core.step5_kv_cache import supports_step5_shared_kv_backing
+from vllm_ascend.core.step5_kv_cache import supports_step5_shared_kv_backing, supports_step5_tailring_shared_backing
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device_allocator.camem import CaMemAllocator
@@ -746,6 +746,8 @@ class NPUWorker(WorkerBase):
             return available_memory
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
         if not kv_cache_groups:
+            return available_memory
+        if supports_step5_tailring_shared_backing(self.vllm_config, kv_cache_groups):
             return available_memory
         # vLLM #51718 removed the DSV4-specific packed planner. Ascend restores
         # that shared-tuple layout in patch_kv_cache_utils, so DSV4 already fits
