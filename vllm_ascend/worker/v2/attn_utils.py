@@ -34,6 +34,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
     get_layers_from_vllm_config,
+    set_current_vllm_config,
 )
 from vllm.distributed import get_dcp_group, get_tensor_model_parallel_rank
 from vllm.logger import logger
@@ -55,7 +56,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, customize_attention_spec
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
@@ -212,6 +213,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
     from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
+    customize_step5_blnhc = uses_step5_blnhc(vllm_config)
     use_turboquant = vllm_config.cache_config.cache_dtype == TURBOQUANT_CACHE_DTYPE
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     attention_layer_names: list[str] = []
@@ -344,6 +346,12 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
         if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
             spec = mxfp_cache_spec(spec)
+        if customize_step5_blnhc and isinstance(spec, AttentionSpec):
+            # Restore the upstream collector contract after Ascend conversions.
+            # Step5 DSA publishes its native byte-stride constraint here; its
+            # backend hook requires the supplied config even for CPU planning.
+            with set_current_vllm_config(vllm_config):
+                spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
         kv_cache_spec[layer_name] = spec
         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
             attention_layer_names.append(layer_name)

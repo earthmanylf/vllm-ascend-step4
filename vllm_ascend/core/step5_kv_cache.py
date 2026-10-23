@@ -83,6 +83,16 @@ def validate_step5_blnhc_descriptors(config, layout):
                 valid = spec.dtype == torch.bfloat16 and spec.head_size == spec.head_size_v == 192 and ratio == 1
             if not valid or spec.num_kv_heads != 1:
                 raise ValueError("Step5 BLNHC cache geometry is unsupported")
+            # Check native row alignment independently of the collected spec:
+            # a missing backend customization must fail before allocation, not
+            # later in GBSA's PA_BBND tiling parser.
+            if spec.head_size_v > 0:
+                native_alignment = spec.num_kv_heads * spec.head_size * spec.dtype.itemsize
+                if stride % native_alignment:
+                    raise ValueError(
+                        f"Step5 BLNHC main KV {name} block stride {stride} bytes "
+                        f"is not divisible by native row alignment {native_alignment} bytes"
+                    )
             page = spec.page_size_bytes
             offset = descriptor.offset + index * descriptor.layer_stride
             if (

@@ -1,6 +1,8 @@
 """CPU storage tests for the actual upstream planner, allocator and BLNHC views."""
 
+import ast
 import copy
+import importlib
 import importlib.util
 import unittest
 from pathlib import Path
@@ -9,8 +11,16 @@ from unittest.mock import patch
 
 import torch
 from vllm.v1.attention.backend import MultipleOf
-from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups, get_kv_cache_groups
-from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
+from vllm.v1.core.kv_cache_planning import (
+    get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+)
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.utils import allocate_kv_cache
 
@@ -23,13 +33,18 @@ module_spec.loader.exec_module(helper)
 def config():
     return NS(
         use_v2_model_runner=True,
-        model_config=NS(hf_text_config=NS(model_type="step5")),
+        model_config=NS(hf_text_config=NS(model_type="step5"), dtype=torch.bfloat16),
         kv_transfer_config=None,
         additional_config={},
-        attention_config=NS(hisparse_config=None),
-        parallel_config=NS(prefill_context_parallel_size=1, decode_context_parallel_size=1, pipeline_parallel_size=1),
+        attention_config=NS(hisparse_config=None, indexer_kv_dtype="auto"),
+        parallel_config=NS(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
         scheduler_config=NS(disable_hybrid_kv_cache_manager=False),
         cache_config=NS(
+            cache_dtype="auto",
             get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLNHC,
             num_gpu_blocks_override=None,
             prefix_cache_retention_interval=0,
@@ -96,7 +111,12 @@ class BLNHCStorageTests(unittest.TestCase):
         conf, planned = plan(blocks)
         layers = helper.validate_step5_blnhc_descriptors(planned, KVCacheLayout.BLNHC)
         with patch.object(torch, "zeros", wraps=torch.zeros) as alloc:
-            canonical = allocate_kv_cache(planned, "cpu", KVCacheLayout.BLNHC, [128] * len(planned.kv_cache_groups))
+            canonical = allocate_kv_cache(
+                planned,
+                "cpu",
+                KVCacheLayout.BLNHC,
+                [128] * len(planned.kv_cache_groups),
+            )
         self.assertEqual(alloc.call_count, 1)
         views = helper.step5_blnhc_layer_views(canonical, layers)
         return conf, planned, layers, canonical, views
@@ -109,7 +129,10 @@ class BLNHCStorageTests(unittest.TestCase):
         self.assertEqual(len(full[0].layer_names), 4)
         for i in range(2):
             self.assertIn(f"model.layers.{i}.attn", full[0].layer_names)
-            self.assertEqual(layers[f"model.layers.{i}.attn.sparse_summary_cache"].page_size_bytes, 4096)
+            self.assertEqual(
+                layers[f"model.layers.{i}.attn.sparse_summary_cache"].page_size_bytes,
+                4096,
+            )
 
     def test_budget_single_storage_and_zero_copy_kv_views(self):
         _, planned, _, canonical, views = self.allocate()
@@ -167,7 +190,11 @@ class BLNHCStorageTests(unittest.TestCase):
                 ast.fix_missing_locations(
                     ast.Module(
                         body=[
-                            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                            ast.ImportFrom(
+                                module="__future__",
+                                names=[ast.alias(name="annotations")],
+                                level=0,
+                            ),
                             node,
                         ],
                         type_ignores=[],
@@ -179,7 +206,9 @@ class BLNHCStorageTests(unittest.TestCase):
             namespace,
         )
         namespace["copy_kv_cache_blocks_inplace"](
-            views.values(), 4, [NS(src_block_id=1, dst_block_id=2), NS(src_block_id=2, dst_block_id=3)]
+            views.values(),
+            4,
+            [NS(src_block_id=1, dst_block_id=2), NS(src_block_id=2, dst_block_id=3)],
         )
         self.assertTrue(torch.all(main[2] == 2))
         self.assertTrue(torch.all(summary[2] == 9))
@@ -216,7 +245,11 @@ class BLNHCStorageTests(unittest.TestCase):
             candidate = copy.deepcopy(original)
             change(candidate)
             with (
-                patch.object(torch, "zeros", side_effect=AssertionError("must reject before allocation")),
+                patch.object(
+                    torch,
+                    "zeros",
+                    side_effect=AssertionError("must reject before allocation"),
+                ),
                 self.assertRaises(ValueError),
             ):
                 helper.validate_step5_blnhc_descriptors(candidate, KVCacheLayout.BLNHC)
@@ -232,6 +265,170 @@ class BLNHCStorageTests(unittest.TestCase):
         _, planned = plan()
         with self.assertRaises(ValueError):
             helper.validate_step5_blnhc_descriptors(planned, KVCacheLayout.LBNHC)
+
+
+class BLNHCCollectorTests(unittest.TestCase):
+    """A missing backend hook must not reach native GBSA with illegal strides."""
+
+    def collector(self, layers, *, customize=True):
+        from vllm.config import set_current_vllm_config
+        from vllm.v1.worker.utils import customize_attention_spec
+
+        base = importlib.import_module("vllm_ascend.worker.v2.attn_utils")
+        source = ROOT / "vllm_ascend/worker/v2/attn_utils.py"
+        tree = ast.parse(source.read_text())
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "get_kv_cache_spec")
+        namespace = dict(base.__dict__)
+        namespace.update(
+            get_layers_from_vllm_config=lambda *args: layers,
+            enable_sfa_dcp_replicated_indexer=lambda *args: False,
+            is_c8_mxfp_kv_quant=lambda *args: False,
+            kv_cache_dtype_str_to_dtype=lambda *args: torch.bfloat16,
+            customize_attention_spec=customize_attention_spec,
+            set_current_vllm_config=set_current_vllm_config,
+            uses_step5_blnhc=helper.uses_step5_blnhc if customize else lambda conf: False,
+        )
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                function,
+            ],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+        return namespace["get_kv_cache_spec"]
+
+    def layers(self, mtp):
+        from vllm.models.step5.nvidia.csa_tail_ring import Step5CSATailRingBackend
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+        from vllm_ascend.models.step5.dsa_attention import AscendStep5DSABackend
+        from vllm_ascend.models.step5.summary_cache import (
+            AscendStep5SparseSummaryBackend,
+        )
+
+        result = {}
+
+        def add(name, spec, backend):
+            result[name] = NS(
+                get_kv_cache_spec=lambda conf, s=spec: s,
+                get_attn_backend=lambda b=backend: b,
+            )
+
+        for index in range(92 + (3 if mtp else 0)):
+            name = f"model.layers.{index}.attn"
+            if index % 4 != 3:
+                add(
+                    name,
+                    SlidingWindowSpec(
+                        block_size=128,
+                        num_kv_heads=1,
+                        head_size=192,
+                        head_size_v=192,
+                        dtype=torch.bfloat16,
+                        sliding_window=512,
+                        extra_retained_tokens=3,
+                    ),
+                    AscendAttentionBackend,
+                )
+                continue
+            add(
+                name,
+                FullAttentionSpec(
+                    block_size=128,
+                    num_kv_heads=1,
+                    head_size=192,
+                    head_size_v=192,
+                    dtype=torch.bfloat16,
+                ),
+                AscendStep5DSABackend,
+            )
+            add(
+                name + ".sparse_summary_cache",
+                FullAttentionSpec(
+                    block_size=128,
+                    num_kv_heads=1,
+                    head_size=256,
+                    head_size_v=0,
+                    dtype=torch.uint8,
+                    tokens_per_state=8,
+                ),
+                AscendStep5SparseSummaryBackend,
+            )
+            add(
+                name + ".csa_tail_ring",
+                CircularBufferSpec(
+                    block_size=128,
+                    num_kv_heads=1,
+                    head_size=384,
+                    head_size_v=0,
+                    dtype=torch.bfloat16,
+                    block_stride_alignment=1024,
+                ),
+                Step5CSATailRingBackend,
+            )
+        return result
+
+    def test_backend_alignment_survives_collector_and_real_planner(self):
+        from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config
+
+        for mtp in (False, True):
+            with self.subTest(mtp=mtp):
+                conf = config()
+                layers = self.layers(mtp)
+                previous = get_current_vllm_config_or_none()
+                original_specs = self.collector(layers, customize=False)(conf)
+                fixed_specs = self.collector(layers)(conf)
+                self.assertIs(get_current_vllm_config_or_none(), previous)
+                dsa = [n for n in layers if n.endswith(".attn") and int(n.split(".")[2]) % 4 == 3]
+                self.assertTrue(all(original_specs[n].block_stride_alignment is None for n in dsa))
+                self.assertTrue(all(fixed_specs[n].block_stride_alignment == 384 for n in dsa))
+                summary = [s for n, s in fixed_specs.items() if n.endswith("sparse_summary_cache")]
+                self.assertTrue(all(s.page_size_bytes == 4096 and s.page_size_padded is None for s in summary))
+                groups = get_kv_cache_groups(conf, fixed_specs)
+                planned = get_kv_cache_config_from_groups(conf, groups, 24 * 2359296)
+                self.assertEqual(
+                    planned.kv_cache_tensors[0].block_stride,
+                    2359296 if mtp else 2356224,
+                )
+                bound_specs = helper.validate_step5_blnhc_descriptors(planned, KVCacheLayout.BLNHC)
+                canonical = allocate_kv_cache(planned, "cpu", KVCacheLayout.BLNHC, [128] * len(groups))
+                views = helper.step5_blnhc_layer_views(canonical, bound_specs)
+                self.assertTrue(all(views[n][0].stride(0) % 192 == 0 for n in dsa))
+                old_groups = get_kv_cache_groups(conf, original_specs)
+                invalid = get_kv_cache_config_from_groups(conf, old_groups, 24 * 2359296)
+                self.assertEqual(
+                    invalid.kv_cache_tensors[0].block_stride,
+                    2359296 if mtp else 2355200,
+                )
+                for descriptor in invalid.kv_cache_tensors:
+                    descriptor.block_stride = 2355200
+                    descriptor.size = invalid.num_blocks * 2355200
+                with self.assertRaisesRegex(ValueError, "native row alignment 384 bytes"):
+                    helper.validate_step5_blnhc_descriptors(invalid, KVCacheLayout.BLNHC)
+                outer = config()
+                outer.model_config.hf_text_config.model_type = "other_model"
+                with set_current_vllm_config(outer):
+                    self.collector(layers)(conf)
+                    self.assertIs(get_current_vllm_config_or_none(), outer)
+
+    def test_collector_does_not_customize_non_target_models_or_legacy_runner(self):
+        layers = self.layers(False)
+        for excluded in ("non_step5", "non_v2"):
+            with self.subTest(excluded=excluded):
+                conf = config()
+                if excluded == "non_step5":
+                    conf.model_config.hf_text_config.model_type = "other_model"
+                else:
+                    conf.use_v2_model_runner = False
+                collector = self.collector(layers)
+                original = self.collector(layers, customize=False)
+                with patch.dict(
+                    collector.__globals__,
+                    customize_attention_spec=unittest.mock.Mock(
+                        side_effect=AssertionError("excluded paths must retain the old collector")
+                    ),
+                ):
+                    self.assertEqual(collector(conf), original(conf))
 
 
 if __name__ == "__main__":
