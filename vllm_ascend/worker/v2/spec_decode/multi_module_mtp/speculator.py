@@ -11,7 +11,11 @@ from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
 )
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionState,
+    AscendMetadata,
+)
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_factory,
     build_attn_metadata_wrapper,
@@ -128,7 +132,22 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
         step,
         **kwargs,
     ):
-        assert self.input_batch is not None
+        if self.input_batch is None:
+            raise RuntimeError("Multi-module MTP input batch is missing")
+        if batch_desc.cg_mode == CUDAGraphMode.NONE:
+            # A FULL target may append dummy request ends to InputBatch's
+            # CPU query array. Eager draft metadata must count only real
+            # requests, not that target graph's final padded boundary.
+            query_start_loc_np = query_start_loc_np[: num_reqs + 1]
+            if (
+                len(query_start_loc_np) != num_reqs + 1
+                or num_reqs < 1
+                or int(query_start_loc_np[0]) != 0
+                or any(end < start for start, end in zip(query_start_loc_np, query_start_loc_np[1:]))
+                or int(query_start_loc_np[-1]) != self.input_batch.num_tokens
+                or not 0 <= self.input_batch.num_tokens <= batch_desc.num_tokens
+            ):
+                raise RuntimeError("Invalid eager MTP real query prefix")
         with build_attn_metadata_factory(
             self.input_buffers.positions,
             batch_desc.num_tokens,
@@ -145,10 +164,60 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
                 step,
                 **kwargs,
             )
-        assert attn_metadata is not None
+        if attn_metadata is None:
+            raise RuntimeError("Multi-module MTP attention metadata is missing")
         for metadata in attn_metadata.values():
             if metadata is not None:
                 metadata.attn_state = self.draft_attn_state
+        # Only the exact ordinary FIA backend consumes this host cumulative
+        # list. GQA subclasses such as C8-MXFP/QFA use device length buffers.
+        if batch_desc.cg_mode == CUDAGraphMode.FULL and self.attn_backend is AscendAttentionBackend:
+            num_reqs_padded = batch_desc.num_reqs
+            query_width = batch_desc.uniform_token_count
+            if (
+                num_reqs_padded is None
+                or query_width is None
+                or query_width <= 0
+                or not 0 < num_reqs <= num_reqs_padded
+                or num_reqs_padded * query_width != batch_desc.num_tokens
+            ):
+                raise RuntimeError("Invalid uniform FIA MTP graph descriptor")
+            updates = []
+            seen = set()
+            for metadata in attn_metadata.values():
+                if metadata is None or id(metadata) in seen:
+                    continue
+                seen.add(id(metadata))
+                # FIAParamProvider.resolve reads the direct AscendMetadata;
+                # nested decode wrappers are not ordinary FIA metadata.
+                if type(metadata) is not AscendMetadata:
+                    raise RuntimeError("Unsupported FIA MTP metadata type (including nested decode wrappers)")
+                query_ends = metadata.actual_seq_lengths_q
+                kv_lens = metadata.seq_lens_list
+                if (
+                    query_ends is None
+                    or len(query_ends) != num_reqs_padded
+                    or kv_lens is None
+                    or len(kv_lens) != num_reqs_padded
+                    or list(query_ends[:num_reqs]) != [(i + 1) * query_width for i in range(num_reqs)]
+                    or any(length != 0 for length in kv_lens[num_reqs:])
+                ):
+                    raise RuntimeError("Invalid FIA MTP real query boundaries or nonzero padded KV lengths")
+                real_end = query_ends[num_reqs - 1]
+                # Accept original collapsed no-op ends or already repaired
+                # shared metadata; reject stale/ambiguous padding boundaries.
+                fixed_ends = list(query_ends[:num_reqs]) + [
+                    (i + 1) * query_width for i in range(num_reqs, num_reqs_padded)
+                ]
+                if list(query_ends[num_reqs:]) not in (
+                    [real_end] * (num_reqs_padded - num_reqs),
+                    fixed_ends[num_reqs:],
+                ):
+                    raise RuntimeError("Invalid FIA MTP padded query boundaries")
+                # Validate every layer before modifying any query boundary.
+                updates.append((metadata, fixed_ends))
+            for metadata, fixed_ends in updates:
+                metadata.actual_seq_lengths_q = fixed_ends
         self._multi_module_attn_metadata = attn_metadata
         return attn_metadata
 
