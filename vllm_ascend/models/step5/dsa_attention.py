@@ -9,7 +9,7 @@ force-includes its current region and applies an exact token causal mask.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import torch
@@ -28,7 +28,9 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from vllm_ascend.core.step5_kv_cache import uses_step5_blnhc
 from vllm_ascend.models.step5._step5_compat import Step5DSAScratchWorkspace
 from vllm_ascend.models.step5.generic_block_sparse_attention import (
     gbsa_expected_counts,
@@ -51,6 +53,28 @@ def _is_graph_capturing() -> bool:
 
 class AscendStep5DSABackend(AttentionBackend):
     accept_output_buffer: bool = True
+
+    @classmethod
+    def supported_kv_cache_layouts(cls):
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is not None and uses_step5_blnhc(config):
+            return (KVCacheLayout.BLNHC,)
+        return None
+
+    @classmethod
+    def customize_spec(cls, spec):
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is not None and uses_step5_blnhc(config):
+            # GBSA PA_BBND requires block stride divisible by Nkv*D elements.
+            # Publish this actual native constraint; upstream planner aligns
+            # the global tile, without padding each compressed summary page.
+            alignment = spec.num_kv_heads * spec.head_size * spec.dtype.itemsize
+            return replace(spec, block_stride_alignment=alignment)
+        return spec
 
     @staticmethod
     def get_name() -> str:

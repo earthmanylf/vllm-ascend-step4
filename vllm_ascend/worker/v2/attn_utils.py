@@ -56,6 +56,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
@@ -89,8 +90,11 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.core.step5_kv_cache import (
     allocate_step5_shared_kv_backing,
     allocate_step5_tailring_shared_backing,
+    step5_blnhc_layer_views,
     supports_step5_shared_kv_backing,
     supports_step5_tailring_shared_backing,
+    uses_step5_blnhc,
+    validate_step5_blnhc_descriptors,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -1378,8 +1382,13 @@ def allocate_kv_cache_main(
     still consumes separate K/V (and backend-specific state) tensors, so keep
     the Ascend allocation/reshape contract behind the new entry point.
     """
-    del layout
     vllm_config = get_current_vllm_config()
+    if uses_step5_blnhc(vllm_config):
+        specs = validate_step5_blnhc_descriptors(kv_cache_config, layout)
+        if any(size != 128 for size in kernel_block_sizes):
+            raise ValueError("Step5 BLNHC currently requires 128-token kernel blocks")
+        caches = allocate_upstream_kv_cache(kv_cache_config, device, layout, kernel_block_sizes)
+        return step5_blnhc_layer_views(caches, specs)
     if supports_step5_tailring_shared_backing(vllm_config, kv_cache_config.kv_cache_groups):
         return allocate_step5_tailring_shared_backing(kv_cache_config, device)
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)

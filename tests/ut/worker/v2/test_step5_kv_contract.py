@@ -206,6 +206,7 @@ class SharedCacheTests(unittest.TestCase):
         self.assertEqual(k.untyped_storage().nbytes(), 4 * page)
         env = dict(
             get_current_vllm_config=config,
+            uses_step5_blnhc=lambda _: False,
             supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
             allocate_step5_tailring_shared_backing=helper.allocate_step5_tailring_shared_backing,
         )
@@ -223,9 +224,11 @@ class SharedCacheTests(unittest.TestCase):
         ):
             invalid = copy.deepcopy(kv)
             mutate(invalid)
-            with patch.object(helper.torch, "zeros", side_effect=AssertionError("validate before allocating")):
-                with self.assertRaises(ValueError):
-                    helper.allocate_step5_tailring_shared_backing(invalid, "cpu")
+            with (
+                patch.object(helper.torch, "zeros", side_effect=AssertionError("validate before allocating")),
+                self.assertRaises(ValueError),
+            ):
+                helper.allocate_step5_tailring_shared_backing(invalid, "cpu")
 
     def test_step5_summary_page_view_preserves_padding_and_block_ids(self):
         spec = NS(
@@ -279,6 +282,7 @@ class SharedCacheTests(unittest.TestCase):
         env = dict(
             torch=torch,
             get_current_vllm_config=config,
+            uses_step5_blnhc=lambda _: False,
             _is_dsv4_model=lambda _: False,
             is_deepseek_v41_cache=lambda _: False,
             _get_layer_kv_cache_specs=lambda _: {"summary": spec},
@@ -454,6 +458,7 @@ class SharedCacheTests(unittest.TestCase):
         )
         env.update(
             get_kv_cache_groups=lambda *_: kv.kv_cache_groups,
+            uses_step5_blnhc=lambda _: False,
             supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
             UniformTypeKVCacheSpecs=UniformTypeKVCacheSpecs,
         )
@@ -501,7 +506,9 @@ class SharedCacheTests(unittest.TestCase):
             v[2].fill_(19)
             original = raw.clone().reshape(4, page_elements)
             entries = [summary, (k, v), ring] if summary_first else [(k, v), ring, summary]
-            copy_blocks = extract(ROOT / "vllm_ascend/worker/utils.py", "copy_kv_cache_blocks_inplace", {"torch": torch})
+            copy_blocks = extract(
+                ROOT / "vllm_ascend/worker/utils.py", "copy_kv_cache_blocks_inplace", {"torch": torch}
+            )
             copy_blocks(entries, 4, [NS(src_block_id=1, dst_block_id=2), NS(src_block_id=2, dst_block_id=3)])
             actual = raw.reshape(4, page_elements)
             self.assertTrue(torch.equal(actual[0], original[0]))
