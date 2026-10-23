@@ -120,6 +120,42 @@ def test_mtp_derived_backend_does_not_receive_ordinary_fia_padding():
     assert metadata.actual_seq_lengths_q == [4, 8, 12, 12]
 
 
+def test_mtp_full_normalizes_common_queries_before_fia_builder_adds_tail():
+    """Exercise the actual callback before the current builder's tail append."""
+    spec = _mtp_test_speculator()
+    spec.attn_groups = [[SimpleNamespace(backend=AscendAttentionBackend)]]
+    module = "vllm_ascend.worker.v2.spec_decode.multi_module_mtp.speculator"
+    callback = None
+    query = torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32)
+    original = query.clone()
+    common = SimpleNamespace(num_reqs=4, query_start_loc_cpu=query)
+
+    def factory(*args, **kwargs):
+        nonlocal callback
+        callback = kwargs["offload_kwargs"]["common_metadata_callback"]
+        return nullcontext()
+
+    def upstream(*args, **kwargs):
+        callback(0, common)
+        # The ordinary builder must not append its synthetic request when
+        # the graph's existing no-op request already owns the padded rows.
+        ends = common.query_start_loc_cpu[1:].tolist()
+        if ends[-1] < 16:
+            ends.append(16)
+        return {"head0": _mtp_test_metadata(ends=ends)}
+
+    descriptor = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_reqs=4, num_tokens=16, uniform_token_count=4)
+    with (
+        patch(f"{module}.build_attn_metadata_factory", side_effect=factory),
+        patch(f"{module}.MultiModuleMTPSpeculator._build_attn_metadata", side_effect=upstream),
+    ):
+        result = spec._build_attn_metadata(3, descriptor, np.array([0, 4, 8, 12, 16]), None, 0)
+    assert result["head0"].actual_seq_lengths_q == [4, 8, 12, 16]
+    assert len(result["head0"].seq_lens_list) == 4
+    torch.testing.assert_close(query, original)
+    assert common.query_start_loc_cpu is not query
+
+
 def test_calc_next_seq_lens_cpu():
     """Test calculation of the next CPU sequence lengths."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)

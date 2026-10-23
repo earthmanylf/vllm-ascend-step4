@@ -148,6 +148,43 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
                 or not 0 <= self.input_batch.num_tokens <= batch_desc.num_tokens
             ):
                 raise RuntimeError("Invalid eager MTP real query prefix")
+        offload_kwargs = None
+        if batch_desc.cg_mode == CUDAGraphMode.FULL and self.attn_backend is AscendAttentionBackend:
+
+            def prepare_fia_common_metadata(group_index, common):
+                groups = self.attn_groups[group_index]
+                if not any(group.backend is AscendAttentionBackend for group in groups):
+                    return
+                if any(group.backend is not AscendAttentionBackend for group in groups):
+                    raise RuntimeError("Mixed FIA MTP cache group is unsupported")
+                padded = batch_desc.num_reqs
+                width = batch_desc.uniform_token_count
+                if (
+                    padded is None
+                    or width is None
+                    or width <= 0
+                    or not 0 < num_reqs <= padded
+                    or padded * width != batch_desc.num_tokens
+                    or common.num_reqs != padded
+                ):
+                    raise RuntimeError("Invalid FIA MTP common graph descriptor")
+                query = common.query_start_loc_cpu
+                real_prefix = [i * width for i in range(num_reqs + 1)]
+                if (
+                    len(query) != padded + 1
+                    or query[: num_reqs + 1].tolist() != real_prefix
+                    or any(value != real_prefix[-1] for value in query[num_reqs + 1 :].tolist())
+                ):
+                    raise RuntimeError("Invalid FIA MTP common real query prefix")
+                # Normalize before the ordinary builder can append its own
+                # synthetic tail request. Copy only the CPU query metadata;
+                # the upstream device boundaries and PAD slots stay intact.
+                query = query.clone()
+                for index in range(num_reqs + 1, padded + 1):
+                    query[index] = index * width
+                common.query_start_loc_cpu = query
+
+            offload_kwargs = {"common_metadata_callback": prepare_fia_common_metadata}
         with build_attn_metadata_factory(
             self.input_buffers.positions,
             batch_desc.num_tokens,
@@ -155,6 +192,7 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
             seq_lens_cpu=self.input_buffers.seq_lens_cpu,
             attn_state=self.draft_attn_state,
             parallel_config=self.draft_vllm_config.parallel_config,
+            offload_kwargs=offload_kwargs,
         ):
             attn_metadata = super()._build_attn_metadata(
                 num_reqs,
