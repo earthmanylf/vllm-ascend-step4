@@ -8,8 +8,8 @@ case "$HOST" in
   177.42.27.1) PEER=172.27.9.107 ;;
   177.42.28.1) PEER=172.27.9.108 ;;
 esac
-ROOT="${EXPORT_ROOT:-/data/chensiyu/step5-tailring-build-20261023}"
-IMAGE="${IMAGE_REF:-quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-624cc9d19a}"
+ROOT="${EXPORT_ROOT:-/data/chensiyu/step5-tailring-final-export-20261023}"
+IMAGE="${IMAGE_REF:-quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-143f3649d8}"
 export SSH_ASKPASS=/data/chensiyu/step5-dp8tp4ep32-20261022/ssh-askpass.sh SSH_ASKPASS_REQUIRE=force DISPLAY=:0
 : "${CLOUD_SSH_PASSWORD:?credential must be supplied in memory}"
 OPTIONS=(-o NumberOfPasswordPrompts=1 -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6

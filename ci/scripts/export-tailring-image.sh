@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="${EXPORT_ROOT:-/data/chensiyu/step5-tailring-build-20261023}"
-IMAGE="${IMAGE_REF:-quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-624cc9d19a}"
+ROOT="${EXPORT_ROOT:-/data/chensiyu/step5-tailring-final-export-20261023}"
+IMAGE="${IMAGE_REF:-quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-143f3649d8}"
 mkdir -p "$ROOT"
 [[ ! -e "$ROOT/image.tar.gz" && ! -e "$ROOT/image.tar.gz.part" ]] || { echo "Refusing to overwrite export" >&2; exit 2; }
 docker image inspect "$IMAGE" > "$ROOT/export-image-inspect.json"
