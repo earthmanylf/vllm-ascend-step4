@@ -230,6 +230,97 @@ def gbsa_sparse_attention_metadata(
     )
 
 
+def _union_step_geometry(
+    seq_lens_host: list,
+    context_lens_host: list,
+    *,
+    region_size: int,
+    topk: int,
+) -> tuple[int, int, int, int]:
+    """Host-side union geometry shared by every layer of one prefill step.
+
+    Returns ``(max_query_len, num_union_groups, union_capacity,
+    max_kv_blocks)``. All four derive from the step's seq-lens and the
+    selection width only -- never from device data -- so the attention
+    metadata builder can compute them before the model runs and every
+    layer's union tensors come out with exactly these shapes.
+    """
+    query_lens = [s - c for s, c in zip(seq_lens_host, context_lens_host)]
+    max_query_len = max(query_lens)
+    max_kv_blocks = max(1, max(-(-s // region_size) for s in seq_lens_host))
+    num_union_groups = sum(-(-q // region_size) for q in query_lens)
+    union_capacity = min(region_size * (topk + 1), max_kv_blocks)
+    return max_query_len, num_union_groups, union_capacity, max_kv_blocks
+
+
+def gbsa_union_sparse_metadata(
+    *,
+    num_heads: int,
+    num_kv_groups: int,
+    head_dim: int,
+    region_size: int,
+    topk: int,
+    cu_seqlens_q: torch.Tensor,
+    seqused_kv: torch.Tensor,
+    seq_lens_host: list,
+    context_lens_host: list,
+    max_pages: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Run the union (``mask_mode=3``) AICPU scheduling op once per step.
+
+    The scheduler tiles the step's query geometry and hands each core a
+    range of union-group block slots; it is fed the union *capacity* bound
+    -- the largest union any layer of the step can produce -- instead of
+    one layer's actual counts. Every layer's real union count is at most
+    that bound by construction (the union builder op validates it), and
+    the AI Core attention kernel clamps its scheduled ranges to the
+    runtime ``sparse_block_count`` tensor, so a single schedule serves all
+    layers of the step. This is the same upper-bound-scheduling contract
+    the base path's ``gbsa_expected_counts`` relies on, and it is why the
+    metadata is tiling, not per-layer data.
+
+    Only tensor shapes and the count values are read on the host; the
+    zero-filled idx never reaches the AI Core kernel.
+    """
+    max_query_len, num_union_groups, union_capacity, _ = _union_step_geometry(
+        seq_lens_host, context_lens_host, region_size=region_size, topk=topk
+    )
+    idx_shape = torch.zeros(
+        (num_kv_groups, num_union_groups, union_capacity),
+        dtype=torch.int32,
+        device=seqused_kv.device,
+    )
+    counts = torch.full(
+        (num_kv_groups, num_union_groups),
+        union_capacity,
+        dtype=torch.int32,
+        device=seqused_kv.device,
+    )
+    return generic_block_sparse_attention_metadata(
+        idx_shape,
+        counts,
+        num_heads,
+        num_kv_groups,
+        head_dim,
+        [1, region_size],
+        cu_seqlens_q=cu_seqlens_q.to(torch.int64),
+        seqused_kv=seqused_kv.to(torch.int32),
+        max_seqlen_q=max_query_len,
+        max_seqlen_kv=max_pages * page_size,
+        layout_q="TND",
+        layout_kv="PA_BBND",
+        layout_sparse_pattern=_SPARSE_PATTERN_PER_GROUP_PER_TOKEN,
+        mask_mode=_MASK_UNION,
+        quant_mode=_QUANT_NONE,
+        softmax_precision=_SOFTMAX_PRECISION_BF16,
+        win_left=_WINDOW_DISABLED,
+        win_right=_WINDOW_DISABLED,
+        residual_block_mode=_RESIDUAL_BLOCK_MODE_DISABLED,
+        is_consistent_topk=False,
+    )
+
+
 def gbsa_sparse_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -313,14 +404,12 @@ def gbsa_union_sparse_attention(
     cu_seqlens_q: torch.Tensor,
     seqused_kv: torch.Tensor,
     *,
-    num_heads: int,
-    head_dim: int,
     num_kv_groups: int,
     region_size: int,
     softmax_scale: float,
-    page_size: int,
     seq_lens_host: list,
     context_lens_host: list,
+    metadata: torch.Tensor,
 ) -> torch.Tensor:
     """Union (mask_mode=3) variant of :func:`gbsa_sparse_attention`.
 
@@ -333,20 +422,18 @@ def gbsa_union_sparse_attention(
     (measured on real Step-5 prefill: union ~555 blocks per region vs
     ~3592 per-token block visits, 2.7x on the attention op).
 
-    Unlike the base path, the AICPU scheduling metadata cannot be built
-    once per step outside the model: it schedules from the block counts,
-    and the union counts depend on each layer's own selections. The union
-    preprocessing and the metadata therefore both run per layer here.
+    ``metadata`` is the step's union AICPU schedule from
+    :func:`gbsa_union_sparse_metadata`, built once in the attention
+    metadata builder. It is pure tiling -- scheduled from the union
+    capacity bound, with every layer's actual union counts resolved
+    against it at run time by the AI Core kernel -- so all layers of the
+    step share it, exactly like the base path's per-step metadata.
 
     Everything on the hot path stays on device: the operator consumes the
     packed int32 seq-len tensors directly, and the union geometry (group
     count, capacity) comes from the builder's CPU seq-len copies
     (``seq_lens_host`` / ``context_lens_host``) -- no tensor is read back
     to the host and no shape value is derived from device data.
-
-    Args match :func:`gbsa_sparse_attention`, plus the head geometry and
-    the host seq-len copies the per-layer metadata build needs (the base
-    path gets those from the prebuilt per-step metadata instead).
 
     Returns ``out`` shaped ``[total_q, num_heads, head_dim]``.
     """
@@ -363,12 +450,12 @@ def gbsa_union_sparse_attention(
     try:
         # Registers torch.ops.cann_ops_nn.union_sparse_meta_launch
         # (schema + NPU dispatch); a sys.modules hit after the first call.
-        import cann_ops_nn_custom  # noqa: F401
+        import cann_ops_nn_custom_nn  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
             "VLLM_ASCEND_ENABLE_STEP4_UNION_SPARSE=1 requires the "
             "UnionSparseMeta operator (ops-nn): install the custom_nn "
-            "vendor package and the cann_ops_nn_custom wheel."
+            "vendor package and the cann_ops_nn_custom_nn wheel."
         ) from exc
 
     idx, counts = _append_current_region(
@@ -377,12 +464,15 @@ def gbsa_union_sparse_attention(
     # Union geometry from the builder's CPU copies (host ints, no sync):
     # the capacity must cover min(region selection width, every logical
     # block of the longest request) -- the safe bound the operator
-    # enforces -- and the group count is one union per region.
-    query_lens = [s - c for s, c in zip(seq_lens_host, context_lens_host)]
-    max_query_len = max(query_lens)
-    max_kv_blocks = max(1, max(-(-s // region_size) for s in seq_lens_host))
-    num_union_groups = sum(-(-q // region_size) for q in query_lens)
-    union_capacity = min(region_size * idx.shape[2], max_kv_blocks)
+    # enforces -- and the group count is one union per region. These are
+    # step constants, identical to what gbsa_union_sparse_metadata
+    # scheduled the step's shared tiling from.
+    _, num_union_groups, union_capacity, max_kv_blocks = _union_step_geometry(
+        seq_lens_host,
+        context_lens_host,
+        region_size=region_size,
+        topk=idx.shape[2] - 1,
+    )
 
     seqused_kv_i32 = seqused_kv.to(torch.int32)
     cu_seqlens_kv = torch.cat(
@@ -423,18 +513,9 @@ def gbsa_union_sparse_attention(
         residual_block_mode=_RESIDUAL_BLOCK_MODE_DISABLED,
         is_consistent_topk=False,
     )
-    # Per-layer scheduling: the union counts differ from layer to layer.
-    metadata = generic_block_sparse_attention_metadata(
-        union_idx,
-        union_counts,
-        num_heads,
-        num_kv_groups,
-        head_dim,
-        [1, region_size],
-        max_seqlen_q=max_query_len,
-        max_seqlen_kv=block_table.shape[1] * page_size,
-        **common,
-    )
+    # The step's shared tiling: scheduled once in the metadata builder
+    # from the union capacity bound; the kernel clamps its ranges to this
+    # layer's runtime union counts.
     out, _lse = generic_block_sparse_attention(
         query,
         key_cache,
