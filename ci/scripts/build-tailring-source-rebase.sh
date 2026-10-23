@@ -3,7 +3,7 @@ set -euo pipefail
 CI_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 INPUTS="${CI_UPGRADE_INPUTS_DIR:-$CI_DIR/cache/tailring-cann9.2.0-143f3649d8}"
 CONTEXT=""
-IMAGE="quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-143f3649d8"
+IMAGE="quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-143f3649d8-rebuild"
 RECEIPT=""
 DRY_RUN=0
 CHECK_ONLY=0

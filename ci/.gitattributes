@@ -1,3 +1,6 @@
 # Shared, versioned cache payloads: Git tracks pointers; Git LFS shares exact binary objects.
 /cache/**/*.tar.gz filter=lfs diff=lfs merge=lfs -text
 /cache/**/*.whl filter=lfs diff=lfs merge=lfs -text
+
+# Unified-diff blank context lines intentionally contain a single space.
+/experiments/**/*.patch whitespace=-blank-at-eol

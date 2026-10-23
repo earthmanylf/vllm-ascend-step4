@@ -2,9 +2,9 @@
 set -euo pipefail
 node=${1:?node index 0..3}
 [[ "$node" =~ ^[0-3]$ ]] || exit 2
-ROOT="${SERVICE_ROOT:-/data/chensiyu/step5-tailring-service-20261023}"
-IMAGE="${IMAGE_REF:-quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-143f3649d8}"
-NAME="${CONTAINER_NAME:-step5-tailring-dp8tp4ep32-node${node}-20261023}"
+ROOT="${SERVICE_ROOT:-/data/chensiyu/step5-tailring-final-service-20261023}"
+IMAGE="${IMAGE_REF:-quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-143f3649d8-final}"
+NAME="${CONTAINER_NAME:-step5-tailring-final-node${node}-20261023}"
 DRAFT_EAGER="${MTP_DRAFT_EAGER:-false}"
 [[ -f "$ROOT/serve-tailring-dp8tp4.sh" ]] || { echo "Missing service script" >&2; exit 2; }
 if docker container inspect "$NAME" >/dev/null 2>&1; then

@@ -1,0 +1,77 @@
+{
+  "scope": "CPU replay of installed planner with MTP3 retention and seven real groups; six cacheable groups appear in alignment log because private ring filtered. Per-DP pool23631 inferred exactly from live kv_cache_max_concurrency; metrics num_gpu_blocks189046 is DP sum, not per-DP.",
+  "model_weight_gib_observed": 27.66,
+  "kv_budget_gib_observed": 49.76,
+  "groups": [
+    {
+      "type": "FullAttentionSpec",
+      "layers": 23,
+      "block_size": 128,
+      "page_bytes": 98304,
+      "real_page_bytes": 98304,
+      "blocks_per_1M_request": 8192
+    },
+    {
+      "type": "FullAttentionSpec",
+      "layers": 23,
+      "block_size": 128,
+      "page_bytes": 98304,
+      "real_page_bytes": 4096,
+      "blocks_per_1M_request": 8192
+    },
+    {
+      "type": "CircularBufferSpec",
+      "layers": 23,
+      "block_size": 128,
+      "page_bytes": 98304,
+      "real_page_bytes": 98304,
+      "blocks_per_1M_request": 1
+    },
+    {
+      "type": "SlidingWindowSpec",
+      "layers": 18,
+      "block_size": 128,
+      "page_bytes": 98304,
+      "real_page_bytes": 98304,
+      "blocks_per_1M_request": 262
+    },
+    {
+      "type": "SlidingWindowSpec",
+      "layers": 18,
+      "block_size": 128,
+      "page_bytes": 98304,
+      "real_page_bytes": 98304,
+      "blocks_per_1M_request": 262
+    },
+    {
+      "type": "SlidingWindowSpec",
+      "layers": 18,
+      "block_size": 128,
+      "page_bytes": 98304,
+      "real_page_bytes": 98304,
+      "blocks_per_1M_request": 262
+    },
+    {
+      "type": "SlidingWindowSpec",
+      "layers": 18,
+      "block_size": 128,
+      "page_bytes": 98304,
+      "real_page_bytes": 98304,
+      "blocks_per_1M_request": 262
+    }
+  ],
+  "blocks_per_1M_request": 17433,
+  "printed_capacity_tokens": 1421378,
+  "compatible_live_block_counts": [
+    23631
+  ],
+  "pool_bytes_per_block": 2260992,
+  "bs128_balanced_requests_per_dp": 16,
+  "sequence_len": 133120,
+  "decode_blocks_per_request": 2105,
+  "decode_pool_gib_for16": 70.92041015625,
+  "main_pool_gib_for16": 35.0390625,
+  "summary_pool_gib_for16": 35.0390625,
+  "summary_real_to_padded_ratio": 24.0,
+  "note": "Summary is independently addressed and padded to main page; startup maxlen-derived token capacity is not linear residency proof. Do not bypass guards without case-specific real group evidence."
+}

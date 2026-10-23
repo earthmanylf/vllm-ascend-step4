@@ -1,0 +1,663 @@
+{
+  "size": 20,
+  "phases": [
+    "full-off-a",
+    "full-off-b",
+    "eager-off-a",
+    "eager-off-b",
+    "full-off-c"
+  ],
+  "comparisons": [
+    {
+      "baseline": "full-off-a",
+      "phase": "full-off-b",
+      "exact": 20,
+      "total": 20,
+      "requests": [
+        {
+          "index": 0,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 1,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 2,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 3,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 4,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 5,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 6,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 7,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 8,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 9,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 10,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 11,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 12,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 13,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 14,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 15,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 16,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 17,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 18,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 19,
+          "exact": true,
+          "first_difference": null
+        }
+      ]
+    },
+    {
+      "baseline": "full-off-a",
+      "phase": "eager-off-a",
+      "exact": 20,
+      "total": 20,
+      "requests": [
+        {
+          "index": 0,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 1,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 2,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 3,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 4,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 5,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 6,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 7,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 8,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 9,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 10,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 11,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 12,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 13,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 14,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 15,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 16,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 17,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 18,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 19,
+          "exact": true,
+          "first_difference": null
+        }
+      ]
+    },
+    {
+      "baseline": "full-off-a",
+      "phase": "eager-off-b",
+      "exact": 20,
+      "total": 20,
+      "requests": [
+        {
+          "index": 0,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 1,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 2,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 3,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 4,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 5,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 6,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 7,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 8,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 9,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 10,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 11,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 12,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 13,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 14,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 15,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 16,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 17,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 18,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 19,
+          "exact": true,
+          "first_difference": null
+        }
+      ]
+    },
+    {
+      "baseline": "full-off-a",
+      "phase": "full-off-c",
+      "exact": 20,
+      "total": 20,
+      "requests": [
+        {
+          "index": 0,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 1,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 2,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 3,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 4,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 5,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 6,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 7,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 8,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 9,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 10,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 11,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 12,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 13,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 14,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 15,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 16,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 17,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 18,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 19,
+          "exact": true,
+          "first_difference": null
+        }
+      ]
+    },
+    {
+      "baseline": "eager-off-a",
+      "phase": "eager-off-b",
+      "exact": 20,
+      "total": 20,
+      "requests": [
+        {
+          "index": 0,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 1,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 2,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 3,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 4,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 5,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 6,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 7,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 8,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 9,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 10,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 11,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 12,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 13,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 14,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 15,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 16,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 17,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 18,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 19,
+          "exact": true,
+          "first_difference": null
+        }
+      ]
+    },
+    {
+      "baseline": "full-off-b",
+      "phase": "full-off-c",
+      "exact": 20,
+      "total": 20,
+      "requests": [
+        {
+          "index": 0,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 1,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 2,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 3,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 4,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 5,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 6,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 7,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 8,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 9,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 10,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 11,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 12,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 13,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 14,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 15,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 16,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 17,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 18,
+          "exact": true,
+          "first_difference": null
+        },
+        {
+          "index": 19,
+          "exact": true,
+          "first_difference": null
+        }
+      ]
+    }
+  ],
+  "trace": "false",
+  "ordered_waves": true,
+  "control": "single process/image; fixed DP; scheduler paused while admitting each batch; target FULL unchanged"
+}

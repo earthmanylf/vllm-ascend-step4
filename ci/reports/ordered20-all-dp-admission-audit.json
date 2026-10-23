@@ -1,0 +1,925 @@
+{
+  "pass": true,
+  "audit": {
+    "full-ord-a-dp0": {
+      "node": 0,
+      "indices": [
+        0,
+        8,
+        16
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-a-dp1": {
+      "node": 0,
+      "indices": [
+        1,
+        9,
+        17
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-b-dp0": {
+      "node": 0,
+      "indices": [
+        0,
+        8,
+        16
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-b-dp1": {
+      "node": 0,
+      "indices": [
+        1,
+        9,
+        17
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-a-dp0": {
+      "node": 0,
+      "indices": [
+        0,
+        8,
+        16
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-a-dp1": {
+      "node": 0,
+      "indices": [
+        1,
+        9,
+        17
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-b-dp0": {
+      "node": 0,
+      "indices": [
+        0,
+        8,
+        16
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-b-dp1": {
+      "node": 0,
+      "indices": [
+        1,
+        9,
+        17
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-c-dp0": {
+      "node": 0,
+      "indices": [
+        0,
+        8,
+        16
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-c-dp1": {
+      "node": 0,
+      "indices": [
+        1,
+        9,
+        17
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-a-dp2": {
+      "node": 1,
+      "indices": [
+        2,
+        10,
+        18
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-a-dp3": {
+      "node": 1,
+      "indices": [
+        3,
+        11,
+        19
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-b-dp2": {
+      "node": 1,
+      "indices": [
+        2,
+        10,
+        18
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-b-dp3": {
+      "node": 1,
+      "indices": [
+        3,
+        11,
+        19
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-a-dp2": {
+      "node": 1,
+      "indices": [
+        2,
+        10,
+        18
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-a-dp3": {
+      "node": 1,
+      "indices": [
+        3,
+        11,
+        19
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-b-dp2": {
+      "node": 1,
+      "indices": [
+        2,
+        10,
+        18
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-b-dp3": {
+      "node": 1,
+      "indices": [
+        3,
+        11,
+        19
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-c-dp2": {
+      "node": 1,
+      "indices": [
+        2,
+        10,
+        18
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-c-dp3": {
+      "node": 1,
+      "indices": [
+        3,
+        11,
+        19
+      ],
+      "query": [
+        0,
+        1024,
+        2048,
+        3072
+      ],
+      "scheduled": [
+        1024,
+        1024,
+        1024
+      ],
+      "tokens": 3072,
+      "seq_lens": [
+        1024,
+        1024,
+        1024
+      ]
+    },
+    "full-ord-a-dp4": {
+      "node": 2,
+      "indices": [
+        4,
+        12
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-a-dp5": {
+      "node": 2,
+      "indices": [
+        5,
+        13
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-b-dp4": {
+      "node": 2,
+      "indices": [
+        4,
+        12
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-b-dp5": {
+      "node": 2,
+      "indices": [
+        5,
+        13
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-a-dp4": {
+      "node": 2,
+      "indices": [
+        4,
+        12
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-a-dp5": {
+      "node": 2,
+      "indices": [
+        5,
+        13
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-b-dp4": {
+      "node": 2,
+      "indices": [
+        4,
+        12
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-b-dp5": {
+      "node": 2,
+      "indices": [
+        5,
+        13
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-c-dp5": {
+      "node": 2,
+      "indices": [
+        5,
+        13
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-c-dp4": {
+      "node": 2,
+      "indices": [
+        4,
+        12
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-a-dp6": {
+      "node": 3,
+      "indices": [
+        6,
+        14
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-a-dp7": {
+      "node": 3,
+      "indices": [
+        7,
+        15
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-b-dp6": {
+      "node": 3,
+      "indices": [
+        6,
+        14
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-b-dp7": {
+      "node": 3,
+      "indices": [
+        7,
+        15
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-a-dp7": {
+      "node": 3,
+      "indices": [
+        7,
+        15
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-a-dp6": {
+      "node": 3,
+      "indices": [
+        6,
+        14
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-b-dp6": {
+      "node": 3,
+      "indices": [
+        6,
+        14
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "eager-ord-b-dp7": {
+      "node": 3,
+      "indices": [
+        7,
+        15
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-c-dp6": {
+      "node": 3,
+      "indices": [
+        6,
+        14
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    },
+    "full-ord-c-dp7": {
+      "node": 3,
+      "indices": [
+        7,
+        15
+      ],
+      "query": [
+        0,
+        1024,
+        2048
+      ],
+      "scheduled": [
+        1024,
+        1024
+      ],
+      "tokens": 2048,
+      "seq_lens": [
+        1024,
+        1024
+      ]
+    }
+  }
+}

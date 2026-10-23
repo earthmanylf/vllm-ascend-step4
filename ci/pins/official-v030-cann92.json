@@ -136,5 +136,18 @@
     "native_source_commit": "624cc9d19a74dcb8c685c4c7c5b3b4829dbfbab3",
     "installed_distribution_version": "0.19.1rc2.dev2976+g624cc9d19a",
     "note": "Incremental installed Python revision143f; unchanged1114native files; full recipe below rebuilds latest wheel metadata"
+  },
+  "validated_final_image": {
+    "image": "quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-tailring-143f3649d8-final",
+    "config": "sha256:819e33aac7faff91480d4c6e5f861d1bc0c73c1c301fb40079eaad41f46f8e58",
+    "source_commit": "143f3649d8181edae635091c5fe809eb51ff992c",
+    "native_source_commit": "624cc9d19a74dcb8c685c4c7c5b3b4829dbfbab3",
+    "installed_distribution_version": "0.19.1rc2.dev2977+g143f3649d8",
+    "base_wheel_sha256": "8cb7397fba6618d48bd48733bea6f1e666e8ce96f190d178d24e92b5effac652",
+    "built_wheel_sha256": "b7280934e03a2cf7ce4542f20f0d333845d78c745e89091055067e597965ed86",
+    "preserved_native_file_count": 1114,
+    "repack_helper_sha256": "1bf103c8cbc2fbf1f9ba3f6593fb0e6b5abfe5e77932986831d3f581d916b41b",
+    "repack_recipe_sha256": "209b4b07b7d212ad520e511a075cd758d972f5a2029ec5678ed95a3b5b40b54c",
+    "note": "Built using earlier repack helper; hardened helper preserves payload but new ZIP timestamps need not reproduce wheel SHA/image ID. Both remain separate evidence."
   }
 }

@@ -1,0 +1,85 @@
+===run_exit===
+0
+===health===
+200
+===idle===
+# HELP vllm:spec_decode_num_drafts_total Number of spec decoding drafts.
+# TYPE vllm:spec_decode_num_drafts_total counter
+vllm:spec_decode_num_drafts_total{engine="0",model_name="step5"} 45282.0
+vllm:spec_decode_num_drafts_total{engine="1",model_name="step5"} 45565.0
+vllm:spec_decode_num_drafts_total{engine="2",model_name="step5"} 47196.0
+vllm:spec_decode_num_drafts_total{engine="3",model_name="step5"} 44885.0
+vllm:spec_decode_num_drafts_total{engine="4",model_name="step5"} 45480.0
+vllm:spec_decode_num_drafts_total{engine="5",model_name="step5"} 46016.0
+vllm:spec_decode_num_drafts_total{engine="6",model_name="step5"} 46672.0
+vllm:spec_decode_num_drafts_total{engine="7",model_name="step5"} 41779.0
+# HELP vllm:spec_decode_num_draft_tokens_total Number of draft tokens.
+# TYPE vllm:spec_decode_num_draft_tokens_total counter
+vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="step5"} 135846.0
+vllm:spec_decode_num_draft_tokens_total{engine="1",model_name="step5"} 136695.0
+vllm:spec_decode_num_draft_tokens_total{engine="2",model_name="step5"} 141588.0
+vllm:spec_decode_num_draft_tokens_total{engine="3",model_name="step5"} 134655.0
+vllm:spec_decode_num_draft_tokens_total{engine="4",model_name="step5"} 136440.0
+vllm:spec_decode_num_draft_tokens_total{engine="5",model_name="step5"} 138048.0
+vllm:spec_decode_num_draft_tokens_total{engine="6",model_name="step5"} 140016.0
+vllm:spec_decode_num_draft_tokens_total{engine="7",model_name="step5"} 125337.0
+# HELP vllm:spec_decode_num_accepted_tokens_total Number of accepted tokens.
+# TYPE vllm:spec_decode_num_accepted_tokens_total counter
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="step5"} 51078.0
+vllm:spec_decode_num_accepted_tokens_total{engine="1",model_name="step5"} 50842.0
+vllm:spec_decode_num_accepted_tokens_total{engine="2",model_name="step5"} 51197.0
+vllm:spec_decode_num_accepted_tokens_total{engine="3",model_name="step5"} 53509.0
+vllm:spec_decode_num_accepted_tokens_total{engine="4",model_name="step5"} 52900.0
+vllm:spec_decode_num_accepted_tokens_total{engine="5",model_name="step5"} 52367.0
+vllm:spec_decode_num_accepted_tokens_total{engine="6",model_name="step5"} 51714.0
+vllm:spec_decode_num_accepted_tokens_total{engine="7",model_name="step5"} 54564.0
+# HELP vllm:spec_decode_num_accepted_tokens_per_pos_total Accepted tokens per draft position.
+# TYPE vllm:spec_decode_num_accepted_tokens_per_pos_total counter
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="step5",position="0"} 17473.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="step5",position="1"} 16807.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="step5",position="2"} 16798.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="1",model_name="step5",position="0"} 17354.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="1",model_name="step5",position="1"} 16826.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="1",model_name="step5",position="2"} 16662.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="2",model_name="step5",position="0"} 17471.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="2",model_name="step5",position="1"} 16870.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="2",model_name="step5",position="2"} 16856.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="3",model_name="step5",position="0"} 18964.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="3",model_name="step5",position="1"} 17299.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="3",model_name="step5",position="2"} 17246.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="4",model_name="step5",position="0"} 19560.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="4",model_name="step5",position="1"} 16682.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="4",model_name="step5",position="2"} 16658.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="5",model_name="step5",position="0"} 19382.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="5",model_name="step5",position="1"} 16511.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="5",model_name="step5",position="2"} 16474.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="6",model_name="step5",position="0"} 18140.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="6",model_name="step5",position="1"} 16845.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="6",model_name="step5",position="2"} 16729.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="7",model_name="step5",position="0"} 19809.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="7",model_name="step5",position="1"} 17405.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="7",model_name="step5",position="2"} 17350.0
+vllm:num_requests_running{engine="0",model_name="step5"} 0.0
+vllm:num_requests_running{engine="1",model_name="step5"} 0.0
+vllm:num_requests_running{engine="2",model_name="step5"} 0.0
+vllm:num_requests_running{engine="3",model_name="step5"} 0.0
+vllm:num_requests_running{engine="4",model_name="step5"} 0.0
+vllm:num_requests_running{engine="5",model_name="step5"} 0.0
+vllm:num_requests_running{engine="6",model_name="step5"} 0.0
+vllm:num_requests_running{engine="7",model_name="step5"} 0.0
+vllm:num_requests_waiting{engine="0",model_name="step5"} 0.0
+vllm:num_requests_waiting{engine="1",model_name="step5"} 0.0
+vllm:num_requests_waiting{engine="2",model_name="step5"} 0.0
+vllm:num_requests_waiting{engine="3",model_name="step5"} 0.0
+vllm:num_requests_waiting{engine="4",model_name="step5"} 0.0
+vllm:num_requests_waiting{engine="5",model_name="step5"} 0.0
+vllm:num_requests_waiting{engine="6",model_name="step5"} 0.0
+vllm:num_requests_waiting{engine="7",model_name="step5"} 0.0
+vllm:num_preemptions_total{engine="0",model_name="step5"} 0.0
+vllm:num_preemptions_total{engine="1",model_name="step5"} 0.0
+vllm:num_preemptions_total{engine="2",model_name="step5"} 0.0
+vllm:num_preemptions_total{engine="3",model_name="step5"} 0.0
+vllm:num_preemptions_total{engine="4",model_name="step5"} 0.0
+vllm:num_preemptions_total{engine="5",model_name="step5"} 0.0
+vllm:num_preemptions_total{engine="6",model_name="step5"} 0.0
+vllm:num_preemptions_total{engine="7",model_name="step5"} 0.0
