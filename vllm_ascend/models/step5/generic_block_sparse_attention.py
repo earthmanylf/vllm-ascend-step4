@@ -35,6 +35,15 @@ tiling -- and the per-layer forward passes it straight through.
 
 ``is_consistent_topk`` is fixed to ``False``: live counts vary per row in
 serving, and the operator's consistent-count fast path does not apply.
+
+``gbsa_union_sparse_attention`` is the union (mask_mode=3) variant of
+``gbsa_sparse_attention`` for prefill: the aclnn ``UnionSparseMeta``
+operator (ops-nn) deduplicates each region's per-token selections into a
+union that GenericBlockSparseAttention computes once, restoring per-token
+visibility through ``exactMask`` bitmasks. It is selected per request by
+``VLLM_ASCEND_ENABLE_STEP4_UNION_SPARSE`` and runs its union
+preprocessing and AICPU metadata per layer (union counts are
+selection-dependent, unlike the position-derived base counts).
 """
 
 from __future__ import annotations
@@ -50,8 +59,12 @@ from cann_ops_transformer.ops.attention.generic_block_sparse_attention import (
 
 _SPARSE_PATTERN_PER_GROUP_PER_TOKEN = 4
 _MASK_CAUSAL = 1
+_MASK_UNION = 3
 _QUANT_NONE = 0
 _SOFTMAX_PRECISION_FP32 = 1
+_SOFTMAX_PRECISION_BF16 = 0
+_WINDOW_DISABLED = -1
+_RESIDUAL_BLOCK_MODE_DISABLED = 0
 
 
 @triton.jit
@@ -217,6 +230,97 @@ def gbsa_sparse_attention_metadata(
     )
 
 
+def _union_step_geometry(
+    seq_lens_host: list,
+    context_lens_host: list,
+    *,
+    region_size: int,
+    topk: int,
+) -> tuple[int, int, int, int]:
+    """Host-side union geometry shared by every layer of one prefill step.
+
+    Returns ``(max_query_len, num_union_groups, union_capacity,
+    max_kv_blocks)``. All four derive from the step's seq-lens and the
+    selection width only -- never from device data -- so the attention
+    metadata builder can compute them before the model runs and every
+    layer's union tensors come out with exactly these shapes.
+    """
+    query_lens = [s - c for s, c in zip(seq_lens_host, context_lens_host)]
+    max_query_len = max(query_lens)
+    max_kv_blocks = max(1, max(-(-s // region_size) for s in seq_lens_host))
+    num_union_groups = sum(-(-q // region_size) for q in query_lens)
+    union_capacity = min(region_size * (topk + 1), max_kv_blocks)
+    return max_query_len, num_union_groups, union_capacity, max_kv_blocks
+
+
+def gbsa_union_sparse_metadata(
+    *,
+    num_heads: int,
+    num_kv_groups: int,
+    head_dim: int,
+    region_size: int,
+    topk: int,
+    cu_seqlens_q: torch.Tensor,
+    seqused_kv: torch.Tensor,
+    seq_lens_host: list,
+    context_lens_host: list,
+    max_pages: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Run the union (``mask_mode=3``) AICPU scheduling op once per step.
+
+    The scheduler tiles the step's query geometry and hands each core a
+    range of union-group block slots; it is fed the union *capacity* bound
+    -- the largest union any layer of the step can produce -- instead of
+    one layer's actual counts. Every layer's real union count is at most
+    that bound by construction (the union builder op validates it), and
+    the AI Core attention kernel clamps its scheduled ranges to the
+    runtime ``sparse_block_count`` tensor, so a single schedule serves all
+    layers of the step. This is the same upper-bound-scheduling contract
+    the base path's ``gbsa_expected_counts`` relies on, and it is why the
+    metadata is tiling, not per-layer data.
+
+    Only tensor shapes and the count values are read on the host; the
+    zero-filled idx never reaches the AI Core kernel.
+    """
+    max_query_len, num_union_groups, union_capacity, _ = _union_step_geometry(
+        seq_lens_host, context_lens_host, region_size=region_size, topk=topk
+    )
+    idx_shape = torch.zeros(
+        (num_kv_groups, num_union_groups, union_capacity),
+        dtype=torch.int32,
+        device=seqused_kv.device,
+    )
+    counts = torch.full(
+        (num_kv_groups, num_union_groups),
+        union_capacity,
+        dtype=torch.int32,
+        device=seqused_kv.device,
+    )
+    return generic_block_sparse_attention_metadata(
+        idx_shape,
+        counts,
+        num_heads,
+        num_kv_groups,
+        head_dim,
+        [1, region_size],
+        cu_seqlens_q=cu_seqlens_q.to(torch.int64),
+        seqused_kv=seqused_kv.to(torch.int32),
+        max_seqlen_q=max_query_len,
+        max_seqlen_kv=max_pages * page_size,
+        layout_q="TND",
+        layout_kv="PA_BBND",
+        layout_sparse_pattern=_SPARSE_PATTERN_PER_GROUP_PER_TOKEN,
+        mask_mode=_MASK_UNION,
+        quant_mode=_QUANT_NONE,
+        softmax_precision=_SOFTMAX_PRECISION_BF16,
+        win_left=_WINDOW_DISABLED,
+        win_right=_WINDOW_DISABLED,
+        residual_block_mode=_RESIDUAL_BLOCK_MODE_DISABLED,
+        is_consistent_topk=False,
+    )
+
+
 def gbsa_sparse_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -283,6 +387,145 @@ def gbsa_sparse_attention(
         [1, region_size],
         metadata=metadata,
         block_table=block_table,
+        softmax_scale=softmax_scale,
+        return_softmax_lse=False,
+        **common,
+    )
+    return out
+
+
+def gbsa_union_sparse_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    ids: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_kv: torch.Tensor,
+    *,
+    num_kv_groups: int,
+    region_size: int,
+    softmax_scale: float,
+    seq_lens_host: list,
+    context_lens_host: list,
+    metadata: torch.Tensor,
+) -> torch.Tensor:
+    """Union (mask_mode=3) variant of :func:`gbsa_sparse_attention`.
+
+    The aclnn ``UnionSparseMeta`` operator (ops-nn) merges the appended
+    per-token selections of each ``region_size``-token region into one
+    deduplicated union; GenericBlockSparseAttention then gathers and
+    computes the union once and restores every token's exact selection
+    through the union ``exactMask`` bitmasks. This removes the redundant
+    KV gathers / QK^T GEMMs of heavily-overlapping adjacent selections
+    (measured on real Step-5 prefill: union ~555 blocks per region vs
+    ~3592 per-token block visits, 2.7x on the attention op).
+
+    ``metadata`` is the step's union AICPU schedule from
+    :func:`gbsa_union_sparse_metadata`, built once in the attention
+    metadata builder. It is pure tiling -- scheduled from the union
+    capacity bound, with every layer's actual union counts resolved
+    against it at run time by the AI Core kernel -- so all layers of the
+    step share it, exactly like the base path's per-step metadata.
+
+    Everything on the hot path stays on device: the operator consumes the
+    packed int32 seq-len tensors directly, and the union geometry (group
+    count, capacity) comes from the builder's CPU seq-len copies
+    (``seq_lens_host`` / ``context_lens_host``) -- no tensor is read back
+    to the host and no shape value is derived from device data.
+
+    Returns ``out`` shaped ``[total_q, num_heads, head_dim]``.
+    """
+    if num_kv_groups != 1:
+        raise NotImplementedError(
+            "The union sparse path currently requires a single KV group "
+            f"(MQA), got num_kv_groups={num_kv_groups}."
+        )
+    if region_size != 8:
+        raise NotImplementedError(
+            "The union sparse path currently requires region_size=8 "
+            f"(UnionSparseMeta v1 block/union granularity), got {region_size}."
+        )
+    try:
+        # Registers torch.ops.cann_ops_nn.union_sparse_meta_launch
+        # (schema + NPU dispatch); a sys.modules hit after the first call.
+        import cann_ops_nn_custom_nn  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "VLLM_ASCEND_ENABLE_STEP4_UNION_SPARSE=1 requires the "
+            "UnionSparseMeta operator (ops-nn): install the custom_nn "
+            "vendor package and the cann_ops_nn_custom_nn wheel."
+        ) from exc
+
+    idx, counts = _append_current_region(
+        ids, positions, groups=num_kv_groups, region_size=region_size
+    )
+    # Union geometry from the builder's CPU copies (host ints, no sync):
+    # the capacity must cover min(region selection width, every logical
+    # block of the longest request) -- the safe bound the operator
+    # enforces -- and the group count is one union per region. These are
+    # step constants, identical to what gbsa_union_sparse_metadata
+    # scheduled the step's shared tiling from.
+    _, num_union_groups, union_capacity, max_kv_blocks = _union_step_geometry(
+        seq_lens_host,
+        context_lens_host,
+        region_size=region_size,
+        topk=idx.shape[2] - 1,
+    )
+
+    seqused_kv_i32 = seqused_kv.to(torch.int32)
+    cu_seqlens_kv = torch.cat(
+        (
+            torch.zeros((1,), device=seqused_kv_i32.device, dtype=torch.int32),
+            seqused_kv_i32.cumsum(0, dtype=torch.int32),
+        )
+    )
+    union_idx, union_counts, exact_mask = (
+        torch.ops.cann_ops_nn.union_sparse_meta_launch(
+            idx,
+            counts,
+            cu_seqlens_q.to(torch.int32),
+            cu_seqlens_kv,
+            None,
+            seqused_kv_i32,
+            1,
+            region_size,
+            region_size,
+            True,
+            union_capacity,
+            num_union_groups,
+            max_kv_blocks,
+        )
+    )
+    common = dict(
+        cu_seqlens_q=cu_seqlens_q.to(torch.int64),
+        cu_seqlens_kv=None,
+        seqused_kv=seqused_kv_i32,
+        layout_q="TND",
+        layout_kv="PA_BBND",
+        layout_sparse_pattern=_SPARSE_PATTERN_PER_GROUP_PER_TOKEN,
+        mask_mode=_MASK_UNION,
+        quant_mode=_QUANT_NONE,
+        softmax_precision=_SOFTMAX_PRECISION_BF16,
+        win_left=_WINDOW_DISABLED,
+        win_right=_WINDOW_DISABLED,
+        residual_block_mode=_RESIDUAL_BLOCK_MODE_DISABLED,
+        is_consistent_topk=False,
+    )
+    # The step's shared tiling: scheduled once in the metadata builder
+    # from the union capacity bound; the kernel clamps its ranges to this
+    # layer's runtime union counts.
+    out, _lse = generic_block_sparse_attention(
+        query,
+        key_cache,
+        value_cache,
+        union_idx,
+        union_counts,
+        [1, region_size],
+        metadata=metadata,
+        block_table=block_table,
+        attn_mask=exact_mask,
         softmax_scale=softmax_scale,
         return_softmax_lse=False,
         **common,

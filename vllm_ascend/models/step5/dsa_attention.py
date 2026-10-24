@@ -62,10 +62,13 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 
+from vllm_ascend import envs
 from vllm_ascend.models.step5.generic_block_sparse_attention import (
     gbsa_expected_counts,
     gbsa_sparse_attention,
     gbsa_sparse_attention_metadata,
+    gbsa_union_sparse_attention,
+    gbsa_union_sparse_metadata,
 )
 from vllm_ascend.worker.step5_csa_slot_manager import (
     CSA_SLOTS_PER_REQUEST,
@@ -200,6 +203,12 @@ class AscendStep5DSAPrefillMetadata:
     """Per-step AICPU GenericBlockSparseAttention scheduling tensor, built
     once in the builder from the query positions and shared across all
     layers (the scheduled counts are position-derived, layer-independent)."""
+
+    gbsa_union_metadata: torch.Tensor = None
+    """Per-step union (mask_mode=3) AICPU scheduling tensor, built once in
+    the builder from the union capacity bound and shared across all layers
+    (pure tiling: the kernel clamps its ranges to each layer's runtime
+    union counts). Only populated when the union sparse path is enabled."""
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -483,6 +492,25 @@ class AscendStep5DSAMetadataBuilder(
                 path="prefill",
                 graph_shape=graph_shape,
             )
+            if envs.VLLM_ASCEND_ENABLE_STEP4_UNION_SPARSE:
+                # Union tiling, also once per step: the schedule is built
+                # from the union capacity bound (the largest union any
+                # layer can produce), and the AI Core kernel clamps its
+                # ranges to each layer's runtime union counts, so every
+                # layer of the step shares this one tensor.
+                prefill_metadata.gbsa_union_metadata = gbsa_union_sparse_metadata(
+                    num_heads=self.gbsa_num_heads,
+                    num_kv_groups=self.gbsa_num_kv_groups,
+                    head_dim=self.gbsa_head_size,
+                    region_size=self.gbsa_region_size,
+                    topk=self.gbsa_topk,
+                    cu_seqlens_q=prefill_metadata.query_start_loc,
+                    seqused_kv=prefill_seq_lens,
+                    seq_lens_host=prefill_metadata.seq_lens_host,
+                    context_lens_host=prefill_metadata.context_lens_host,
+                    max_pages=int(block_table.shape[1]),
+                    page_size=self.gbsa_block_size,
+                )
 
         decode_metadata: AscendStep5DSADecodeMetadata | None = None
         active_decodes = 0
@@ -1465,20 +1493,44 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             topk=self.topk_regions,
             region_size=self.region_size,
         )
-        out = gbsa_sparse_attention(
-            query,
-            key_cache,
-            value_cache,
-            ids,
-            q_positions,
-            p.block_table[:num_reqs],
-            cu_seq_lens,
-            p.seq_lens[:num_reqs].to(torch.int32),
-            p.gbsa_metadata,
-            num_kv_groups=self.num_kv_groups,
-            region_size=self.region_size,
-            softmax_scale=self.scale,
-        )
+        if envs.VLLM_ASCEND_ENABLE_STEP4_UNION_SPARSE:
+            # Union path (mask_mode=3): per-layer UnionSparseMeta + the
+            # step's shared union tiling from the builder (scheduled from
+            # the union capacity bound; the kernel clamps to the runtime
+            # counts, so one tensor serves every layer). Host union
+            # geometry comes from the builder's CPU seq-len copies -- no
+            # device readback.
+            out = gbsa_union_sparse_attention(
+                query,
+                key_cache,
+                value_cache,
+                ids,
+                q_positions,
+                p.block_table[:num_reqs],
+                cu_seq_lens,
+                p.seq_lens[:num_reqs].to(torch.int32),
+                num_kv_groups=self.num_kv_groups,
+                region_size=self.region_size,
+                softmax_scale=self.scale,
+                seq_lens_host=p.seq_lens_host,
+                context_lens_host=p.context_lens_host,
+                metadata=p.gbsa_union_metadata,
+            )
+        else:
+            out = gbsa_sparse_attention(
+                query,
+                key_cache,
+                value_cache,
+                ids,
+                q_positions,
+                p.block_table[:num_reqs],
+                cu_seq_lens,
+                p.seq_lens[:num_reqs].to(torch.int32),
+                p.gbsa_metadata,
+                num_kv_groups=self.num_kv_groups,
+                region_size=self.region_size,
+                softmax_scale=self.scale,
+            )
         output[token_offset : token_offset + num_query_tokens] = out.to(output.dtype)
 
     def forward(
