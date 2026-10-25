@@ -229,6 +229,7 @@ def test_mixed_batch_uses_decode_then_prefill_with_matching_ring_offset(spec_tok
         _summary_owners=lambda qsl, rows: torch.zeros(rows, dtype=torch.int32),
     )
     md = types.SimpleNamespace(
+        graph_decode=None,
         num_actual_tokens=4,
         num_decode_tokens=1,
         num_decodes=1,
@@ -264,6 +265,7 @@ def test_uniform_decode_only_uses_verify_for_actual_multitoken_queries(query_len
     impl = types.SimpleNamespace(csa_ring=FakeRing(8), num_speculative_tokens=3)
     rows = 2 * query_len
     md = types.SimpleNamespace(
+        graph_decode=None,
         num_actual_tokens=rows,
         num_decode_tokens=rows,
         num_decodes=2,
@@ -285,7 +287,14 @@ def test_uniform_decode_only_uses_verify_for_actual_multitoken_queries(query_len
 
 @pytest.mark.parametrize("tokens", [0, 1])
 def test_forward_clears_padding_without_touching_actual_output(tokens):
-    md = types.SimpleNamespace(num_actual_tokens=tokens, num_decodes=0, num_prefills=tokens, num_decode_tokens=0)
+    md = types.SimpleNamespace(
+        graph_decode=None,
+        decode=None,
+        num_actual_tokens=tokens,
+        num_decodes=0,
+        num_prefills=tokens,
+        num_decode_tokens=0,
+    )
     namespace = dict(
         torch=torch,
         AscendStep5DSAMetadata=types.SimpleNamespace,
@@ -690,6 +699,7 @@ def test_summary_spec_preserves_logical_block_size_with_physical_page_padding():
         torch=torch,
         Any=object,
         Step5SparseSummaryCacheLayer=Base,
+        uses_step5_blnhc=lambda _: False,
         replace=replace,
         AscendStep5SparseSummaryBackend=object,
     )
@@ -729,7 +739,7 @@ def test_summary_binding_installs_the_cache_used_by_dsa():
     impl = next(n for n in dsa_tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendStep5DSAImpl")
     forward = next(n for n in impl.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
     forward.decorator_list = []
-    md = types.SimpleNamespace(num_actual_tokens=1, num_decodes=0, num_prefills=0)
+    md = types.SimpleNamespace(graph_decode=None, decode=None, num_actual_tokens=1, num_decodes=0, num_prefills=0)
     forward_namespace = dict(
         torch=torch,
         AttentionLayer=object,
@@ -943,7 +953,7 @@ def test_summary_group_physical_overlay_isolated_from_main_and_ring(query_len):
 
 @pytest.mark.parametrize("summary_entry", ["absent", None])
 def test_forward_requires_independent_summary_metadata(summary_entry):
-    md = types.SimpleNamespace(num_actual_tokens=1, num_decodes=0, num_prefills=0)
+    md = types.SimpleNamespace(graph_decode=None, decode=None, num_actual_tokens=1, num_decodes=0, num_prefills=0)
     context = {"dsa": md}
     if summary_entry != "absent":
         context["summary"] = summary_entry
@@ -960,3 +970,51 @@ def test_forward_requires_independent_summary_metadata(summary_entry):
     output = torch.zeros(1, 1)
     with pytest.raises(RuntimeError, match="summary.*metadata"):
         forward(impl, types.SimpleNamespace(layer_name="dsa"), output, (output, output), *([output] * 6))
+
+
+@pytest.mark.parametrize("block", [0, 910, 911, 16384, 21999])
+@pytest.mark.parametrize("stride", [98304, 2359296])
+def test_summary_store_preserves_wide_page_addresses(block, stride):
+    """Execute the production address expression with actual int32 CPU tensors.
+
+    Numerical FP8 conversion is stubbed; pointer offsets are recorded without
+    allocating a huge backing. Compiled NPU IR and model evidence cover device
+    execution separately.
+    """
+    source = REPO_ROOT / "vllm_ascend/models/step5/summary_kernels.py"
+    node = next(
+        n for n in ast.parse(source.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_store_summary"
+    )
+    node.decorator_list = []
+    stores = []
+
+    class CastValue:
+        def to(self, *args, **kwargs):
+            return self
+
+    class Pointer:
+        def __init__(self, offset=0):
+            self.offset = offset
+
+        def __add__(self, offset):
+            return Pointer(self.offset + offset)
+
+    tl = types.SimpleNamespace(
+        int64=torch.int64,
+        bfloat16=torch.bfloat16,
+        float8e4nv=torch.float8_e4m3fn,
+        uint8=torch.uint8,
+        div_rn=lambda *args: CastValue(),
+        store=lambda ptr, value: stores.append(ptr.offset),
+    )
+    namespace = dict(tl=tl, _maximum=max)
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[future, node], type_ignores=[])), str(source), "exec"),
+        namespace,
+    )  # noqa: S102
+    slot = torch.tensor(block * 128 + 15, dtype=torch.int32)
+    dims = torch.arange(256, dtype=torch.int64)
+    namespace["_store_summary"](Pointer(), slot, dims, 1.0, 1.0, stride, 128)
+    assert len(stores) == 1
+    assert torch.equal(stores[0], block * stride + 256 + dims)

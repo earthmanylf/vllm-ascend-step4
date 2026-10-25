@@ -65,6 +65,11 @@ def validate_step5_blnhc_descriptors(config, layout):
             spec = specs[name]
             if type(spec) not in (FullAttentionSpec, SlidingWindowSpec, CircularBufferSpec):
                 raise ValueError("Step5 BLNHC does not support this cache spec")
+            if (
+                getattr(spec, "num_head_slots", None) is not None
+                or getattr(spec, "state_content_bytes", None) is not None
+            ):
+                raise ValueError("Step5 BLNHC does not support packed head slots or state content")
             ratio = getattr(spec, "tokens_per_state", 1)
             if spec.block_size != 128 or getattr(spec, "kv_quant_mode", 0) != 0:
                 raise ValueError("Step5 BLNHC requires unquantized 128-token manager blocks")
@@ -140,6 +145,14 @@ def step5_blnhc_layer_views(caches, specs):
         )
         if cache.dtype != spec.dtype or tuple(cache.shape) != expected:
             raise ValueError(f"Step5 BLNHC canonical cache shape mismatch: {name}")
+        page_elements = expected[1] * expected[2] * expected[3]
+        # BLNHC rows are dense; singleton strides do not affect addresses.
+        inner_strides = (expected[3], expected[1] * expected[3], 1)
+        if cache.stride(0) < page_elements or any(
+            size > 1 and cache.stride(dim) != stride
+            for dim, (size, stride) in enumerate(zip(expected[1:], inner_strides), 1)
+        ):
+            raise ValueError(f"Step5 BLNHC canonical cache blocks must be dense and non-overlapping: {name}")
         if spec.head_size_v == 0:
             result[name] = cache
         else:

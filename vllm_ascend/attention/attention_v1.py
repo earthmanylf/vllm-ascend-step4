@@ -73,6 +73,20 @@ _FIA_V2_WORKSPACE_KEY = "npu_fused_infer_attention_score_v2.workspace"
 _PA_WORKSPACE_KEY = "npu_paged_attention.workspace"
 
 
+def _fia_v1_pre_tokens(sliding_window: int | None) -> int:
+    """Translate vLLM's current-inclusive window to FIA V1's left distance.
+
+    FIA V1 includes both endpoints, so a window of W tokens requires W-1
+    historical tokens. Keep the configured window unchanged for cache planning,
+    graph providers, and other operators (notably FIA V2/sinks).
+    """
+    if sliding_window is None:
+        return SWA_INT_MAX
+    if sliding_window <= 0:
+        raise ValueError("FIA V1 sliding_window must be positive or None")
+    return sliding_window - 1
+
+
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
 class AscendAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -668,7 +682,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         input_layout = "TND"
         attn_mask = attn_metadata.attn_mask
         sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
-        pre_tokens = self.sliding_window or SWA_INT_MAX
+        pre_tokens = _fia_v1_pre_tokens(self.sliding_window)
         next_tokens = 0 if self.sliding_window else SWA_INT_MAX
         output_view = output[: attn_metadata.num_actual_tokens]
 
@@ -693,6 +707,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output_view = output_view.unsqueeze(2)
             attn_mask = None
             sparse_mode = 0
+            # Preserve the specialized C8/BNSD mode-0 contract, not SWA V1.
+            pre_tokens = self.sliding_window or SWA_INT_MAX
 
         if block_table is None:
             key = key.contiguous()
@@ -1003,7 +1019,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_key_value_heads=self.num_kv_heads,
                     num_heads=self.num_heads,
                     scale=self.scale,
-                    pre_tokens=self.sliding_window,
+                    pre_tokens=_fia_v1_pre_tokens(self.sliding_window),
                     next_tokens=0,
                     sparse_mode=4,
                 )

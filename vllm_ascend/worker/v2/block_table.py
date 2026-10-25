@@ -113,6 +113,7 @@ class AscendBlockTables(BlockTables):
             cp_interleave: int = 1,
             slot_mapping_enabled: list[bool] | None = None,
             dcp_sharded: list[bool] | None = None,
+            sliding_window_reach: list[int] | None = None,
         ):
             if kernel_block_sizes is None:
                 kernel_block_sizes = block_sizes
@@ -150,6 +151,7 @@ class AscendBlockTables(BlockTables):
                 cp_rank=cp_rank,
                 cp_interleave=cp_interleave,
                 slot_mapping_enabled=slot_mapping_enabled,
+                sliding_window_reach=sliding_window_reach,
                 **super_kwargs,
             )
             self.kernel_block_sizes_tensor = torch.tensor(kernel_block_sizes, dtype=torch.int32, device=self.device)

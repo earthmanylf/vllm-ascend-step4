@@ -5,6 +5,7 @@ import copy
 import importlib
 import importlib.util
 import unittest
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import patch
@@ -267,6 +268,188 @@ class BLNHCStorageTests(unittest.TestCase):
             helper.validate_step5_blnhc_descriptors(planned, KVCacheLayout.LBNHC)
 
 
+class BLNHCFailClosedTests(unittest.TestCase):
+    """Reject unsupported storage before allocation or native view creation."""
+
+    def setUp(self):
+        self.conf, self.planned = plan()
+        self.layer_specs = helper.validate_step5_blnhc_descriptors(self.planned, KVCacheLayout.BLNHC)
+        source = ROOT / "vllm_ascend/worker/v2/attn_utils.py"
+        tree = ast.parse(source.read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "allocate_kv_cache_main")
+        namespace = {
+            "get_current_vllm_config": lambda: self.conf,
+            "uses_step5_blnhc": helper.uses_step5_blnhc,
+            "validate_step5_blnhc_descriptors": helper.validate_step5_blnhc_descriptors,
+            "step5_blnhc_layer_views": helper.step5_blnhc_layer_views,
+            "allocate_upstream_kv_cache": allocate_kv_cache,
+        }
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                node,
+            ],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+        self.allocate_entrypoint = namespace["allocate_kv_cache_main"]
+        self.names = [
+            "model.layers.0.attn",
+            "model.layers.0.attn.sparse_summary_cache",
+            "model.layers.0.attn.csa_tail_ring",
+            "model.layers.3.attn",
+        ]
+
+    def canonical(self):
+        return allocate_kv_cache(
+            self.planned,
+            "cpu",
+            KVCacheLayout.BLNHC,
+            [128] * len(self.planned.kv_cache_groups),
+        )
+
+    def test_packed_overrides_rejected_before_upstream_allocation(self):
+        for name in self.names:
+            for field, value in (
+                ("num_head_slots", 1),
+                ("num_head_slots", 2),
+                ("state_content_bytes", self.layer_specs[name].state_content_size_bytes),
+                ("state_content_bytes", self.layer_specs[name].state_content_size_bytes // 2),
+            ):
+                with self.subTest(layer=name, field=field, value=value):
+                    groups = []
+                    for group in self.planned.kv_cache_groups:
+                        if name not in group.layer_names:
+                            groups.append(group)
+                            continue
+                        changed = dict(group.kv_cache_spec.kv_cache_specs)
+                        changed[name] = replace(changed[name], **{field: value})
+                        groups.append(
+                            replace(group, kv_cache_spec=replace(group.kv_cache_spec, kv_cache_specs=changed))
+                        )
+                    planned = get_kv_cache_config_from_groups(self.conf, groups, 10 * 1024 * 1024)
+                    with (
+                        patch.dict(
+                            self.allocate_entrypoint.__globals__,
+                            allocate_upstream_kv_cache=unittest.mock.Mock(
+                                side_effect=AssertionError("packed spec reached allocation"),
+                            ),
+                        ),
+                        patch.object(torch, "zeros", side_effect=AssertionError("must reject before allocation")),
+                        self.assertRaisesRegex(ValueError, "packed head slots or state content"),
+                    ):
+                        self.allocate_entrypoint(
+                            planned,
+                            "cpu",
+                            KVCacheLayout.BLNHC,
+                            [128] * len(groups),
+                        )
+
+    def test_dim0_alias_rejected_before_native_views_for_every_cache_type(self):
+        canonical = self.canonical()
+        for name in self.names:
+            cache = canonical[name]
+            page_elements = cache[0].numel()
+            for stride in (0, 1, page_elements // 2, page_elements - 1):
+                with self.subTest(layer=name, stride=stride):
+                    bad = cache.as_strided(cache.shape, (stride, *cache.stride()[1:]))
+                    with (
+                        patch.object(
+                            torch.Tensor, "as_strided", side_effect=AssertionError("bad cache reached native views")
+                        ),
+                        self.assertRaisesRegex(ValueError, "dense and non-overlapping"),
+                    ):
+                        helper.step5_blnhc_layer_views({name: bad}, {name: self.layer_specs[name]})
+
+    def test_inner_stride_crossing_into_next_id_rejected(self):
+        for name in self.names:
+            with self.subTest(layer=name):
+                spec = self.layer_specs[name]
+                shape = (2, spec.num_kv_heads, spec.num_states, spec.head_size + spec.head_size_v)
+                page_elements = shape[1] * shape[2] * shape[3]
+                backing = torch.zeros(3 * page_elements, dtype=spec.dtype)
+                bad = backing.as_strided(shape, (page_elements, shape[3], 2 * shape[3], 1))
+                with self.assertRaisesRegex(ValueError, "dense and non-overlapping"):
+                    helper.step5_blnhc_layer_views({name: bad}, {name: spec})
+
+    def test_singleton_head_stride_is_not_a_false_alias(self):
+        for name in self.names:
+            spec = self.layer_specs[name]
+            shape = (2, spec.num_kv_heads, spec.num_states, spec.head_size + spec.head_size_v)
+            dense = torch.zeros(shape, dtype=spec.dtype)
+            for head_stride in (dense.stride(1), 0):
+                with self.subTest(layer=name, head_stride=head_stride):
+                    strides = (dense.stride(0), head_stride, *dense.stride()[2:])
+                    cache = dense.as_strided(shape, strides)
+                    bound = helper.step5_blnhc_layer_views({name: cache}, {name: spec})[name]
+                    tensors = bound if isinstance(bound, tuple) else (bound,)
+                    for tensor in tensors:
+                        self.assertEqual(tensor.untyped_storage().data_ptr(), dense.untyped_storage().data_ptr())
+                    tensors[0][1].fill_(7)
+                    self.assertTrue(torch.all(tensors[0][0] == 0))
+
+    def test_legal_entrypoint_keeps_one_upstream_backing_and_page_geometry(self):
+        with (
+            patch.dict(
+                self.allocate_entrypoint.__globals__,
+                allocate_upstream_kv_cache=unittest.mock.Mock(wraps=allocate_kv_cache),
+            ),
+            patch.object(torch, "zeros", wraps=torch.zeros) as alloc,
+        ):
+            views = self.allocate_entrypoint(
+                self.planned,
+                "cpu",
+                KVCacheLayout.BLNHC,
+                [128] * len(self.planned.kv_cache_groups),
+            )
+            self.assertEqual(alloc.call_count, 1)
+            self.allocate_entrypoint.__globals__["allocate_upstream_kv_cache"].assert_called_once()
+        self.assertEqual(set(views), set(self.layer_specs))
+        storage_sizes = {}
+        for name, bound in views.items():
+            tensors = bound if isinstance(bound, tuple) else (bound,)
+            for tensor in tensors:
+                self.assertEqual(
+                    tensor.stride(0) * tensor.element_size(), self.planned.kv_cache_tensors[0].block_stride
+                )
+                storage_sizes[tensor.untyped_storage().data_ptr()] = tensor.untyped_storage().nbytes()
+            if name.endswith("sparse_summary_cache"):
+                self.assertEqual(self.layer_specs[name].page_size_bytes, 4096)
+                self.assertEqual(self.layer_specs[name].tokens_per_state, 8)
+                self.assertIsNone(self.layer_specs[name].page_size_padded)
+        self.assertEqual(len(storage_sizes), 1)
+        self.assertEqual(sum(storage_sizes.values()), self.planned.kv_cache_tensors[0].size)
+
+    def test_full_layer_counts_with_and_without_mtp_keep_upstream_tiles(self):
+        main, summary, ring, swa = (self.layer_specs[name] for name in self.names)
+        for mtp, expected_stride in ((False, 2356224), (True, 2359296)):
+            with self.subTest(mtp=mtp):
+                layers = {}
+                for index in range(95 if mtp else 92):
+                    name = f"model.layers.{index}.attn"
+                    if index % 4 != 3:
+                        layers[name] = swa
+                    else:
+                        layers[name] = main
+                        layers[name + ".sparse_summary_cache"] = summary
+                        layers[name + ".csa_tail_ring"] = ring
+                groups = get_kv_cache_groups(self.conf, layers)
+                self.conf.cache_config.num_gpu_blocks_override = 4
+                try:
+                    planned = get_kv_cache_config_from_groups(self.conf, groups, 64 * 1024 * 1024)
+                finally:
+                    self.conf.cache_config.num_gpu_blocks_override = None
+                with patch.object(torch, "zeros", wraps=torch.zeros) as alloc:
+                    bound = self.allocate_entrypoint(planned, "cpu", KVCacheLayout.BLNHC, [128] * len(groups))
+                self.assertEqual(alloc.call_count, 1)
+                self.assertEqual(set(bound), set(layers))
+                self.assertEqual({d.block_stride for d in planned.kv_cache_tensors}, {expected_stride})
+                for value in bound.values():
+                    for tensor in value if isinstance(value, tuple) else (value,):
+                        self.assertEqual(tensor.shape[0], planned.num_blocks)
+                        self.assertEqual(tensor.stride(0) * tensor.element_size(), expected_stride)
+
+
 class BLNHCCollectorTests(unittest.TestCase):
     """A missing backend hook must not reach native GBSA with illegal strides."""
 
@@ -280,6 +463,7 @@ class BLNHCCollectorTests(unittest.TestCase):
         function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "get_kv_cache_spec")
         namespace = dict(base.__dict__)
         namespace.update(
+            fields=fields,
             get_layers_from_vllm_config=lambda *args: layers,
             enable_sfa_dcp_replicated_indexer=lambda *args: False,
             is_c8_mxfp_kv_quant=lambda *args: False,
@@ -300,6 +484,7 @@ class BLNHCCollectorTests(unittest.TestCase):
 
     def layers(self, mtp):
         from vllm.models.step5.nvidia.csa_tail_ring import Step5CSATailRingBackend
+
         from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
         from vllm_ascend.models.step5.dsa_attention import AscendStep5DSABackend
         from vllm_ascend.models.step5.summary_cache import (
@@ -312,6 +497,7 @@ class BLNHCCollectorTests(unittest.TestCase):
             result[name] = NS(
                 get_kv_cache_spec=lambda conf, s=spec: s,
                 get_attn_backend=lambda b=backend: b,
+                is_draft_layer=int(name.split(".")[2]) >= 92,
             )
 
         for index in range(92 + (3 if mtp else 0)):
@@ -367,6 +553,26 @@ class BLNHCCollectorTests(unittest.TestCase):
                 Step5CSATailRingBackend,
             )
         return result
+
+    def test_draft_marker_survives_collector_without_changing_grouping(self):
+        conf = config()
+        layers = self.layers(True)
+        draft_names = {name for name, layer in layers.items() if layer.is_draft_layer}
+        self.assertEqual(len(draft_names), 3)
+        for customize in (False, True):
+            with self.subTest(customize=customize):
+                collected = self.collector(layers, customize=customize)(conf)
+                self.assertEqual({name for name, spec in collected.items() if spec.is_draft}, draft_names)
+                unmarked = {name: replace(spec, is_draft=False) for name, spec in collected.items()}
+                self.assertEqual(get_kv_cache_groups(conf, collected), get_kv_cache_groups(conf, unmarked))
+
+    def test_collector_allows_modules_without_draft_marker(self):
+        conf = config()
+        layers = self.layers(True)
+        for layer in layers.values():
+            del layer.is_draft_layer
+        collected = self.collector(layers)(conf)
+        self.assertFalse(any(spec.is_draft for spec in collected.values()))
 
     def test_backend_alignment_survives_collector_and_real_planner(self):
         from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config

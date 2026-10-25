@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import copy
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -369,6 +369,13 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 mamba_specs[layer_name] = replace(spec, page_size_padded=common_page_size)
         kv_cache_spec.update(mamba_specs)
 
+    # Annotate final specs after conversions, early branches and page alignment.
+    for layer_name, spec in kv_cache_spec.items():
+        if getattr(attn_layers[layer_name], "is_draft_layer", False) and any(
+            field.name == "is_draft" and field.init for field in fields(spec)
+        ):
+            kv_cache_spec[layer_name] = replace(spec, is_draft=True)
+
     return kv_cache_spec
 
 
@@ -586,6 +593,11 @@ def build_attn_metadata(
                 if not for_cudagraph_capture and model_specific_attn_metadata is not None
                 else {}
             )
+            if getattr(attn_metadata_builder, "supports_padded_decode_graph", False):
+                attn_metadata_extra_kwargs.update(
+                    num_actual_reqs=num_actual_reqs,
+                    full_graph_mode=full_graph_mode or for_cudagraph_capture,
+                )
             if is_dsa_builder:
                 # DSA cache groups share request-level metadata during replay.
                 attn_metadata_extra_kwargs.update(

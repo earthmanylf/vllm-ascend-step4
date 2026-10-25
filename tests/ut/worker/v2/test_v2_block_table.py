@@ -27,6 +27,7 @@ def _parent_init(
     cp_rank=0,
     cp_interleave=1,
     slot_mapping_enabled=None,
+    sliding_window_reach=None,
 ):
     self.block_sizes = block_sizes
     # vLLM main dropped `kernel_block_sizes` from BlockTables; only the release
@@ -45,6 +46,30 @@ def _parent_init(
     self.block_table_strides = MagicMock()
     self.block_sizes_tensor = MagicMock()
     self.slot_mappings = object()
+
+
+def test_init_forwards_sliding_window_reach_only_on_main():
+    if vllm_version_is("0.31.0"):
+        return
+
+    seen: dict[str, Any] = {}
+
+    def recording_init(self, *args, **kwargs):
+        seen["kwargs"] = kwargs
+        _parent_init(self, *args, **kwargs)
+
+    reach = [129, 0]
+    with patch.object(BlockTables, "__init__", recording_init):
+        AscendBlockTables(
+            [128, 128],
+            2,
+            8,
+            [4, 4],
+            torch.device("cpu"),
+            sliding_window_reach=reach,
+        )
+
+    assert seen["kwargs"]["sliding_window_reach"] is reach
 
 
 def _init_tables(*args, next_power_of_2=16, **kwargs):
@@ -205,6 +230,8 @@ def test_init_block_table_layout_tensors_builds_distinct_sizes():
     tables.block_tables = [SimpleNamespace(gpu=torch.zeros(2, 8)) for _ in range(2)]
     tables.input_block_tables = [torch.zeros(2, 8) for _ in range(2)]
     tables._slot_mapping_enabled = [True, False]
+    if not vllm_version_is("0.31.0"):
+        tables._sliding_window_reach = [129, 0]
     tables.init_block_table_layout_tensors()
 
     if vllm_version_is("0.31.0"):
@@ -214,6 +241,7 @@ def test_init_block_table_layout_tensors_builds_distinct_sizes():
         # vLLM main dropped `kernel_block_sizes`; AscendBlockTables builds the
         # kernel-block tensor in __init__ instead.
         assert not hasattr(tables, "kernel_block_sizes_tensor")
+        assert torch.equal(tables.sliding_window_reach, torch.tensor([129, 0], dtype=torch.int32))
     assert torch.equal(tables.block_sizes_tensor, torch.tensor([16, 32], dtype=torch.int32))
     assert tables.block_sizes_tensor.device.type == "cpu"
 
