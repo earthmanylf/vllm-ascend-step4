@@ -311,7 +311,7 @@ class MetricsCapture:
             try:
                 await asyncio.wait_for(self.stop.wait(), timeout=max(0.0, next_sample - time.perf_counter()))
                 return
-            except TimeoutError:
+            except asyncio.TimeoutError:  # noqa: UP041 - Python 3.10 uses a distinct asyncio exception
                 pass
             if not self.stop.is_set():
                 await self.snapshot("during")
@@ -431,7 +431,7 @@ class ProcessMetricsCapture:
                     temporary.replace(self.stop_path)
                     try:
                         await asyncio.wait_for(self.process.wait(), timeout=30.0)
-                    except TimeoutError:
+                    except asyncio.TimeoutError:  # noqa: UP041 - Python 3.10 uses a distinct asyncio exception
                         self.process.kill()
                         await self.process.wait()
                         raise TimeoutError("Metrics worker failed to finish; acceptance must remain invalid")
