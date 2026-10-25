@@ -22,7 +22,6 @@ AscendRowParallelLinear and AscendColumnParallelLinear.
 
 import torch
 import torch.nn as nn
-import torch_npu
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
@@ -50,12 +49,11 @@ from vllm_ascend.device.hardware_profile import (
 )
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.quantization.tp_weight_switch import TPWeightGatherSpec, TPWeightSwitchMixin
-from vllm_ascend.utils import (
-    ACL_FORMAT_FRACTAL_ND,
-    maybe_trans_nz,
-)
+from vllm_ascend.utils import maybe_trans_nz
 
 logger = init_logger(__name__)
+
+MMRS_FUSION_ROW_THRESHOLD = 1000
 
 
 def unquantized_gemm(
@@ -404,7 +402,7 @@ class AscendRowParallelLinear(RowParallelLinear):
         return True
 
     def _use_mmrs_fusion(self, input_parallel: torch.Tensor) -> bool:
-        """Runtime gate: forward-context switch plus input shape contract."""
+        """Fuse only above the row threshold and with a compatible input shape."""
         try:
             # get_forward_context() asserts outside set_forward_context (UTs);
             # no context means the mmrs_fusion switch is unavailable.
@@ -414,6 +412,7 @@ class AscendRowParallelLinear(RowParallelLinear):
         return (
             getattr(forward_context, "mmrs_fusion", False)
             and input_parallel.dim() == 2
+            and input_parallel.shape[0] > MMRS_FUSION_ROW_THRESHOLD
             and input_parallel.shape[0] % self.tp_size == 0
             and self._mmrs_fusion_ready()
         )

@@ -353,16 +353,15 @@ class TestRowParallelLinearMmrsFusion(unittest.TestCase):
         kwargs.setdefault("prefix", "o_proj")
         return AscendRowParallelLinear(**kwargs)
 
-    def _rs_forward(self, linear, rows=16):
+    def _rs_forward(self, linear, rows=1002):
         input_tensor = torch.randn(rows, linear.input_size_per_partition, dtype=torch.bfloat16)
         return linear(input_tensor, reduce_scatter_results=True, reduce_scatter_dim=0)
 
     @patch("vllm_ascend.ops.linear.get_forward_context")
-    @patch("vllm_ascend.ops.linear.torch_npu.get_npu_format", return_value=2)
     @patch("vllm_ascend.device.device_op.DeviceOperator")
-    def test_fused_path_taken_when_eligible(self, mock_device_op, _mock_fmt, mock_get_ctx):
+    def test_fused_path_taken_when_eligible(self, mock_device_op, mock_get_ctx):
         mock_get_ctx.return_value = MagicMock(mmrs_fusion=True)
-        expected = torch.randn(8, 8, dtype=torch.bfloat16)
+        expected = torch.randn(501, 8, dtype=torch.bfloat16)
         mock_device_op.npu_mm_reduce_scatter_base.return_value = expected
 
         linear = self._make_linear()
@@ -370,7 +369,7 @@ class TestRowParallelLinearMmrsFusion(unittest.TestCase):
 
         mock_device_op.npu_mm_reduce_scatter_base.assert_called_once()
         args = mock_device_op.npu_mm_reduce_scatter_base.call_args.args
-        self.assertEqual(tuple(args[0].shape), (16, 8))  # (m, k) shard input
+        self.assertEqual(tuple(args[0].shape), (1002, 8))  # (m, k) shard input
         self.assertEqual(tuple(args[1].shape), (8, 8))  # ND (k, n) weight copy
         self.assertEqual(args[2], "hcom-test")
         self.assertEqual(args[3], 2)
@@ -382,8 +381,8 @@ class TestRowParallelLinearMmrsFusion(unittest.TestCase):
     @patch("vllm.distributed.tensor_model_parallel_reduce_scatter")
     def test_fallback_when_context_switch_off(self, mock_rs, mock_device_op, mock_get_ctx):
         mock_get_ctx.return_value = MagicMock(mmrs_fusion=False)
-        partial = torch.randn(16, 8, dtype=torch.bfloat16)
-        shard = torch.randn(8, 8, dtype=torch.bfloat16)
+        partial = torch.randn(1002, 8, dtype=torch.bfloat16)
+        shard = torch.randn(501, 8, dtype=torch.bfloat16)
         mock_rs.return_value = shard
 
         linear = self._make_linear()
@@ -397,27 +396,49 @@ class TestRowParallelLinearMmrsFusion(unittest.TestCase):
     @patch("vllm_ascend.ops.linear.get_forward_context")
     @patch("vllm_ascend.device.device_op.DeviceOperator")
     @patch("vllm.distributed.tensor_model_parallel_reduce_scatter")
+    def test_fallback_at_or_below_row_threshold(self, mock_rs, mock_device_op, mock_get_ctx):
+        mock_get_ctx.return_value = MagicMock(mmrs_fusion=True)
+        linear = self._make_linear()
+        for rows in (0, 16, 998, 1000):
+            with self.subTest(rows=rows):
+                partial = torch.randn(rows, 8, dtype=torch.bfloat16)
+                shard = torch.randn(rows // 2, 8, dtype=torch.bfloat16)
+                mock_rs.reset_mock()
+                mock_rs.return_value = shard
+                with (
+                    patch.object(linear, "_mmrs_fusion_ready") as mock_ready,
+                    patch.object(linear.quant_method, "apply", return_value=partial),
+                ):
+                    output, _ = self._rs_forward(linear, rows=rows)
+                mock_ready.assert_not_called()
+                mock_device_op.npu_mm_reduce_scatter_base.assert_not_called()
+                mock_rs.assert_called_once_with(partial, 0)
+                self.assertIs(output, shard)
+
+    @patch("vllm_ascend.ops.linear.get_forward_context")
+    @patch("vllm_ascend.device.device_op.DeviceOperator")
+    @patch("vllm.distributed.tensor_model_parallel_reduce_scatter")
     def test_fallback_when_rows_not_divisible(self, mock_rs, mock_device_op, mock_get_ctx):
         mock_get_ctx.return_value = MagicMock(mmrs_fusion=True)
         mock_rs.return_value = MagicMock()
 
         linear = self._make_linear()
-        with patch.object(linear.quant_method, "apply", return_value=torch.randn(15, 8)):
-            self._rs_forward(linear, rows=15)
+        with patch.object(linear.quant_method, "apply", return_value=torch.randn(1001, 8)):
+            self._rs_forward(linear, rows=1001)
 
         mock_device_op.npu_mm_reduce_scatter_base.assert_not_called()
         mock_rs.assert_called_once()
 
     @patch("vllm_ascend.ops.linear.get_forward_context")
-    @patch("vllm_ascend.ops.linear.torch_npu.get_npu_format", side_effect=RuntimeError("no npu"))
+    @patch("torch.distributed.get_rank", side_effect=RuntimeError("no npu"))
     @patch("vllm_ascend.device.device_op.DeviceOperator")
     @patch("vllm.distributed.tensor_model_parallel_reduce_scatter")
-    def test_init_failure_latches_fallback(self, mock_rs, mock_device_op, _mock_fmt, mock_get_ctx):
+    def test_init_failure_latches_fallback(self, mock_rs, mock_device_op, _mock_rank, mock_get_ctx):
         mock_get_ctx.return_value = MagicMock(mmrs_fusion=True)
         mock_rs.return_value = MagicMock()
 
         linear = self._make_linear()
-        with patch.object(linear.quant_method, "apply", return_value=torch.randn(16, 8)):
+        with patch.object(linear.quant_method, "apply", return_value=torch.randn(1002, 8)):
             self._rs_forward(linear)
             self._rs_forward(linear)
 
