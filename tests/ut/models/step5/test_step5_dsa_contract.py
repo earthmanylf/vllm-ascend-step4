@@ -12,23 +12,19 @@ independent.
 
 from __future__ import annotations
 
-from pathlib import Path
-
-# Repo root of vllm-ascend-private.
-REPO_ROOT = Path(__file__).resolve().parents[4]
-
 import ast
-import types
-from pathlib import Path
-import pytest
-import torch
-import unittest
-from dataclasses import dataclass
-from unittest.mock import patch
 import importlib.util
+import types
+import unittest
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 MODEL_DIR = REPO_ROOT / "vllm_ascend/models/step5"
 ROOT = REPO_ROOT
@@ -39,6 +35,7 @@ GRAPH = ROOT / "vllm_ascend/worker/v2/spec_decode/autoregressive/aclgraph.py"
 # ========================================================================
 # from tests/ut/models/step5/test_native_dsa_contract.py
 # ========================================================================
+
 
 def load_functions(filename, names, namespace):
     tree = ast.parse((MODEL_DIR / filename).read_text())
@@ -218,6 +215,7 @@ def test_captured_speculative_shape_refreshes_schedule_at_the_captured_address(q
         block_table=torch.zeros(num_reqs, 2, dtype=torch.int32),
     )
     metadata = types.SimpleNamespace(
+        graph_decode=None,
         query_start_loc=torch.arange(0, actual_tokens + 1, query_len, dtype=torch.int32),
         num_actual_tokens=actual_tokens,
         num_decodes=num_reqs,
@@ -268,6 +266,7 @@ def test_mixed_metadata_preserves_request_boundaries():
         block_table=torch.tensor([[5]], dtype=torch.int32),
     )
     md = types.SimpleNamespace(
+        graph_decode=None,
         query_start_loc=torch.tensor([0, 2, 4, 7, 7], dtype=torch.int32),
         num_actual_tokens=7,
         decode=d,
@@ -341,6 +340,7 @@ def test_consumer_uses_paged_kv_and_request_varlen_without_flattening(path):
         gbsa_metadata=torch.tensor([29]),
     )
     md = types.SimpleNamespace(
+        graph_decode=None,
         num_decodes=1,
         num_prefills=1,
         decode=d,
@@ -437,6 +437,7 @@ def test_native_attention_passes_matching_metadata_and_paged_kv():
 # ========================================================================
 # from tests/ut/models/step5/test_step5_model_state_contract.py
 # ========================================================================
+
 
 class Scalar(int):
     def item(self):
@@ -570,6 +571,7 @@ if __name__ == "__main__":
 # ========================================================================
 # from tests/ut/worker/v2/test_ar_graph_step_contract.py
 # ========================================================================
+
 
 def methods(path, class_name, names, base, namespace):
     tree = ast.parse(path.read_text())
@@ -751,9 +753,7 @@ class CaptureContract(unittest.TestCase):
                     desc = Desc(Mode.FULL, 4, 2, maximum, width)
 
                     def prepare(*args, prepared=prepared, **kwargs):
-                        result = (object(), object())
-                        prepared.append((args, kwargs, result))
-                        return result
+                        prepared.append((args, kwargs))
 
                     class Base:
                         @staticmethod
@@ -761,36 +761,49 @@ class CaptureContract(unittest.TestCase):
                             create(desc, True)(Mode.NONE)
                             create(desc, False)(Mode.NONE)
 
+                    class Parent:
+                        def capture(self, *args, **kwargs):
+                            self.delegated = (args, kwargs)
+
                     cls = methods(
                         GRAPH,
                         "AutoRegressiveAclGraphManager",
                         ["capture"],
-                        object,
+                        Parent,
                         {
                             "communicator_switch": nullcontext,
                             "model_capture_wrapper": lambda *a: nullcontext(),
                             "CudaGraphManager": Base,
                             "CUDAGraphMode": Mode,
+                            "BatchExecutionDescriptor": Desc,
+                            "vllm_version_is": lambda _: False,
                             "prepare_inputs_to_capture": prepare,
-                            "torch": SimpleNamespace(full=lambda *a, **k: (4, 4), int32=object()),
+                            "torch": torch,
                         },
                     )
                     g = cls()
-                    g.speculator = object()
+                    g.speculator = SimpleNamespace(num_speculative_steps=3)
                     g.is_draft_model_prefill = phase
                     g.max_num_reqs = 3
                     g.dp_size = 2
-                    inputs = [object() for _ in range(5)]
+                    input_buffers = SimpleNamespace(seq_lens_cpu=torch.tensor([5, 9, 0]))
+                    inputs = [object(), input_buffers, object(), object(), object()]
                     g.capture(lambda *a, calls=calls: calls.append(a), *inputs)
+                    if phase:
+                        self.assertEqual(g.delegated[0][1:], tuple(inputs))
+                        self.assertEqual(g.delegated[1], {"progress_bar_desc": "Capturing CUDA graphs"})
+                        self.assertEqual(prepared, [])
+                        continue
                     self.assertEqual(len(prepared), 2)
                     self.assertEqual(len(calls), 2)
-                    for (_, kw, result), call in zip(prepared, calls):
-                        self.assertEqual(
-                            kw,
-                            {"full_cudagraph": True, "max_query_len": maximum or width},
-                        )
-                        self.assertEqual(call, (2, 4, *result, (4, 4), Mode.NONE))
-                    self.assertIsNot(calls[0][2], calls[1][2])
+                    for (_, kw), call in zip(prepared, calls):
+                        self.assertEqual(kw, {"full_cudagraph": True, "max_query_len": maximum or width})
+                        self.assertEqual(call[:2], (2, False))
+                        self.assertEqual(call[2], Desc(Mode.NONE, 4, 2))
+                        self.assertEqual(call[3].tolist(), [4, 4])
+                        self.assertEqual(call[4].tolist(), [5, 9])
+                        self.assertEqual(call[4].data_ptr(), input_buffers.seq_lens_cpu.data_ptr())
+                        self.assertEqual(call[5], 3)
 
     def test_replay_resolves_one_current_context_before_launch(self):
         order = []
@@ -817,21 +830,30 @@ class CaptureContract(unittest.TestCase):
             Base,
             {
                 "UpdatableGraph": FakeGraph,
-                "ContextSource": lambda context: SimpleNamespace(context=context),
+                "SharedSource": lambda params: SimpleNamespace(params=params),
                 "torch": SimpleNamespace(npu=SimpleNamespace(current_stream=lambda: "stream")),
             },
         )
         g = cls()
-        desc = object()
+        desc = Desc(Mode.FULL, 4, 2)
         graph = FakeGraph()
         g.graphs = {desc: graph}
         g.update_stream = SimpleNamespace(wait_stream=lambda stream: order.append("wait"))
+        g.is_draft_model_prefill = False
         metadata = {"draft": object()}
+        params = object()
+        seen = []
+
+        def build_fia_params(*args):
+            seen.append(args)
+            return params
+
+        g.speculator = SimpleNamespace(build_fia_params=build_fia_params)
         self.assertEqual(g._updatable_graph_replay(desc, [metadata]), "output")
-        self.assertIs(graph.source.context, metadata)
+        self.assertEqual(seen, [(2, metadata, False)])
+        self.assertIs(graph.source.params, params)
+        self.assertEqual(graph.tasks, "resolved")
         self.assertEqual(order, ["resolve", "wait", "replay", "update"])
-        with self.assertRaises(AssertionError):
-            g._updatable_graph_replay(desc, [metadata, metadata])
 
 
 class ProviderContract(unittest.TestCase):

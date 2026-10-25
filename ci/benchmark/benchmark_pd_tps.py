@@ -66,6 +66,8 @@ Note: To enable FLOPS and MFU calculations, you need:
 3. The flops_calculator module must be available
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import codecs
@@ -86,6 +88,7 @@ except ImportError:
     raise ImportError("aiohttp is required for this benchmark. Install it with: pip install aiohttp") from None
 
 from flops_calculator import sequence_flops
+from metrics_capture import ProcessMetricsCapture, scheduler_summary, weighted_acceptance
 
 KV_CACHE_GUARD_FACTOR = 0.9
 
@@ -350,6 +353,9 @@ class TpsMetric:
     status: str = "completed"
     skip_reason: str | None = None
     error: str | None = None
+    spec_decode_acceptance: dict[str, Any] = field(default_factory=dict)
+    metrics_iterations: list[dict[str, Any]] = field(default_factory=list)
+    metrics_scheduler_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -390,6 +396,7 @@ class VLLMBenchmarkClient:
         self.request_sock_read_timeout = request_sock_read_timeout
         self.session: aiohttp.ClientSession | None = None
         self.weight_control_session: aiohttp.ClientSession | None = None
+        self.metrics_dp_size = 8
 
     async def __aenter__(self):
         # 创建连接器，设置更高的连接池限制
@@ -434,6 +441,15 @@ class VLLMBenchmarkClient:
             await self.weight_control_session.close()
         if self.session:
             await self.session.close()
+
+    def create_metrics_capture(self, stem):
+        return ProcessMetricsCapture(
+            self.base_url + "/metrics",
+            self.raw_artifacts_dir,
+            stem,
+            self.model_name,
+            self.metrics_dp_size,
+        )
 
     async def health_check(self) -> bool:
         """Check if the service is running properly"""
@@ -1140,6 +1156,7 @@ async def run_single_benchmark(
 
     # Run multiple iterations
     last_iteration_results = None
+    metrics_iterations = []
     for iter_idx in range(num_iters):
         print(f"  Iteration {iter_idx + 1}/{num_iters}")
 
@@ -1147,7 +1164,15 @@ async def run_single_benchmark(
         batch_prompts = generate_random_tokens(batch_size, input_len, seed + iter_idx, vocab_size)
 
         # Run streaming benchmark
-        results = await client.test_streaming_benchmark(batch_prompts, output_len)
+        stem = f"batch{client.batch_sequence + 1:04d}-bs{batch_size}-input{input_len}-output{output_len}-measured"
+        capture = client.create_metrics_capture(stem)
+        await capture.start()
+        iteration_status = "failed"
+        try:
+            results = await client.test_streaming_benchmark(batch_prompts, output_len)
+            iteration_status = "completed"
+        finally:
+            metrics_iterations.append(await capture.finish(iteration_status))
         last_iteration_results = results  # Keep track of last iteration
 
         print(
@@ -1270,6 +1295,15 @@ async def run_single_benchmark(
         request_logprobs=client.request_logprobs,
         return_token_ids=client.return_token_ids,
         weight_version=client.weight_version,
+        metrics_iterations=metrics_iterations,
+        spec_decode_acceptance=weighted_acceptance(
+            [row["acceptance"] for row in metrics_iterations[-effective_stats_iters:]]
+        ),
+        metrics_scheduler_summary=scheduler_summary(
+            [snapshot for row in metrics_iterations[-effective_stats_iters:] for snapshot in row["snapshots"]],
+            client.model_name,
+            client.metrics_dp_size,
+        ),
     )
 
 
@@ -1376,6 +1410,15 @@ async def run_benchmark_suite(
                 ).hexdigest(),
                 "measurement_semantics": "client E2E overlap only; no proof of pure decode or DP routing",
                 "itl_semantics": "SSE event intervals; token counts from token_ids",
+                "metrics_script_sha256": hashlib.sha256(
+                    Path(__file__).with_name("metrics_capture.py").read_bytes()
+                ).hexdigest(),
+                "telemetry_worker_sha256": hashlib.sha256(
+                    Path(__file__).with_name("telemetry_worker.py").read_bytes()
+                ).hexdigest(),
+                "metrics_semantics": (
+                    "independent-process read-only /metrics; all-DP deltas; unknown/reset invalid; 1s nominal"
+                ),
             },
             indent=2,
         ),
@@ -1445,6 +1488,7 @@ async def run_benchmark_suite(
         request_sock_read_timeout=request_sock_read_timeout,
         raw_artifacts_dir=raw_artifacts_dir,
     ) as client:
+        client.metrics_dp_size = dp_size
         # Health check
         if not await client.health_check():
             raise Exception(f"Cannot connect to service {host}:{port}")
@@ -1845,6 +1889,9 @@ async def run_benchmark_suite(
             "status": getattr(result, "status", "completed"),
             "skip_reason": getattr(result, "skip_reason", None),
             "error": getattr(result, "error", None),
+            "spec_decode_acceptance": result.spec_decode_acceptance,
+            "metrics_iterations": result.metrics_iterations,
+            "metrics_scheduler_summary": result.metrics_scheduler_summary,
         }
 
     require_completed_results(final_results)

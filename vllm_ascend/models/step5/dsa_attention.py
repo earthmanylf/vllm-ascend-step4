@@ -9,7 +9,7 @@ force-includes its current region and applies an exact token causal mask.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import torch
@@ -28,7 +28,9 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from vllm_ascend.core.step5_kv_cache import uses_step5_blnhc
 from vllm_ascend.models.step5._step5_compat import Step5DSAScratchWorkspace
 from vllm_ascend.models.step5.generic_block_sparse_attention import (
     gbsa_expected_counts,
@@ -51,6 +53,28 @@ def _is_graph_capturing() -> bool:
 
 class AscendStep5DSABackend(AttentionBackend):
     accept_output_buffer: bool = True
+
+    @classmethod
+    def supported_kv_cache_layouts(cls):
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is not None and uses_step5_blnhc(config):
+            return (KVCacheLayout.BLNHC,)
+        return None
+
+    @classmethod
+    def customize_spec(cls, spec):
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is not None and uses_step5_blnhc(config):
+            # GBSA PA_BBND requires block stride divisible by Nkv*D elements.
+            # Publish this actual native constraint; upstream planner aligns
+            # the global tile, without padding each compressed summary page.
+            alignment = spec.num_kv_heads * spec.head_size * spec.dtype.itemsize
+            return replace(spec, block_stride_alignment=alignment)
+        return spec
 
     @staticmethod
     def get_name() -> str:
@@ -156,6 +180,11 @@ class AscendStep5DSADecodeMetadata:
     """Per-step AICPU schedule shared by every DSA layer in this group."""
     cu_seqlens_q: torch.Tensor | None = None
     """Int64 cumulative query lengths consumed by the native attention op."""
+    query_start_loc: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
+    graph_key: tuple[int, int, int, int] | None = None
+    """(padded requests, query width, padded tokens, block-table columns)."""
+    source_block_table_ptr: int | None = None
 
 
 @dataclass
@@ -172,6 +201,8 @@ class AscendStep5DSAMetadata(AttentionMetadata):
     """(num_reqs,) full-batch sequence lengths, including padding rows."""
     prefill: AscendStep5DSAPrefillMetadata | None = None
     decode: AscendStep5DSADecodeMetadata | None = None
+    graph_decode: AscendStep5DSADecodeMetadata | None = None
+    """Descriptor-sized reader inputs, separate from real writer metadata."""
 
 
 class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetadata]):
@@ -192,6 +223,7 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.supports_padded_decode_graph = uses_step5_blnhc(vllm_config)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         self.context_len_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -210,6 +242,7 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
         # length, so raw config sizes do not identify the captured shapes.
         self.capture_sizes: set[int] = set()
         self.gbsa_meta_buffers: dict[tuple, torch.Tensor] = {}
+        self.decode_graph_buffers: dict[tuple[int, int, int, int], AscendStep5DSADecodeMetadata] = {}
         self.query_start_loc_int64_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens + 1,
             dtype=torch.int64,
@@ -260,6 +293,8 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
             int(cu_seqlens_q.shape[0]) - 1,
             max_query_len,
         )
+        if getattr(self, "supports_padded_decode_graph", False):
+            buffer_key += (int(block_table.shape[1]),)
         buffer = self.gbsa_meta_buffers.get(buffer_key)
         if buffer is None:
             self.gbsa_meta_buffers[buffer_key] = metadata
@@ -269,17 +304,23 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
 
     def _prepare_gbsa_metadata(self, md: AscendStep5DSAMetadata) -> None:
         """Schedule native attention outside the model, without touching journals."""
-        query_start_loc_int64 = self.query_start_loc_int64_buffer[: md.query_start_loc.shape[0]]
-        query_start_loc_int64.copy_(md.query_start_loc)
-        graph_shape = md.num_actual_tokens in self.capture_sizes
-        d = md.decode
-        if d is not None and md.num_decodes:
-            n = md.num_decodes
+        padded_graph = getattr(md, "graph_decode", None) is not None
+        graph_shape = padded_graph or (
+            not getattr(self, "supports_padded_decode_graph", False) and md.num_actual_tokens in self.capture_sizes
+        )
+        d = md.graph_decode if padded_graph else md.decode
+        if d is not None and (padded_graph or md.num_decodes):
+            n = d.seq_lens.shape[0] if padded_graph else md.num_decodes
             q_len = int(d.query_len)
-            total = n * q_len
-            row = torch.arange(total, device=d.seq_lens.device, dtype=torch.int64)
-            positions = (d.seq_lens.to(torch.int64) - q_len).repeat_interleave(q_len) + row % q_len
-            d.cu_seqlens_q = query_start_loc_int64[: n + 1]
+            if padded_graph:
+                positions = d.positions
+            else:
+                query_start_loc_int64 = self.query_start_loc_int64_buffer[: md.query_start_loc.shape[0]]
+                query_start_loc_int64.copy_(md.query_start_loc)
+                total = n * q_len
+                row = torch.arange(total, device=d.seq_lens.device, dtype=torch.int64)
+                positions = (d.seq_lens.to(torch.int64) - q_len).repeat_interleave(q_len) + row % q_len
+                d.cu_seqlens_q = query_start_loc_int64[: n + 1]
             d.gbsa_metadata = self._build_gbsa_metadata(
                 positions,
                 d.cu_seqlens_q,
@@ -305,6 +346,112 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
                 graph_shape=False,
             )
 
+    def _prepare_decode_graph(
+        self,
+        common: CommonAttentionMetadata,
+        num_actual_reqs: int | None,
+        *,
+        for_capture: bool,
+    ) -> AscendStep5DSADecodeMetadata:
+        """Refresh only the descriptor that will replay; never infer it from R."""
+        padded = common.num_reqs
+        width = common.max_query_len
+        tokens = getattr(common, "num_input_tokens", 0) or common.num_actual_tokens
+        actual = common.num_actual_tokens
+        if (
+            not isinstance(padded, int)
+            or not isinstance(width, int)
+            or not isinstance(tokens, int)
+            or not isinstance(actual, int)
+            or padded <= 0
+            or width <= 0
+            or width > self.reorder_batch_threshold
+            or tokens != padded * width
+            or not 0 <= actual <= tokens
+            or actual % width
+            or tokens > (1 << 31) - 1
+        ):
+            raise ValueError("Invalid Step5 uniform decode graph descriptor")
+        real = actual // width
+        if num_actual_reqs is not None and num_actual_reqs != real:
+            raise ValueError("Step5 graph real request/token extents disagree")
+        if not common.causal or getattr(common, "context_parallel_metadata", None) is not None:
+            raise ValueError("Step5 decode graph requires causal, non-CP metadata")
+        query_cpu = common.query_start_loc_cpu
+        if (
+            query_cpu.device.type != "cpu"
+            or query_cpu.ndim != 1
+            or query_cpu.shape[0] < padded + 1
+            or query_cpu[: padded + 1].tolist() != [i * width for i in range(padded + 1)]
+            or common.query_start_loc.ndim != 1
+            or common.query_start_loc.shape[0] < padded + 1
+        ):
+            raise ValueError("Invalid Step5 decode graph QSL")
+        seq = common.seq_lens
+        table = common.block_table_tensor
+        if (
+            seq.ndim != 1
+            or seq.shape[0] < padded
+            or seq.dtype != torch.int32
+            or table.ndim != 2
+            or table.shape[0] < padded
+            or table.shape[1] <= 0
+            or table.dtype != torch.int32
+            or table.device != seq.device
+            or common.slot_mapping.ndim != 1
+            or common.slot_mapping.shape[0] < tokens
+        ):
+            raise ValueError("Invalid Step5 decode graph sequence/table geometry")
+        seq_cpu = getattr(common, "_seq_lens_cpu", None)
+        if seq_cpu is None:
+            seq_cpu = getattr(common, "seq_lens_cpu", None)
+        if seq_cpu is None or seq_cpu.device.type != "cpu" or seq_cpu.ndim != 1 or seq_cpu.shape[0] < padded:
+            raise ValueError("Step5 decode graph requires the existing CPU length mirror")
+        lengths = seq_cpu[:padded].tolist()
+        capacity = min(table.shape[1] * self.gbsa_block_size, (1 << 31) - 1)
+        if any(length < width or length > capacity for length in lengths[:real]) or any(
+            length != 0 for length in lengths[real:]
+        ):
+            raise ValueError("Invalid real or padded Step5 graph KV lengths")
+        key = (padded, width, tokens, table.shape[1])
+        if for_capture and real != padded:
+            raise ValueError("Step5 capture must record the full descriptor writer extent")
+        buffers = self.decode_graph_buffers.get(key)
+        if buffers is None:
+            if not for_capture:
+                raise RuntimeError(f"Step5 decode graph descriptor was not captured: {key}")
+            query_i32 = torch.arange(padded + 1, dtype=torch.int32, device=seq.device) * width
+            buffers = AscendStep5DSADecodeMetadata(
+                seq_lens=torch.empty(padded, dtype=torch.int32, device=seq.device),
+                block_table=torch.empty(
+                    (padded, table.shape[1]),
+                    dtype=torch.int32,
+                    device=seq.device,
+                ),
+                query_len=width,
+                query_start_loc=query_i32,
+                cu_seqlens_q=query_i32.to(torch.int64),
+                positions=torch.empty(tokens, dtype=torch.int64, device=seq.device),
+                graph_key=key,
+                source_block_table_ptr=table.data_ptr(),
+            )
+            self.decode_graph_buffers[key] = buffers
+        elif buffers.seq_lens.device != seq.device:
+            raise ValueError("Step5 captured descriptor device changed")
+        # Internal QSL is canonical and bucket-owned, not a shared scratch view.
+        buffers.seq_lens[:real].copy_(seq[:real])
+        buffers.seq_lens[real:].zero_()
+        buffers.block_table[:real].copy_(table[:real])
+        buffers.block_table[real:].zero_()
+        row = torch.arange(tokens, device=seq.device, dtype=torch.int64)
+        kv_lengths = buffers.seq_lens.to(torch.int64).repeat_interleave(width)
+        positions = kv_lengths - width + row % width
+        # Padded zero-KV rows take the native neutral-output branch. Position 0
+        # keeps expected_counts identical to the current-region pack (one slot).
+        buffers.positions.copy_(torch.where(kv_lengths > 0, positions, 0))
+        buffers.source_block_table_ptr = table.data_ptr()
+        return buffers
+
     def build_for_cudagraph_capture(
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -312,23 +459,46 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
     ) -> AscendStep5DSAMetadata:
         # Register before build so warmup, capture and later runtime builds
         # all bind the same address for this actual capture descriptor.
-        self.capture_sizes.add(common_attn_metadata.num_actual_tokens)
-        return self.build(
+        if not getattr(self, "supports_padded_decode_graph", False):
+            # Preserve the legacy R=P graph schedule and independent summary
+            # table path; this branch does not gain padded-reader support.
+            self.capture_sizes.add(common_attn_metadata.num_actual_tokens)
+            return self.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                **kwargs,
+            )
+        kwargs["full_graph_mode"] = True
+        kwargs["_for_graph_capture"] = True
+        metadata = self.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
             **kwargs,
         )
+        self.capture_sizes.add(metadata.graph_decode.graph_key[2])
+        return metadata
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        *,
+        full_graph_mode: bool = False,
+        num_actual_reqs: int | None = None,
+        _for_graph_capture: bool = False,
     ) -> AscendStep5DSAMetadata:
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
         qsl_cpu = common_attn_metadata.query_start_loc_cpu
+        graph_decode = None
+        if full_graph_mode and getattr(self, "supports_padded_decode_graph", False):
+            graph_decode = self._prepare_decode_graph(
+                common_attn_metadata,
+                num_actual_reqs,
+                for_capture=_for_graph_capture,
+            )
 
         # The upstream uniform splitter indexes the first query length.
         if common_attn_metadata.num_reqs == 0:
@@ -395,6 +565,7 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
             seq_lens=seq_lens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            graph_decode=graph_decode,
         )
         self._prepare_gbsa_metadata(metadata)
         return metadata
@@ -588,12 +759,15 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         decode_rows = int(md.num_decode_tokens) if md.decode is not None else 0
         if decode_rows:
             if md.decode.query_len > 1:
+                decode = md.graph_decode
+                query_start = decode.query_start_loc if decode is not None else md.query_start_loc
+                seq_lens = decode.seq_lens if decode is not None else md.seq_lens
                 summary_cache.update_verify(
                     key[:decode_rows],
                     z[:decode_rows],
                     slots[:decode_rows],
-                    md.query_start_loc[: md.num_decodes + 1],
-                    md.seq_lens[: md.num_decodes],
+                    query_start[: md.num_decodes + 1],
+                    seq_lens[: md.num_decodes],
                     ring,
                 )
             else:
@@ -645,7 +819,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         weights: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        d = md.decode
+        d = md.graph_decode if md.graph_decode is not None else md.decode
         assert d is not None
         if d.query_len != 1:
             if self.num_speculative_tokens <= 0:
@@ -659,7 +833,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 " _forward_sparse_gqa_verify (query_len="
                 f"{d.query_len})."
             )
-        n = md.num_decodes
+        n = d.seq_lens.shape[0] if md.graph_decode is not None else md.num_decodes
         groups = self.num_kv_groups
         seq_lens_i32 = d.seq_lens.to(torch.int32)
         # Fused score + causal topk + ascending sort via aclnn; the exact
@@ -669,14 +843,14 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         # effective KV length including the current query (seq_len); the
         # query token's own 0-based position (seq_len - 1) feeds the
         # attention operator's current-region append.
-        cu_seq_lens = md.query_start_loc[: n + 1]
-        positions = seq_lens_i32 - 1
+        cu_seq_lens = d.query_start_loc if md.graph_decode is not None else md.query_start_loc[: n + 1]
+        positions = d.positions if md.graph_decode is not None else seq_lens_i32 - 1
         actual_kv_lengths = seq_lens_i32
         _scores, ids = indexer_score_topk(
             index_q[:n],
             weights[:n],
             summary_cache.mean.view(torch.float8_e4m3fn),
-            summary_metadata.block_table[:n],
+            d.block_table if md.graph_decode is not None else summary_metadata.block_table[:n],
             cu_seq_lens,
             actual_kv_lengths,
             max_region_len=self._max_regions,
@@ -729,8 +903,8 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         guarantees, evaluated once per request instead of once per row.
         The requests retain their original varlen boundaries for both operators.
         """
-        decode_md = md.decode
-        num_decodes = md.num_decodes
+        decode_md = md.graph_decode if md.graph_decode is not None else md.decode
+        num_decodes = decode_md.seq_lens.shape[0] if md.graph_decode is not None else md.num_decodes
         query_len = int(decode_md.query_len)
         total_tokens = num_decodes * query_len
         groups = self.num_kv_groups
@@ -746,14 +920,16 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         # zero-kernel views refreshed in place by the builder. Static
         # shapes, all device tensors: ACL-graph capturable.
         seq_lens = decode_md.seq_lens[:num_decodes]
-        cu_seq_lens = md.query_start_loc[: num_decodes + 1]
+        cu_seq_lens = (
+            decode_md.query_start_loc if md.graph_decode is not None else md.query_start_loc[: num_decodes + 1]
+        )
         cu_seqlens_q = decode_md.cu_seqlens_q
         actual_kv_lengths = seq_lens
         _scores, ids = indexer_score_topk(
             index_q[:total_tokens],
             weights[:total_tokens],
             summary_cache.mean.view(torch.float8_e4m3fn),
-            summary_metadata.block_table[:num_decodes],
+            decode_md.block_table if md.graph_decode is not None else summary_metadata.block_table[:num_decodes],
             cu_seq_lens,
             actual_kv_lengths,
             max_region_len=self._max_regions,
@@ -765,7 +941,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             key_cache,
             value_cache,
             ids,
-            positions[:total_tokens],
+            decode_md.positions if md.graph_decode is not None else positions[:total_tokens],
             decode_md.block_table[:num_decodes],
             cu_seqlens_q,
             seq_lens,
@@ -875,7 +1051,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             )
         num_tokens = md.num_actual_tokens
         output[num_tokens:].zero_()
-        if num_tokens == 0:
+        if num_tokens == 0 and md.graph_decode is None:
             return output
 
         summary_metadata = attn_metadata.get(self.summary_layer_name)
@@ -883,6 +1059,11 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             raise RuntimeError(
                 f"Step5 summary group metadata is missing or invalid for layer {self.summary_layer_name!r}."
             )
+        if (
+            md.graph_decode is not None
+            and summary_metadata.block_table.data_ptr() != md.graph_decode.source_block_table_ptr
+        ):
+            raise ValueError("Step5 FULL graph requires the shared main/summary group table")
 
         self._maybe_update_summary_cache(
             summary_cache=summary_cache,
@@ -898,9 +1079,10 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         else:
             key_cache, value_cache = kv_cache[0], kv_cache[1]
 
-        if md.num_decodes > 0:
-            n = md.num_decodes
-            decode_query_len = int(md.decode.query_len) if md.decode else 1
+        decode_md = md.graph_decode if md.graph_decode is not None else md.decode
+        if decode_md is not None and (md.graph_decode is not None or md.num_decodes > 0):
+            n = decode_md.seq_lens.shape[0] if md.graph_decode is not None else md.num_decodes
+            decode_query_len = int(decode_md.query_len)
             if decode_query_len > 1:
                 # MTP verify batch: every decode request contributes K+1
                 # consecutive rows (positions ctx..ctx+K).

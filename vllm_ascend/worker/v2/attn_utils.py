@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import copy
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -34,6 +34,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
     get_layers_from_vllm_config,
+    set_current_vllm_config,
 )
 from vllm.distributed import get_dcp_group, get_tensor_model_parallel_rank
 from vllm.logger import logger
@@ -55,7 +56,8 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, customize_attention_spec
+from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
@@ -89,8 +91,11 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.core.step5_kv_cache import (
     allocate_step5_shared_kv_backing,
     allocate_step5_tailring_shared_backing,
+    step5_blnhc_layer_views,
     supports_step5_shared_kv_backing,
     supports_step5_tailring_shared_backing,
+    uses_step5_blnhc,
+    validate_step5_blnhc_descriptors,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -208,6 +213,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
     from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
+    customize_step5_blnhc = uses_step5_blnhc(vllm_config)
     use_turboquant = vllm_config.cache_config.cache_dtype == TURBOQUANT_CACHE_DTYPE
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     attention_layer_names: list[str] = []
@@ -340,6 +346,12 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
         if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
             spec = mxfp_cache_spec(spec)
+        if customize_step5_blnhc and isinstance(spec, AttentionSpec):
+            # Restore the upstream collector contract after Ascend conversions.
+            # Step5 DSA publishes its native byte-stride constraint here; its
+            # backend hook requires the supplied config even for CPU planning.
+            with set_current_vllm_config(vllm_config):
+                spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
         kv_cache_spec[layer_name] = spec
         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
             attention_layer_names.append(layer_name)
@@ -356,6 +368,13 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             if spec.page_size_bytes < common_page_size:
                 mamba_specs[layer_name] = replace(spec, page_size_padded=common_page_size)
         kv_cache_spec.update(mamba_specs)
+
+    # Annotate final specs after conversions, early branches and page alignment.
+    for layer_name, spec in kv_cache_spec.items():
+        if getattr(attn_layers[layer_name], "is_draft_layer", False) and any(
+            field.name == "is_draft" and field.init for field in fields(spec)
+        ):
+            kv_cache_spec[layer_name] = replace(spec, is_draft=True)
 
     return kv_cache_spec
 
@@ -574,6 +593,11 @@ def build_attn_metadata(
                 if not for_cudagraph_capture and model_specific_attn_metadata is not None
                 else {}
             )
+            if getattr(attn_metadata_builder, "supports_padded_decode_graph", False):
+                attn_metadata_extra_kwargs.update(
+                    num_actual_reqs=num_actual_reqs,
+                    full_graph_mode=full_graph_mode or for_cudagraph_capture,
+                )
             if is_dsa_builder:
                 # DSA cache groups share request-level metadata during replay.
                 attn_metadata_extra_kwargs.update(
@@ -1378,8 +1402,13 @@ def allocate_kv_cache_main(
     still consumes separate K/V (and backend-specific state) tensors, so keep
     the Ascend allocation/reshape contract behind the new entry point.
     """
-    del layout
     vllm_config = get_current_vllm_config()
+    if uses_step5_blnhc(vllm_config):
+        specs = validate_step5_blnhc_descriptors(kv_cache_config, layout)
+        if any(size != 128 for size in kernel_block_sizes):
+            raise ValueError("Step5 BLNHC currently requires 128-token kernel blocks")
+        caches = allocate_upstream_kv_cache(kv_cache_config, device, layout, kernel_block_sizes)
+        return step5_blnhc_layer_views(caches, specs)
     if supports_step5_tailring_shared_backing(vllm_config, kv_cache_config.kv_cache_groups):
         return allocate_step5_tailring_shared_backing(kv_cache_config, device)
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)

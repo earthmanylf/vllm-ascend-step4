@@ -61,6 +61,8 @@ def _store_summary(
     """
     summary = tl.div_rn(numerator, _maximum(denominator, 1e-20)).to(tl.bfloat16)
     summary_fp8 = summary.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    # Slot buffers are int32 on Ascend; BLNHC byte offsets exceed 2 GiB.
+    slot = slot.to(tl.int64)
     address = slot // BLOCK_SIZE * MEAN_BLOCK + slot % BLOCK_SIZE // 8 * 256
     tl.store(Mean + address + dim, summary_fp8)
 
@@ -75,9 +77,7 @@ def _replay_ring(Ring, base, first, last, dim, RING_CAPACITY: tl.constexpr):
         row = Ring + (base + position % RING_CAPACITY) * 512
         key = tl.load(row + dim).to(tl.float32)
         z = tl.load(row + 256 + dim).to(tl.float32)
-        numerator, denominator, maximum = _accumulate(
-            numerator, denominator, maximum, key, z
-        )
+        numerator, denominator, maximum = _accumulate(numerator, denominator, maximum, key, z)
     return numerator, denominator, maximum
 
 
@@ -98,15 +98,9 @@ def _update_decode_values(
     """Store an open-region row, or summarize the region this row closes."""
     if (slot >= 0) & (base >= 0):
         if position % 8 == 7:
-            numerator, denominator, maximum = _replay_ring(
-                Ring, base, position - 7, position, dim, RING_CAPACITY
-            )
-            numerator, denominator, maximum = _accumulate(
-                numerator, denominator, maximum, key, z
-            )
-            _store_summary(
-                Mean, slot, dim, numerator, denominator, MEAN_BLOCK, BLOCK_SIZE
-            )
+            numerator, denominator, maximum = _replay_ring(Ring, base, position - 7, position, dim, RING_CAPACITY)
+            numerator, denominator, maximum = _accumulate(numerator, denominator, maximum, key, z)
+            _store_summary(Mean, slot, dim, numerator, denominator, MEAN_BLOCK, BLOCK_SIZE)
         else:
             row = Ring + (base + position % RING_CAPACITY) * 512
             tl.store(row + dim, key.to(tl.bfloat16))
@@ -209,18 +203,12 @@ def _update_verify(
                 tl.store(ring_row + 256 + dim, z.to(tl.bfloat16))
                 if position % 8 == 7:
                     tl.debug_barrier()
-                    numerator, denominator, _ = _replay_ring(
-                        Ring, base, position - 7, position + 1, dim, RING_CAPACITY
-                    )
-                    _store_summary(
-                        Mean, slot, dim, numerator, denominator, MEAN_BLOCK, BLOCK_SIZE
-                    )
+                    numerator, denominator, _ = _replay_ring(Ring, base, position - 7, position + 1, dim, RING_CAPACITY)
+                    _store_summary(Mean, slot, dim, numerator, denominator, MEAN_BLOCK, BLOCK_SIZE)
             tl.debug_barrier()
 
 
-def update_verify(
-    key, z, slots, query_start_loc, seq_lens, ring_base, mean, ring, capacity
-):
+def update_verify(key, z, slots, query_start_loc, seq_lens, ring_base, mean, ring, capacity):
     """Uniform MTP verify update; graph capturable, no host metadata."""
     requests = seq_lens.shape[0]
     if requests:
@@ -333,19 +321,13 @@ def _update_prefill(
         for offset in range(8):
             row = tl.load(metadata + 2 + offset)
             valid = row >= 0
-            key = tl.load(
-                Key + row * KEY_ROW_STRIDE + dim * KEY_DIM_STRIDE, mask=valid, other=0
-            ).to(tl.float32)
-            z = tl.load(
-                Z + row * Z_ROW_STRIDE + dim * Z_DIM_STRIDE, mask=valid, other=0
-            ).to(tl.float32)
+            key = tl.load(Key + row * KEY_ROW_STRIDE + dim * KEY_DIM_STRIDE, mask=valid, other=0).to(tl.float32)
+            z = tl.load(Z + row * Z_ROW_STRIDE + dim * Z_DIM_STRIDE, mask=valid, other=0).to(tl.float32)
             updated = _accumulate(numerator, denominator, maximum, key, z)
             numerator = tl.where(valid, updated[0], numerator)
             denominator = tl.where(valid, updated[1], denominator)
             maximum = tl.where(valid, updated[2], maximum)
-        _store_summary(
-            Mean, region * 8, dim, numerator, denominator, MEAN_BLOCK, BLOCK_SIZE
-        )
+        _store_summary(Mean, region * 8, dim, numerator, denominator, MEAN_BLOCK, BLOCK_SIZE)
 
 
 @triton.jit
@@ -369,9 +351,7 @@ def _write_ring(
         tl.store(Ring + slot * 512 + 256 + dim, z.to(tl.bfloat16))
 
 
-def update_prefill(
-    key, z, metadata, positions, ring_base, ring_slots, mean, ring, capacity
-):
+def update_prefill(key, z, metadata, positions, ring_base, ring_slots, mean, ring, capacity):
     """Summarize the regions this step closes, then store open-region rows.
 
     Every ring read of the step precedes its writes, so a long chunk cannot

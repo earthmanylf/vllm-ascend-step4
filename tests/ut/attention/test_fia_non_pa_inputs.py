@@ -289,3 +289,172 @@ def test_graph_provider_preserves_captured_pa_mode(sliding_window, is_draft_mode
         assert runtime_kwargs["block_table"] is captured_block_table
     else:
         assert runtime_kwargs["block_table"] is (None if is_non_pa else metadata.block_tables)
+
+
+@pytest.mark.parametrize("window", [1, 128, 512, None])
+@pytest.mark.parametrize("qlen", [1, 4])
+@pytest.mark.parametrize("use_pa", [False, True])
+@pytest.mark.parametrize("graph", [False, True])
+def test_fia_v1_window_counts_current_token(window, qlen, use_pa, graph):
+    impl = _make_impl()
+    impl.sliding_window = window
+    metadata = _make_metadata(AscendAttentionState.DecodeOnly if use_pa else AscendAttentionState.PrefillNoCache)
+    metadata.actual_seq_lengths_q = [qlen]
+    metadata.num_actual_tokens = qlen
+    metadata.seq_lens = torch.tensor([qlen], dtype=torch.int32)
+    metadata.seq_lens_list = [qlen]
+    query = torch.zeros(qlen, 2, 4)
+    key, value = _strided_kv(qlen), _strided_kv(qlen, offset=100)
+    if use_pa:
+        backing = torch.arange(2 * 2 * qlen * 4, dtype=torch.float32).view(2, 2, qlen, 1, 4)
+        impl.key_cache, impl.value_cache = backing[:, 0], backing[:, 1]
+    output = torch.empty_like(query)
+    with (
+        patch.object(attn_module, "_EXTRA_CTX", SimpleNamespace(capturing=False, is_draft_model=False)),
+        patch.object(attn_module.envs_vllm, "VLLM_BATCH_INVARIANT", False),
+        patch.object(attn_module, "get_current_hardware_profile", return_value=Mock(supports=lambda _: False)),
+        patch.object(attn_module.torch_npu, "npu_fused_infer_attention_score", create=True) as direct_fia,
+        patch.object(attn_module.DeviceOperator, "npu_fused_infer_attention_score") as device_fia,
+        patch.object(
+            attn_module.torch_npu, "_npu_fused_infer_attention_score_get_max_workspace", create=True
+        ) as get_workspace,
+        patch.object(attn_module, "get_capture_resource", side_effect=lambda _, factory, *args: factory()),
+        patch.object(attn_module, "register_task") as register,
+    ):
+        selected_fia = direct_fia if window is not None else device_fia
+        selected_fia.return_value = (torch.ones_like(query), None)
+        if graph:
+            impl.full_graph_fia(query, key, value, metadata, output)
+            kwargs_list = [get_workspace.call_args.kwargs, register.call_args.args[1]]
+        else:
+            impl.forward_fused_infer_attention(query, key, value, metadata, output)
+            kwargs_list = [selected_fia.call_args.kwargs]
+
+    for kwargs in kwargs_list:
+        assert kwargs["sparse_mode"] == (4 if window is not None else 3)
+        if window is None and not graph:
+            # The non-SWA DeviceOperator call retains its previous defaults.
+            assert "pre_tokens" not in kwargs
+        else:
+            assert kwargs["pre_tokens"] == (window - 1 if window is not None else attn_module.SWA_INT_MAX)
+        if window is not None:
+            assert kwargs["next_tokens"] == 0
+        elif graph:
+            assert kwargs["next_tokens"] == attn_module.SWA_INT_MAX
+        assert kwargs["block_table"] is (metadata.block_tables if use_pa else None)
+    if graph:
+        assert kwargs_list[0]["pre_tokens"] == kwargs_list[1]["pre_tokens"]
+        assert kwargs_list[0]["key"] is kwargs_list[1]["key"]
+        assert kwargs_list[0]["value"] is kwargs_list[1]["value"]
+    assert impl.sliding_window is window
+
+
+@pytest.mark.parametrize("window", [0, -1])
+@pytest.mark.parametrize("graph", [False, True])
+def test_fia_v1_rejects_nonpositive_window(window, graph):
+    impl = _make_impl()
+    impl.sliding_window = window
+    query = torch.zeros(3, 2, 4)
+    with (
+        patch.object(attn_module, "_EXTRA_CTX", SimpleNamespace(capturing=False)),
+        patch.object(attn_module.torch_npu, "npu_fused_infer_attention_score", create=True),
+        pytest.raises(ValueError, match="sliding_window must be positive or None"),
+    ):
+        method = impl.full_graph_fia if graph else impl.forward_fused_infer_attention
+        method(query, _strided_kv(), _strided_kv(), _make_metadata(), torch.empty_like(query))
+
+
+@pytest.mark.parametrize("window", [1, 512, None])
+@pytest.mark.parametrize("graph", [False, True])
+def test_fia_v2_sink_window_is_not_reinterpreted(window, graph):
+    impl = _make_impl()
+    impl.sliding_window = window
+    impl.sinks = torch.zeros(2)
+    query = torch.zeros(3, 2, 4)
+    metadata = _make_metadata()
+    with (
+        patch.object(attn_module, "_EXTRA_CTX", SimpleNamespace(capturing=False)),
+        patch.object(attn_module.torch_npu, "npu_fused_infer_attention_score_v2", create=True) as fia_v2,
+        patch.object(
+            attn_module.torch_npu, "_npu_fused_infer_attention_score_v2_get_max_workspace", create=True
+        ) as get_workspace,
+        patch.object(attn_module, "get_capture_resource", side_effect=lambda _, factory, *args: factory()),
+        patch.object(attn_module, "register_task") as register,
+    ):
+        fia_v2.return_value = (torch.ones_like(query), None)
+        if graph:
+            impl.full_graph_fia_v2(query, _strided_kv(), _strided_kv(), metadata, torch.empty_like(query))
+            kwargs_list = [get_workspace.call_args.kwargs, register.call_args.args[1]]
+        else:
+            impl.forward_fused_infer_attention(query, _strided_kv(), _strided_kv(), metadata, torch.empty_like(query))
+            kwargs_list = [fia_v2.call_args.kwargs]
+    for kwargs in kwargs_list:
+        assert kwargs["pre_tokens"] == (window if window is not None else attn_module.SWA_INT_MAX)
+        assert kwargs["sparse_mode"] == (4 if window is not None else 3)
+        assert kwargs["learnable_sink"] is impl.sinks
+
+
+def test_fia_v1_boundary_sentinel_excludes_extra_historical_token():
+    impl = _make_impl()
+    impl.sliding_window = 512
+    query = torch.zeros(1, 2, 4)
+    metadata = _make_metadata()
+    metadata.actual_seq_lengths_q = [1]
+    metadata.num_actual_tokens = 1
+    with (
+        patch.object(attn_module, "_EXTRA_CTX", SimpleNamespace(capturing=False)),
+        patch.object(
+            attn_module.torch_npu,
+            "npu_fused_infer_attention_score",
+            create=True,
+            return_value=(torch.ones_like(query), None),
+        ) as fia,
+    ):
+        impl.forward_fused_infer_attention(query, _strided_kv(1), _strided_kv(1), metadata, torch.empty_like(query))
+    left = fia.call_args.kwargs["pre_tokens"]
+    target, draft, excluded = 131073, 131071, 130559
+    first_kept_page = (target - (512 - 1 + 2)) // 128
+    actual_positions = range(max(draft - left, 0), draft + 1)
+    assert len(actual_positions) == 512
+    assert excluded not in actual_positions
+    assert all(position // 128 >= first_kept_page for position in actual_positions)
+    # Included-left and current sentinels remain visible with the upstream budget.
+    assert excluded + 1 in actual_positions
+    assert draft in actual_positions
+    # Independent original-adapter counterexample: uniform QK => sentinel weight 1/513.
+    old_positions = range(draft - 512, draft + 1)
+    assert excluded in old_positions
+    assert excluded // 128 < first_kept_page
+    assert 1 / len(old_positions) > 0
+
+
+@pytest.mark.parametrize("window", [512, None])
+def test_fia_v1_c8_graph_keeps_specialized_mode_zero_contract(window):
+    impl = _make_impl(AscendC8AttentionBackendImpl)
+    impl.sliding_window = window
+    impl.enable_c8_quant = True
+    impl.key_cache = torch.empty(2, 3, 1, 4, dtype=torch.int8)
+    impl.value_cache = torch.empty_like(impl.key_cache)
+    impl._nz_5d_view = Mock(side_effect=lambda cache, _: cache)
+    layer = SimpleNamespace(
+        _c8_k_aq_scale_nz_bnsd=torch.ones(1),
+        _c8_v_aq_scale_nz_bnsd=torch.ones(1),
+    )
+    metadata = _make_metadata(AscendAttentionState.DecodeOnly)
+    query = torch.zeros(3, 2, 4)
+    with (
+        patch.object(attn_module, "_EXTRA_CTX", SimpleNamespace(is_draft_model=False)),
+        patch.object(attn_module.torch_npu, "npu_fused_infer_attention_score", create=True),
+        patch.object(
+            attn_module.torch_npu, "_npu_fused_infer_attention_score_get_max_workspace", create=True
+        ) as get_workspace,
+        patch.object(attn_module, "get_capture_resource", side_effect=lambda _, factory, *args: factory()),
+        patch.object(attn_module, "register_task") as register,
+    ):
+        impl.full_graph_fia(query, _strided_kv(), _strided_kv(), metadata, torch.empty_like(query), layer)
+    for kwargs in (get_workspace.call_args.kwargs, register.call_args.args[1]):
+        assert kwargs["input_layout"] == "BNSD"
+        assert kwargs["sparse_mode"] == 0
+        assert kwargs["atten_mask"] is None
+        assert kwargs["pre_tokens"] == (window if window is not None else attn_module.SWA_INT_MAX)
+        assert kwargs["inner_precise"] == 1

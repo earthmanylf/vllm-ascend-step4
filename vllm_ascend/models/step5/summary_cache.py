@@ -33,6 +33,8 @@ from vllm.models.step5.nvidia.sparse_summary_cache import (
 )
 from vllm.v1.attention.backend import AttentionMetadata, CommonAttentionMetadata
 
+from vllm_ascend.core.step5_kv_cache import uses_step5_blnhc
+
 
 @dataclass
 class AscendStep5SparseSummaryMetadata(AttentionMetadata):
@@ -133,9 +135,9 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
     and ``sparse_config`` arguments: main's layer needs neither, and the
     side-storage budget hooks they fed (``_set_summary_cache_budget`` /
     ``_fixed_runtime_state_budget``) do not exist in the TailRing design --
-    the summary is an ordinary FullAttentionSpec layer in its own KV group,
-    so it is budgeted like any other page. Physical padding does not make its
-    manager block IDs aliases of the main layer's block IDs.
+    the V2 BLNHC path keeps the real compressed FullAttentionSpec and the
+    upstream planner groups it with main KV. Both use the same manager IDs.
+    The older padded profile remains separate for non-V2 execution.
     """
 
     def __init__(
@@ -165,6 +167,8 @@ class AscendStep5SparseSummaryCacheLayer(Step5SparseSummaryCacheLayer):
         main_spec = main_layer.get_kv_cache_spec(vllm_config)
         if spec.block_size != main_spec.block_size:
             raise ValueError("Step5 summary and main KV must use the same logical block size")
+        if uses_step5_blnhc(vllm_config):
+            return spec
         return replace(spec, page_size_padded=main_spec.page_size_bytes)
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
