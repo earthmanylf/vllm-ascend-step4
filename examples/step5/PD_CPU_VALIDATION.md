@@ -58,7 +58,9 @@ can pin cache capacity indefinitely. This prevents clock-only reclamation; it
 | Check | Observed result | Boundary |
 |---|---|---|
 | Actual P4/D4 handoff | 13 lengths:1–9,127,128,129,513;104 output IDs and all generation logprobs exact; max delta0 | Reduced model, not original92-layer dualTP8 |
-| Fresh installed source rerun | Same13 cases exact0; tested P/D exited; basic health200 restored | No diagnostic/test-side credit cap |
+| Fresh installed source rerun (premerge09011d71a) | Same13 cases exact0; tested P/D exited; basic health200 restored | Does not certify the later integrated BLNHC revision |
+| Integrated KV/layout RPC CPU checks | 39 passed +24 subtests | Local BLNHC/config-context and compact PD coexistence |
+| Integrated DSA/summary/graph CPU checks | 82 passed +4 subtests;5 skipped | Native collector and post-merge NPU checks remain pending |
 | Controlled cancellation | Abort while RECEIVE publication held after a synchronous READ returned; groups retained; probes did not reuse held IDs | Not proven cancellation during pending native DMA |
 | Owned non-listening peer failure | Real no-peer failure, terminal reporting and exact recovery | Injected failing rank has no DMA; not generic failed-DMA quiescence |
 | Production CPU protocol suite | 134 passed | Source-isolated methods, native networking/device doubles |

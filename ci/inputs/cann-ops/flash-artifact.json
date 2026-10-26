@@ -1,0 +1,10 @@
+{
+  "file": "flash_attn_npu-0.4.0-cp312-cp312-linux_aarch64.whl",
+  "bytes": 38072129,
+  "sha256": "5af639326a753bc6ff015ef2b1c4e920de10a656aabb49e136c455999ff9b870",
+  "forced_source_build": true,
+  "torch": "2.10.0+cpu",
+  "torch_npu": "2.10.0.post4",
+  "npu_target": "950",
+  "installed_version": "0.4.0"
+}

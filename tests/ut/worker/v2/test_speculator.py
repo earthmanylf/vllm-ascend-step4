@@ -23,7 +23,7 @@ else:
         TargetDependentARSpeculator as AutoRegressiveSpeculator,
     )
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState, AscendMetadata
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
@@ -34,6 +34,126 @@ from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
     gather,
     torch_gather_wrapper,
 )
+from vllm_ascend.worker.v2.spec_decode.multi_module_mtp.speculator import AscendMultiModuleMTPSpeculator
+
+
+def _mtp_test_speculator(real_tokens=12):
+    spec = AscendMultiModuleMTPSpeculator.__new__(AscendMultiModuleMTPSpeculator)
+    spec.input_batch = SimpleNamespace(num_tokens=real_tokens, is_prefilling_np=np.zeros(4, dtype=bool))
+    spec.input_buffers = SimpleNamespace(positions=torch.arange(16), seq_lens_cpu=torch.tensor([100, 100, 100, 0]))
+    spec.draft_vllm_config = SimpleNamespace(parallel_config=SimpleNamespace())
+    spec.attn_backend = AscendAttentionBackend
+    return spec
+
+
+def _mtp_test_metadata(ends=None, kv=None):
+    metadata = AscendMetadata.__new__(AscendMetadata)
+    metadata.actual_seq_lengths_q = [4, 8, 12, 12] if ends is None else ends
+    metadata.seq_lens_list = [100, 100, 100, 0] if kv is None else kv
+    metadata.slot_mapping = torch.tensor([*range(12), -1, -1, -1, -1])
+    return metadata
+
+
+def _mtp_test_build(spec, mode, metadata, query=None, real_reqs=3):
+    module = "vllm_ascend.worker.v2.spec_decode.multi_module_mtp.speculator"
+    descriptor = SimpleNamespace(cg_mode=mode, num_reqs=4, num_tokens=16, uniform_token_count=4)
+    query = np.array([0, 4, 8, 12, 16], dtype=np.int32) if query is None else query
+    with (
+        patch(f"{module}.build_attn_metadata_factory", return_value=nullcontext()),
+        patch(f"{module}.MultiModuleMTPSpeculator._build_attn_metadata", return_value=metadata) as upstream,
+    ):
+        result = spec._build_attn_metadata(real_reqs, descriptor, query, None, 0)
+    return result, upstream.call_args.args[2]
+
+
+def test_mtp_full_padding_preserves_real_queries_and_slot_mapping():
+    """The FULL graph must own every query row without changing live cache slots."""
+    spec = _mtp_test_speculator()
+    metadata = _mtp_test_metadata()
+    slots = metadata.slot_mapping.clone()
+    result, _ = _mtp_test_build(spec, CUDAGraphMode.FULL, {"head0": metadata, "head1": metadata})
+    assert result["head0"].actual_seq_lengths_q == [4, 8, 12, 16]
+    assert metadata.seq_lens_list == [100, 100, 100, 0]
+    torch.testing.assert_close(metadata.slot_mapping, slots)
+    _mtp_test_build(spec, CUDAGraphMode.FULL, result)
+    assert metadata.actual_seq_lengths_q == [4, 8, 12, 16]
+
+
+def test_mtp_full_padding_rejects_invalid_layers_atomically():
+    import pytest
+
+    spec = _mtp_test_speculator()
+    valid = _mtp_test_metadata()
+    invalid = _mtp_test_metadata(kv=[100, 100, 100, 999])
+    with pytest.raises(RuntimeError, match="nonzero padded KV"):
+        _mtp_test_build(spec, CUDAGraphMode.FULL, {"head0": valid, "head1": invalid})
+    assert valid.actual_seq_lengths_q == [4, 8, 12, 12]
+
+
+def test_mtp_eager_uses_real_request_prefix_from_padded_target():
+    """Eager cache writes must count real K/V rows, not target graph padding."""
+    for real_reqs in (1, 2, 3, 4):
+        spec = _mtp_test_speculator(real_reqs * 4)
+        query = np.array([0, 4, 8, 12, 16], dtype=np.int32)
+        before = query.copy()
+        _, passed = _mtp_test_build(spec, CUDAGraphMode.NONE, {}, query, real_reqs)
+        np.testing.assert_array_equal(passed, before[: real_reqs + 1])
+        np.testing.assert_array_equal(query, before)
+
+
+def test_mtp_eager_rejects_bad_prefix_without_assert_guards():
+    import pytest
+
+    for query in ([0, 4], [1, 4, 8, 12, 16], [0, 8, 4, 12, 16], [0, 4, 8, 11, 16]):
+        with pytest.raises(RuntimeError, match="eager MTP real query prefix"):
+            _mtp_test_build(_mtp_test_speculator(), CUDAGraphMode.NONE, {}, np.array(query))
+
+
+def test_mtp_derived_backend_does_not_receive_ordinary_fia_padding():
+    class DerivedBackend(AscendAttentionBackend):
+        pass
+
+    spec = _mtp_test_speculator()
+    spec.attn_backend = DerivedBackend
+    metadata = _mtp_test_metadata()
+    _mtp_test_build(spec, CUDAGraphMode.FULL, {"head0": metadata})
+    assert metadata.actual_seq_lengths_q == [4, 8, 12, 12]
+
+
+def test_mtp_full_normalizes_common_queries_before_fia_builder_adds_tail():
+    """Exercise the actual callback before the current builder's tail append."""
+    spec = _mtp_test_speculator()
+    spec.attn_groups = [[SimpleNamespace(backend=AscendAttentionBackend)]]
+    module = "vllm_ascend.worker.v2.spec_decode.multi_module_mtp.speculator"
+    callback = None
+    query = torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32)
+    original = query.clone()
+    common = SimpleNamespace(num_reqs=4, query_start_loc_cpu=query)
+
+    def factory(*args, **kwargs):
+        nonlocal callback
+        callback = kwargs["offload_kwargs"]["common_metadata_callback"]
+        return nullcontext()
+
+    def upstream(*args, **kwargs):
+        callback(0, common)
+        # The ordinary builder must not append its synthetic request when
+        # the graph's existing no-op request already owns the padded rows.
+        ends = common.query_start_loc_cpu[1:].tolist()
+        if ends[-1] < 16:
+            ends.append(16)
+        return {"head0": _mtp_test_metadata(ends=ends)}
+
+    descriptor = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_reqs=4, num_tokens=16, uniform_token_count=4)
+    with (
+        patch(f"{module}.build_attn_metadata_factory", side_effect=factory),
+        patch(f"{module}.MultiModuleMTPSpeculator._build_attn_metadata", side_effect=upstream),
+    ):
+        result = spec._build_attn_metadata(3, descriptor, np.array([0, 4, 8, 12, 16]), None, 0)
+    assert result["head0"].actual_seq_lengths_q == [4, 8, 12, 16]
+    assert len(result["head0"].seq_lens_list) == 4
+    torch.testing.assert_close(query, original)
+    assert common.query_start_loc_cpu is not query
 
 
 def test_calc_next_seq_lens_cpu():

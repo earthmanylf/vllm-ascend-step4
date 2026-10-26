@@ -1,0 +1,32 @@
+[
+  {
+    "path": "abseil-cpp/backport-CVE-2025-0838.patch",
+    "url": "https://gitcode.com/cann-src-third-party/abseil-cpp/releases/download/20230802.1-h0/backport-CVE-2025-0838.patch",
+    "sha256": "a4e4ef6fc4f4c1ed871a3472c5e650068aaadaad2adfef2c8ccb00918bb36d8c",
+    "bytes": 4618
+  },
+  {
+    "path": "abseil-cpp-20230802.1.tar.gz",
+    "url": "https://cann-3rd.obs.cn-north-4.myhuaweicloud.com/abseil-cpp/abseil-cpp-20230802.1.tar.gz",
+    "sha256": "987ce98f02eefbaf930d6e38ab16aa05737234d7afbab2d5c4ea7adbe50c28ed",
+    "bytes": 2157158
+  },
+  {
+    "path": "eigen-5.0.0.tar.gz",
+    "url": "https://cann-3rd.obs.cn-north-4.myhuaweicloud.com/eigen/eigen-5.0.0.tar.gz",
+    "sha256": "93f7f0462988b934e632a9fba58af55192ffceae38e8f46233f4f62cb1e79370",
+    "bytes": 2963022
+  },
+  {
+    "path": "protobuf-25.1.tar.gz",
+    "url": "https://cann-3rd.obs.cn-north-4.myhuaweicloud.com/protobuf/protobuf-25.1.tar.gz",
+    "sha256": "9bd87b8280ef720d3240514f884e56a712f2218f0d693b48050c836028940a42",
+    "bytes": 5878124
+  },
+  {
+    "path": "json-3.12.0.tar.gz",
+    "url": "https://cann-3rd.obs.cn-north-4.myhuaweicloud.com/json/json-3.12.0.tar.gz",
+    "sha256": "4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187",
+    "bytes": 9678593
+  }
+]

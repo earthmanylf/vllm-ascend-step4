@@ -12,7 +12,7 @@ import sys
 import unittest
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from pathlib import Path
 from types import ModuleType
@@ -79,7 +79,13 @@ module_spec = importlib.util.spec_from_file_location(
     "step5_shared_candidate", ROOT / "vllm_ascend/core/step5_kv_cache.py"
 )
 helper = importlib.util.module_from_spec(module_spec)
-with patch.dict(sys.modules, {"vllm.v1.kv_cache_interface": stub}):
+layout_spec = importlib.util.spec_from_file_location("cpu_kv_cache_layout", vllm_source_file("v1/kv_cache_layout.py"))
+layout_stub = importlib.util.module_from_spec(layout_spec)
+layout_spec.loader.exec_module(layout_stub)
+with patch.dict(
+    sys.modules,
+    {"vllm.v1.kv_cache_interface": stub, "vllm.v1.kv_cache_layout": layout_stub},
+):
     module_spec.loader.exec_module(helper)
 
 
@@ -286,7 +292,10 @@ def pd_upstream_fixture(counts=(2, 2, 2)):
     builder_module = ModuleType("vllm.v1.core.kv_cache_config_builder")
     builder_module.get_kv_cache_config_builder = lambda c: builder
     candidate = importlib.util.module_from_spec(module_spec)
-    with patch.dict(sys.modules, {"vllm.v1.kv_cache_interface": interface}):
+    with patch.dict(
+        sys.modules,
+        {"vllm.v1.kv_cache_interface": interface, "vllm.v1.kv_cache_layout": layout},
+    ):
         module_spec.loader.exec_module(candidate)
     env = dict(planner.__dict__)
     env.update(candidate.__dict__)
@@ -309,6 +318,105 @@ def pd_upstream_fixture(counts=(2, 2, 2)):
 
 
 class SharedCacheTests(unittest.TestCase):
+    def test_supported_v2_pd_selects_compact_layout_not_local_blnhc(self):
+        f = pd_upstream_fixture()
+        for connector in ("MooncakeConnectorV2", "MooncakePullConnector"):
+            for role in ("kv_producer", "kv_consumer"):
+                with self.subTest(connector=connector, role=role):
+                    f.cfg.kv_transfer_config.kv_connector = connector
+                    f.cfg.kv_transfer_config.kv_role = role
+                    f.helper.validate_step5_kv_transfer_config(f.cfg)
+                    self.assertFalse(f.helper.uses_step5_blnhc(f.cfg))
+                    groups = f.planner.get_kv_cache_groups(f.cfg, dict(f.specs))
+                    self.assertTrue(f.helper.supports_step5_tailring_shared_backing(f.cfg, groups))
+        f.cfg.kv_transfer_config.is_kv_transfer_instance = False
+        self.assertTrue(f.helper.uses_step5_blnhc(f.cfg))
+        f.cfg.kv_transfer_config = None
+        self.assertTrue(f.helper.uses_step5_blnhc(f.cfg))
+
+    def test_supported_v2_pd_allocator_uses_aligned_compact_page_addresses(self):
+        f = pd_upstream_fixture()
+        groups = f.planner.get_kv_cache_groups(f.cfg, dict(f.specs))
+        planned = f.planner.get_kv_cache_config_from_groups(f.cfg, groups, 4 * 196608)
+        f.env.update(get_current_vllm_config=lambda: f.cfg)
+        allocate = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "allocate_kv_cache_main", f.env)
+        with patch.object(torch, "zeros", wraps=torch.zeros) as alloc:
+            views = allocate(planned, "cpu", f.cfg.cache_config.get_resolved_kv_cache_layout(), [128] * len(groups))
+        self.assertEqual(alloc.call_count, 1)
+        k, v = views["main.0"]
+        self.assertEqual(k.data_ptr() % f.helper.STEP5_PD_BUFFER_ALIGNMENT, 0)
+        self.assertEqual(k.stride(0) * k.element_size(), 98304)
+        self.assertEqual(v.data_ptr() - k.data_ptr(), 49152)
+        self.assertEqual(views["main.1"][0].data_ptr() - k.data_ptr(), 4 * 98304)
+        self.assertEqual(views["summary.0"].shape, (4, 1, 16, 256))
+        self.assertEqual(views["summary.0"].stride(0), 98304)
+        self.assertEqual(f.specs["summary.0"].page_size_padded, 98304)
+        tensors = [t for value in views.values() for t in (value if isinstance(value, tuple) else (value,))]
+        self.assertEqual({t.untyped_storage().data_ptr() for t in tensors}, {k.untyped_storage().data_ptr()})
+        self.assertEqual(k.untyped_storage().nbytes(), planned.kv_cache_tensors[0].size + 2097152)
+
+    def test_supported_v2_pd_budget_reserves_once_before_real_planner(self):
+        f = pd_upstream_fixture()
+        budget = 4 * 196608 + f.helper.STEP5_PD_BUFFER_ALIGNMENT + 19
+        reduced = f.scale(f.worker, budget)
+        self.assertEqual(reduced, budget - f.helper.STEP5_PD_BUFFER_ALIGNMENT)
+        self.assertEqual(f.worker._apply_step5_tailring_alignment_reserve(budget), reduced)
+        groups = f.planner.get_kv_cache_groups(f.cfg, dict(f.specs))
+        planned = f.planner.get_kv_cache_config_from_groups(f.cfg, groups, reduced)
+        self.assertEqual(planned.num_blocks, 4)
+        views = f.helper.allocate_step5_tailring_shared_backing(planned, "cpu", align_for_transfer=True)
+        self.assertLessEqual(views["main.0"][0].untyped_storage().nbytes(), budget)
+
+    def test_pd_layout_selection_leaves_capability_validation_separate(self):
+        f = pd_upstream_fixture()
+        f.cfg.kv_transfer_config.kv_connector = "UnsupportedConnector"
+        self.assertFalse(f.helper.uses_step5_blnhc(f.cfg))
+        with self.assertRaisesRegex(ValueError, "registered Ascend"):
+            f.helper.validate_step5_kv_transfer_config(f.cfg)
+
+    def test_pd_backend_and_summary_spec_retain_compact_padded_profile(self):
+        f = pd_upstream_fixture()
+        namespace = dict(f.env, AttentionBackend=object, replace=replace)
+        source = ROOT / "vllm_ascend/models/step5/dsa_attention.py"
+        backend = next(
+            n for n in ast.parse(source.read_text()).body if getattr(n, "name", None) == "AscendStep5DSABackend"
+        )
+        backend.body = [
+            n for n in backend.body if getattr(n, "name", None) in ("supported_kv_cache_layouts", "customize_spec")
+        ]
+        exec(compile(ast.Module(body=[backend], type_ignores=[]), str(source), "exec"), namespace)
+        config_module = ModuleType("vllm.config")
+        config_module.get_current_vllm_config_or_none = lambda: f.cfg
+        with patch.dict(sys.modules, {"vllm.config": config_module}):
+            self.assertIsNone(namespace[backend.name].supported_kv_cache_layouts())
+            self.assertIs(namespace[backend.name].customize_spec(f.specs["main.0"]), f.specs["main.0"])
+
+        class Base:
+            def get_kv_cache_spec(self, _):
+                return replace(f.specs["summary.0"], page_size_padded=None)
+
+        source = ROOT / "vllm_ascend/models/step5/summary_cache.py"
+        layer = next(
+            n
+            for n in ast.parse(source.read_text()).body
+            if getattr(n, "name", None) == "AscendStep5SparseSummaryCacheLayer"
+        )
+        namespace.update(Step5SparseSummaryCacheLayer=Base, Any=object, AscendStep5SparseSummaryBackend=object)
+        exec(compile(ast.Module(body=[layer], type_ignores=[]), str(source), "exec"), namespace)
+        summary = namespace[layer.name].__new__(namespace[layer.name])
+        main = NS(get_kv_cache_spec=lambda _: f.specs["main.0"])
+        summary._main_layer_ref = lambda: main
+        padded = summary.get_kv_cache_spec(f.cfg)
+        self.assertEqual(padded.page_size_bytes, 98304)
+        self.assertEqual(padded.page_size_padded, 98304)
+        self.assertEqual(padded.tokens_per_state, 8)
+        f.cfg.kv_transfer_config = None
+        local = summary.get_kv_cache_spec(f.cfg)
+        self.assertEqual(local.page_size_bytes, 4096)
+        self.assertIsNone(local.page_size_padded)
+        with patch.dict(sys.modules, {"vllm.config": config_module}):
+            self.assertEqual(namespace[backend.name].supported_kv_cache_layouts(), (f.helper.KVCacheLayout.BLNHC,))
+
     def test_pd_override_upstream_reproduces_original_budget_overrun(self):
         f = pd_upstream_fixture()
         f.cfg.cache_config.num_gpu_blocks_override = 5
@@ -463,6 +571,7 @@ class SharedCacheTests(unittest.TestCase):
         allocated = helper.allocate_step5_tailring_shared_backing(kv, "cpu", align_for_transfer=True)
         env = dict(
             get_current_vllm_config=lambda: cfg,
+            uses_step5_blnhc=lambda _: False,
             step5_tailring_alignment_reserve=helper.step5_tailring_alignment_reserve,
             supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
             allocate_step5_tailring_shared_backing=helper.allocate_step5_tailring_shared_backing,
@@ -533,6 +642,7 @@ class SharedCacheTests(unittest.TestCase):
         cfg, kv = tailring_config()
         env = dict(
             get_kv_cache_groups=lambda *_: kv.kv_cache_groups,
+            uses_step5_blnhc=lambda _: False,
             supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
             step5_tailring_alignment_reserve=helper.step5_tailring_alignment_reserve,
             supports_step5_shared_kv_backing=helper.supports_step5_shared_kv_backing,
@@ -674,6 +784,7 @@ class SharedCacheTests(unittest.TestCase):
         env = dict(
             get_current_vllm_config=config,
             step5_tailring_alignment_reserve=helper.step5_tailring_alignment_reserve,
+            uses_step5_blnhc=lambda _: False,
             supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
             allocate_step5_tailring_shared_backing=helper.allocate_step5_tailring_shared_backing,
         )
@@ -752,6 +863,7 @@ class SharedCacheTests(unittest.TestCase):
         env = dict(
             torch=torch,
             get_current_vllm_config=config,
+            uses_step5_blnhc=lambda _: False,
             _is_dsv4_model=lambda _: False,
             is_deepseek_v41_cache=lambda _: False,
             _get_layer_kv_cache_specs=lambda _: {"summary": spec},
@@ -927,6 +1039,7 @@ class SharedCacheTests(unittest.TestCase):
         )
         env.update(
             get_kv_cache_groups=lambda *_: kv.kv_cache_groups,
+            uses_step5_blnhc=lambda _: False,
             supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
             UniformTypeKVCacheSpecs=UniformTypeKVCacheSpecs,
         )

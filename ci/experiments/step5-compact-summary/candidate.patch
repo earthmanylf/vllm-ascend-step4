@@ -1,0 +1,281 @@
+--- /dev/null
++++ b/vllm_ascend/core/step5_compact_kv.py
+@@ -0,0 +1,233 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Opt-in Step5 compact summaries with one charged global block-ID pool.
++
++Native main KV remains in its original homogeneous layer-major backing.
++Summaries live in a separate, fully charged backing. Every global block ID
++owns the corresponding slot in BOTH backings, so heterogeneous page sizes
++never overlay differently numbered live blocks.
++"""
++
++from collections import defaultdict
++
++import torch
++from vllm.v1.core.kv_cache_planning import DefaultKVCacheConfigBuilder, create_kv_cache_group_specs
++from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    KVCacheTensor,
++    SlidingWindowSpec,
++    UniformTypeKVCacheSpecs,
++)
++
++MAIN_PAGE_BYTES = 98304
++SUMMARY_PAGE_BYTES = 4096
++SUMMARY_SUFFIX = ".sparse_summary_cache"
++RING_SUFFIX = ".csa_tail_ring"
++
++
++def compact_summary_requested(config):
++    return (getattr(config, "additional_config", None) or {}).get("step5_compact_summary", False) is True
++
++
++def validate_compact_config(config):
++    """Fail closed outside the exact tested text-only, local KV V2 path."""
++    if not compact_summary_requested(config):
++        raise ValueError("Step5 compact summary must be explicitly requested")
++    if not config.use_v2_model_runner or config.model_config.hf_text_config.model_type != "step5":
++        raise ValueError("Step5 compact summary requires Step5 Model Runner V2")
++    if config.kv_transfer_config is not None:
++        raise ValueError("Step5 compact summary does not support KV transport")
++    additional = config.additional_config or {}
++    if additional.get("enable_kvpp", False) or additional.get("sparse_kv_offload_config", {}).get("enabled", False):
++        raise ValueError("Step5 compact summary cannot combine with KV offload/KVPP")
++    if getattr(config.attention_config, "hisparse_config", None) is not None:
++        raise ValueError("Step5 compact summary does not support HiSparse")
++    parallel = config.parallel_config
++    if any(
++        getattr(parallel, field, 1) != 1
++        for field in ("pipeline_parallel_size", "decode_context_parallel_size", "prefill_context_parallel_size")
++    ):
++        raise ValueError("Step5 compact summary requires PP/PCP/DCP=1")
++    layout = config.cache_config.get_resolved_kv_cache_layout()
++    if not (layout.is_layer_compact and layout.is_block_compact):
++        raise ValueError("Step5 compact summary requires a layer/block compact layout")
++    if config.scheduler_config.disable_hybrid_kv_cache_manager:
++        raise ValueError("Step5 compact summary requires hybrid KV management")
++    if config.cache_config.enable_prefix_caching:
++        raise ValueError("Step5 compact summary prefix-cache acceptance is not yet validated")
++    if getattr(config.model_config, "is_multimodal_model", False):
++        raise ValueError("Step5 compact summary requires text-only mode")
++
++
++def classify_specs(specs):
++    """Exact layer roles and page geometry; never infer backing identity by size."""
++    roles = {"main": {}, "summary": {}, "ring": {}, "swa": {}}
++    for name, spec in specs.items():
++        if spec.block_size != 128 or getattr(spec, "store_on_host", False) or spec.kv_quant_mode != 0:
++            raise ValueError(f"Unsupported Step5 compact cache spec: {name}")
++        if type(spec) is FullAttentionSpec and name.endswith(SUMMARY_SUFFIX):
++            if (
++                spec.dtype != torch.uint8 or spec.num_kv_heads != 1 or spec.head_size != 256
++                or spec.head_size_v != 0 or spec.tokens_per_state != 8
++                or spec.page_size_padded is not None or spec.page_size_bytes != SUMMARY_PAGE_BYTES
++            ):
++                raise ValueError(f"Invalid compact summary: {name}")
++            role = "summary"
++        elif type(spec) is CircularBufferSpec and name.endswith(RING_SUFFIX):
++            if (
++                spec.dtype != torch.bfloat16 or spec.num_kv_heads != 1
++                or spec.head_size != 384 or spec.head_size_v != 0 or spec.tokens_per_state != 1
++                or spec.page_size_padded is not None or spec.page_size_bytes != MAIN_PAGE_BYTES
++            ):
++                raise ValueError(f"Invalid compact ring: {name}")
++            role = "ring"
++        elif type(spec) in (FullAttentionSpec, SlidingWindowSpec) and name.endswith(".attn"):
++            if (
++                spec.dtype != torch.bfloat16 or spec.num_kv_heads != 1
++                or spec.head_size != 192 or spec.head_size_v != 192 or spec.tokens_per_state != 1
++                or spec.page_size_padded is not None or spec.page_size_bytes != MAIN_PAGE_BYTES
++            ):
++                raise ValueError(f"Invalid compact main/SWA: {name}")
++            role = "main" if type(spec) is FullAttentionSpec else "swa"
++        else:
++            raise ValueError(f"Unknown compact Step5 layer role: {name}")
++        roles[role][name] = spec
++    if not all(roles.values()):
++        raise ValueError("Compact Step5 requires main, summary, SWA and ring layers")
++    if set(roles["summary"]) != {name + SUMMARY_SUFFIX for name in roles["main"]}:
++        raise ValueError("Compact summary must match every main layer exactly")
++    if set(roles["ring"]) != {name + RING_SUFFIX for name in roles["main"]}:
++        raise ValueError("Compact ring must match every main layer exactly")
++    return roles
++
++
++def flatten_groups(groups):
++    specs = {}
++    for group in groups:
++        if group.host_resident:
++            raise ValueError("Compact Step5 does not support host groups")
++        for name in group.layer_names:
++            if name in specs:
++                raise ValueError(f"Duplicate compact layer: {name}")
++            specs[name] = (
++                group.kv_cache_spec.kv_cache_specs[name]
++                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) else group.kv_cache_spec
++            )
++    return specs
++
++
++def compact_sizes(groups):
++    roles = classify_specs(flatten_groups(groups))
++    main_slots = max(sum(name not in roles["summary"] for name in group.layer_names) for group in groups)
++    summary_slots = len(roles["summary"])
++    return main_slots * MAIN_PAGE_BYTES, summary_slots * SUMMARY_PAGE_BYTES
++
++
++class Step5CompactKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
++    """Use Core's auto-fit, null-block and cross-rank convergence unchanged."""
++
++    def get_kv_cache_groups(self, config, specs):
++        validate_compact_config(config)
++        roles = classify_specs(specs)
++        full = {**roles["main"], **roles["summary"]}
++        full_spec = UniformTypeKVCacheSpecs.from_specs(full)
++        if full_spec is None:
++            raise ValueError("Main and compact summary cannot share manager blocks")
++        groups = [KVCacheGroupSpec(list(full), full_spec)]
++        # Keep homogeneous SWA/ring slots at most as wide as the main group.
++        width = len(roles["main"])
++        for role in ("swa", "ring"):
++            buckets = defaultdict(list)
++            for name, spec in roles[role].items():
++                buckets[spec].append(name)
++            for names in buckets.values():
++                count = (len(names) + width - 1) // width
++                groups.extend(create_kv_cache_group_specs(specs, [names[i::count] for i in range(count)]))
++        return groups
++
++    def _get_pool_bytes_per_block(self, config, groups):
++        validate_compact_config(config)
++        return sum(compact_sizes(groups))
++
++    def get_kv_cache_config_from_groups(self, config, groups, num_blocks):
++        validate_compact_config(config)
++        if num_blocks <= 0:
++            raise ValueError("Compact Step5 needs a positive block count")
++        specs = flatten_groups(groups)
++        roles = classify_specs(specs)
++        main_cost, summary_cost = compact_sizes(groups)
++        descriptors = []
++        for group in groups:
++            for summary in (False, True):
++                names = [name for name in group.layer_names if (name in roles["summary"]) == summary]
++                page = SUMMARY_PAGE_BYTES if summary else MAIN_PAGE_BYTES
++                cost = summary_cost if summary else main_cost
++                # One descriptor per exact layer: role identity never depends on size.
++                for slot, name in enumerate(names):
++                    descriptors.append(KVCacheTensor(
++                        size=cost * num_blocks, layers=[name], layer_stride=page * num_blocks,
++                        block_stride=page, offset=slot * page * num_blocks,
++                    ))
++        return KVCacheConfig(
++            num_blocks=num_blocks, kv_cache_tensors=descriptors, kv_cache_groups=groups,
++            prefix_cache_retention_interval=config.cache_config.prefix_cache_retention_interval,
++        )
++
++
++def allocate_compact_backings(config, device):
++    """Validate the complete placement before allocating either physical backing."""
++    specs = flatten_groups(config.kv_cache_groups)
++    roles = classify_specs(specs)
++    main_cost, summary_cost = compact_sizes(config.kv_cache_groups)
++    if config.num_blocks <= 0:
++        raise ValueError("Compact Step5 needs positive blocks")
++    expected = {}
++    for group in config.kv_cache_groups:
++        for summary in (False, True):
++            names = [name for name in group.layer_names if (name in roles["summary"]) == summary]
++            page = SUMMARY_PAGE_BYTES if summary else MAIN_PAGE_BYTES
++            size = (summary_cost if summary else main_cost) * config.num_blocks
++            for slot, name in enumerate(names):
++                expected[name] = (summary, size, page, slot * page * config.num_blocks)
++    regions = {}
++    for descriptor in config.kv_cache_tensors:
++        if len(descriptor.layers) != 1:
++            raise ValueError("Compact descriptors must carry exactly one layer")
++        name = descriptor.layers[0]
++        if name not in expected or name in regions or descriptor.host_resident:
++            raise ValueError("Missing, unknown, duplicate or host compact layer")
++        summary, size, page, offset = expected[name]
++        if (
++            descriptor.size != size or descriptor.block_stride != page
++            or descriptor.layer_stride != page * config.num_blocks or descriptor.offset != offset
++            or offset < 0 or offset + page * config.num_blocks > size
++        ):
++            raise ValueError(f"Invalid compact descriptor: {name}")
++        regions[name] = (summary, offset, page)
++    if set(regions) != set(expected):
++        raise ValueError("Compact descriptors must cover every layer exactly once")
++    # Identity-based two allocations: even equal sizes would remain distinct.
++    main = torch.zeros(main_cost * config.num_blocks, dtype=torch.int8, device=device)
++    summary = torch.zeros(summary_cost * config.num_blocks, dtype=torch.uint8, device=device)
++    caches = {}
++    for name, (is_summary, offset, page) in regions.items():
++        spec = specs[name]
++        raw = summary if is_summary else main
++        typed = raw.view(spec.dtype)
++        itemsize = spec.dtype.itemsize
++        if spec.head_size_v == 0:
++            states = spec.block_size // spec.tokens_per_state
++            caches[name] = typed.as_strided(
++                (config.num_blocks, spec.num_kv_heads, states, spec.head_size),
++                (page // itemsize, states * spec.head_size, spec.head_size, 1), offset // itemsize,
++            )
++        else:
++            shape = (config.num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
++            stride = (page // itemsize, spec.num_kv_heads * spec.head_size, spec.head_size, 1)
++            caches[name] = (
++                typed.as_strided(shape, stride, offset // itemsize),
++                typed.as_strided(shape, stride, offset // itemsize + page // (2 * itemsize)),
++            )
++    return caches
+--- a/vllm_ascend/models/step5/summary_cache.py
++++ b/vllm_ascend/models/step5/summary_cache.py
+@@ -165,6 +165,10 @@
+         main_spec = main_layer.get_kv_cache_spec(vllm_config)
+         if spec.block_size != main_spec.block_size:
+             raise ValueError("Step5 summary and main KV must use the same logical block size")
++        # The paired builder owns two fully charged physical allocations.
++        # Preserve the original padded/shared profile unless explicitly selected.
++        if (vllm_config.additional_config or {}).get("step5_compact_summary", False) is True:
++            return spec
+         return replace(spec, page_size_padded=main_spec.page_size_bytes)
+ 
+     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -100,6 +100,14 @@
+         "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
+     ]
+     dispatch_key: str = "PrivateUse1"
++
++    @classmethod
++    def get_kv_cache_config_builder_cls(cls, vllm_config):
++        # Opt-in exact Step5 profile; stateless builder retains Core-owned
++        # auto-fit/null-block/rank convergence. No process-global override.
++        if (vllm_config.additional_config or {}).get("step5_compact_summary", False) is True:
++            return "vllm_ascend.core.step5_compact_kv.Step5CompactKVCacheConfigBuilder"
++        return super().get_kv_cache_config_builder_cls(vllm_config)
+ 
+     supported_quantization: list[str] = [
+         ASCEND_QUANTIZATION_METHOD,
+--- a/vllm_ascend/worker/v2/attn_utils.py
++++ b/vllm_ascend/worker/v2/attn_utils.py
+@@ -1380,6 +1380,12 @@
+     """
+     del layout
+     vllm_config = get_current_vllm_config()
++    if (vllm_config.additional_config or {}).get("step5_compact_summary", False) is True:
++        # Keep this isolated path paired with its multi-allocation builder.
++        from vllm_ascend.core.step5_compact_kv import allocate_compact_backings, validate_compact_config
++
++        validate_compact_config(vllm_config)
++        return allocate_compact_backings(kv_cache_config, device)
+     if supports_step5_tailring_shared_backing(vllm_config, kv_cache_config.kv_cache_groups):
+         return allocate_step5_tailring_shared_backing(kv_cache_config, device)
+     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)

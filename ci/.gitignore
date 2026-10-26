@@ -1,0 +1,12 @@
+# CI 运行产物，不入库
+ci-build-receipt*.json
+*.log
+context/
+prepare-result.json
+__pycache__/
+*.pyc
+
+# Shared cache archives are tracked with Git LFS; ignore only local/incomplete files.
+/cache/**/*.part
+/cache/**/*.tmp
+/cache/cache-status.local.json

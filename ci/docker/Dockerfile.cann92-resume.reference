@@ -1,0 +1,17 @@
+ARG BUILD_CACHE=quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-flash-buildcache-317c7fb99e
+FROM ${BUILD_CACHE}
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+COPY patch_flash_hcc.py /opt/upgrade/patch_flash_hcc.py
+RUN python3 /opt/upgrade/patch_flash_hcc.py
+RUN source /opt/upgrade/cann92-build-env.sh && cd /opt/upgrade/source-assets/flash-attention-npu && \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_BUILD_NPU=950 python3 setup.py bdist_wheel && \
+    cd /tmp && python3 -m pip install --force-reinstall --no-deps /opt/upgrade/source-assets/flash-attention-npu/dist/flash_attn_npu-*.whl
+RUN source /opt/upgrade/cann92-build-env.sh && cd /opt/upgrade/source-assets/ops-transformer && \
+    bash build.sh --pkg --soc=ascend950 --vendor_name=step5_ops --ops=generic_block_sparse_attention,generic_block_sparse_attention_metadata,indexer_region_score --cann_3rd_lib_path=/opt/upgrade/source-assets/ops-thirdparty -j16 && \
+    bash build.sh --torch_extension && python3 /opt/upgrade/install_ops.py build_out && \
+    cd /tmp && python3 /opt/upgrade/probe_environment.py > /opt/upgrade/evidence/development.json
+COPY cann92-entrypoint.sh /opt/upgrade/cann92-entrypoint.sh
+LABEL org.opencontainers.image.base.name="quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler" step5.cann.version="9.2.0" step5.cann.arm64.manifest="sha256:811ca9bb37475ba1a8db6cd1f52731651c13f5860a4cfb58773a32e603e02f57"
+WORKDIR /workspace
+ENTRYPOINT ["/bin/bash", "/opt/upgrade/cann92-entrypoint.sh"]
+CMD ["/bin/bash"]

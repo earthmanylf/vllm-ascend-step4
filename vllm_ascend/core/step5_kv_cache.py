@@ -13,6 +13,162 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
+
+
+def uses_step5_blnhc(vllm_config):
+    """Select local V2 BLNHC; active PD retains the validated compact profile.
+
+    Transport capability is checked by validate_step5_kv_transfer_config,
+    independently of this layout selection.
+    """
+    if not getattr(vllm_config, "use_v2_model_runner", False):
+        return False
+    if getattr(vllm_config.model_config.hf_text_config, "model_type", None) != "step5":
+        return False
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    parallel = vllm_config.parallel_config
+    if (
+        vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        or additional.get("enable_kvpp", False)
+        or additional.get("sparse_kv_offload_config", {}).get("enabled", False)
+        or getattr(getattr(vllm_config, "attention_config", None), "hisparse_config", None) is not None
+        or any(
+            getattr(parallel, field, 1) != 1
+            for field in ("prefill_context_parallel_size", "decode_context_parallel_size", "pipeline_parallel_size")
+        )
+    ):
+        raise ValueError("Step5 BLNHC currently requires V2 local KV with PP/PCP/DCP=1 and no offload")
+    transfer = vllm_config.kv_transfer_config
+    return transfer is None or not transfer.is_kv_transfer_instance
+
+
+def validate_step5_blnhc_descriptors(config, layout):
+    """Validate upstream block tiles before allocation, without replanning."""
+    if layout is not KVCacheLayout.BLNHC:
+        raise ValueError("Step5 V2 requires the upstream BLNHC layout")
+    specs = _layer_specs(config.kv_cache_groups)
+    if not specs or type(config.num_blocks) is not int or config.num_blocks <= 0:
+        raise ValueError("Step5 BLNHC requires layers and positive blocks")
+    if any(getattr(group, "host_resident", False) for group in config.kv_cache_groups):
+        raise ValueError("Step5 BLNHC does not support host-resident groups")
+    regions = {}
+    tile_stride = None
+    for descriptor in config.kv_cache_tensors:
+        if not descriptor.layers or getattr(descriptor, "host_resident", False):
+            raise ValueError("Step5 BLNHC descriptor must contain device layers")
+        stride = descriptor.block_stride
+        if type(stride) is not int or stride <= 0 or descriptor.size != config.num_blocks * stride:
+            raise ValueError("Step5 BLNHC descriptor size must match whole global block tiles")
+        if tile_stride is not None and tile_stride != stride:
+            raise ValueError("Step5 BLNHC descriptors must share one global block stride")
+        tile_stride = stride
+        for index, name in enumerate(descriptor.layers):
+            if name not in specs or name in regions:
+                raise ValueError("Step5 BLNHC descriptors contain unknown or duplicate layers")
+            spec = specs[name]
+            if type(spec) not in (FullAttentionSpec, SlidingWindowSpec, CircularBufferSpec):
+                raise ValueError("Step5 BLNHC does not support this cache spec")
+            if (
+                getattr(spec, "num_head_slots", None) is not None
+                or getattr(spec, "state_content_bytes", None) is not None
+            ):
+                raise ValueError("Step5 BLNHC does not support packed head slots or state content")
+            ratio = getattr(spec, "tokens_per_state", 1)
+            if spec.block_size != 128 or getattr(spec, "kv_quant_mode", 0) != 0:
+                raise ValueError("Step5 BLNHC requires unquantized 128-token manager blocks")
+            if getattr(spec, "page_size_padded", None) is not None:
+                raise ValueError("Step5 BLNHC must retain each layer's real page size")
+            if type(spec) is CircularBufferSpec:
+                valid = spec.dtype == torch.bfloat16 and spec.head_size_v == 0 and ratio == 1
+            elif spec.head_size_v == 0:
+                valid = (
+                    type(spec) is FullAttentionSpec
+                    and spec.dtype == torch.uint8
+                    and spec.head_size == 256
+                    and ratio == 8
+                )
+            else:
+                valid = spec.dtype == torch.bfloat16 and spec.head_size == spec.head_size_v == 192 and ratio == 1
+            if not valid or spec.num_kv_heads != 1:
+                raise ValueError("Step5 BLNHC cache geometry is unsupported")
+            # Check native row alignment independently of the collected spec:
+            # a missing backend customization must fail before allocation, not
+            # later in GBSA's PA_BBND tiling parser.
+            if spec.head_size_v > 0:
+                native_alignment = spec.num_kv_heads * spec.head_size * spec.dtype.itemsize
+                if stride % native_alignment:
+                    raise ValueError(
+                        f"Step5 BLNHC main KV {name} block stride {stride} bytes "
+                        f"is not divisible by native row alignment {native_alignment} bytes"
+                    )
+            page = spec.page_size_bytes
+            offset = descriptor.offset + index * descriptor.layer_stride
+            if (
+                type(descriptor.offset) is not int
+                or descriptor.offset < 0
+                or descriptor.layer_stride != page
+                or offset < 0
+                or offset + page > stride
+                or offset % spec.dtype.itemsize
+                or stride % spec.dtype.itemsize
+                or stride % spec.get_block_stride_alignment()
+            ):
+                raise ValueError("Step5 BLNHC descriptor exceeds or misaligns its global block tile")
+            regions[name] = (offset, offset + page)
+    if set(regions) != set(specs):
+        raise ValueError("Step5 BLNHC descriptors must cover every layer exactly once")
+    # All groups address block b within [b*stride, (b+1)*stride).
+    # Groups may overlay only the SAME block ID; layers within one group may not.
+    for group in config.kv_cache_groups:
+        spans = sorted(regions[name] for name in group.layer_names)
+        if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
+            raise ValueError("Step5 BLNHC layers in one manager group cannot overlap")
+    return specs
+
+
+def step5_blnhc_layer_views(caches, specs):
+    """Zero-copy native K/V planes inside each upstream BLNHC layer page.
+
+    CANN FIA permits gaps only between blocks, not interleaved token rows.
+    Reinterpret the content of each main page as dense K then dense V, while
+    retaining the planner's block/layer offsets and its shared global-ID tile.
+    Summary and ring pages retain their canonical content. Active PD selects
+    the separate compact slab path rather than transporting these BLNHC pages.
+    """
+    if set(caches) != set(specs):
+        raise ValueError("Step5 BLNHC allocation does not cover every layer")
+    result = {}
+    for name, cache in caches.items():
+        spec = specs[name]
+        expected = (
+            cache.shape[0],
+            spec.num_kv_heads,
+            spec.block_size // getattr(spec, "tokens_per_state", 1),
+            spec.head_size + spec.head_size_v,
+        )
+        if cache.dtype != spec.dtype or tuple(cache.shape) != expected:
+            raise ValueError(f"Step5 BLNHC canonical cache shape mismatch: {name}")
+        page_elements = expected[1] * expected[2] * expected[3]
+        # BLNHC rows are dense; singleton strides do not affect addresses.
+        inner_strides = (expected[3], expected[1] * expected[3], 1)
+        if cache.stride(0) < page_elements or any(
+            size > 1 and cache.stride(dim) != stride
+            for dim, (size, stride) in enumerate(zip(expected[1:], inner_strides), 1)
+        ):
+            raise ValueError(f"Step5 BLNHC canonical cache blocks must be dense and non-overlapping: {name}")
+        if spec.head_size_v == 0:
+            result[name] = cache
+        else:
+            shape = (cache.shape[0], spec.block_size, spec.num_kv_heads, spec.head_size)
+            block_stride = cache.stride(0)
+            strides = (block_stride, spec.num_kv_heads * spec.head_size, spec.head_size, 1)
+            offset = cache.storage_offset()
+            k = cache.as_strided(shape, strides, offset)
+            v = cache.as_strided(shape, strides, offset + spec.block_size * spec.num_kv_heads * spec.head_size)
+            result[name] = (k, v)
+    return result
+
 
 STEP5_PD_BUFFER_ALIGNMENT = 2 * 1024 * 1024
 

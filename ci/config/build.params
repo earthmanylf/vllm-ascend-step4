@@ -1,0 +1,23 @@
+# Historical candidate profile only; default official session build uses pins/official-v030-cann92.json.
+# 构建默认参数（环境变量可覆盖；build.sh 参数优先）。
+
+# 输出镜像 ref。默认不用封存 tag，避免与交付镜像混淆。
+CI_IMAGE_REF_DEFAULT="${CI_IMAGE_REF_DEFAULT:-step5-fp8-a5:ci-rebuild}"
+
+# 目标平台与 Dockerfile target（与交付配方一致）。
+CI_PLATFORM="${CI_PLATFORM:-linux/arm64}"
+CI_TARGET="${CI_TARGET:-candidate}"
+
+# 后端：buildctl（aarch64 构建机，原有 BuildKit+containerd）| docker（任意 docker 主机，x86 走 QEMU，慢）。
+CI_BACKEND_DEFAULT="${CI_BACKEND_DEFAULT:-buildctl}"
+
+# buildctl 后端。
+CI_BUILDCTL_BIN="${CI_BUILDCTL_BIN:-buildctl}"
+CI_BUILDKIT_ADDR="${CI_BUILDKIT_ADDR:-unix:///run/buildkit/buildkitd.sock}"
+CI_CTR_BIN="${CI_CTR_BIN:-ctr}"
+CI_CTR_NAMESPACE="${CI_CTR_NAMESPACE:-step5-fp8-review-20261014}"
+# 950DT 上 ctr 不在 PATH 且 containerd socket 需要 root：设为 "sudo -n"
+CI_CTR_SUDO="${CI_CTR_SUDO:-}"
+
+# docker 后端。
+CI_DOCKER_BIN="${CI_DOCKER_BIN:-docker}"

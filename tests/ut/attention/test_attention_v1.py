@@ -930,6 +930,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         output = self.impl_swa.forward(layer, query, key, value, kv_cache, metadata, output)
         print(output.shape)
         mock_fused_infer_attention_score.assert_called_once()
+        assert mock_fused_infer_attention_score.call_args.kwargs["pre_tokens"] == 1023
         assert output.shape == (10, 8, 64)
 
     @patch("vllm_ascend.attention.attention_v1._EXTRA_CTX")
@@ -964,6 +965,8 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_fused_infer_attention_score_v2.return_value = (torch.ones(10, 8, 64), 1)
         output = self.impl_swa_sink.forward(layer, query, key, value, kv_cache, metadata, output)
         mock_fused_infer_attention_score_v2.assert_called_once()
+        # FIA V2/sinks needs its own semantic probe before changing its width.
+        assert mock_fused_infer_attention_score_v2.call_args.kwargs["pre_tokens"] == 1024
         mock_reshape_and_cache.assert_called_once()
         assert output.shape == (10, 8, 64)
 
@@ -1007,6 +1010,7 @@ class TestAscendAttentionBackendImpl(TestBase):
 
         mock_paged_attention.assert_not_called()
         mock_fused_infer_attention_score.assert_called_once()
+        assert mock_fused_infer_attention_score.call_args.kwargs["pre_tokens"] == 1023
         mock_reshape_and_cache.assert_called_once()
 
         assert output.shape == (10, 8, 64)

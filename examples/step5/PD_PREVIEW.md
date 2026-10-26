@@ -17,6 +17,21 @@ failure-safety work; no experimental native library is required or included.
 
 ## Matched source and build prerequisites
 
+### Integration revision note
+
+The exact 13-case hardware-tested PD checkpoint is commit `09011d71a`
+(including its CANN-first parent `d32a822e9`). The later merge preserves the
+parallel BLNHC/capacity work and adds explicit worker-config context for layout
+negotiation. Integrated CPU checks pass: KV/layout RPC39 tests +24 subtests,
+protocol134 tests, DSA/summary/graph82 tests +4 subtests (5 skipped).
+Post-merge NPU revalidation is pending: the validation host's SSH timed out on
+both connection attempts. Historical hardware results do not certify the merged
+revision. For the exact previously tested snapshot, use `09011d71a`; it remains
+in this branch's history. The known native failure-safety limitation applies to
+both snapshots.
+
+## Matched source and build prerequisites
+
 Use vLLM commit `ca5e43ddcd5b04c91e3de451702eecc1632faea8` (official main
 `8407bc0bb6` plus stepcast_plugin), this Ascend source, and the matching Ascend
 custom kernels. Do not install an unrelated latest vLLM or copy .py files over
@@ -48,6 +63,12 @@ separate10-layer view was validated; it does not certify original92-layer dual
 TP8 deployment. MRv2 must be enabled; prefix caching, MTP/speculation, KVPP,
 sparse offload and HiSparse must be disabled. PP/PCP/DCP=1; P/D TP/EP and cache
 geometry must match. Passing the constructor guard alone is not this acceptance.
+
+The merged parallel-development work preserves **unpadded BLNHC for local V2
+inference**. Active PD selects the already validated compact NHD/shared-slab
+profile, including padded summary pages and its alignment reserve. The selector
+is a work/profile boundary, not a claim that BLNHC PD is fundamentally unsupported.
+PD on the new unpadded global-tile layout needs separate transport/capacity validation.
 
 The following commands run **inside the matched prepared environment**. Set
 `MODEL` to the complete text-only model directory. First confirm the devices

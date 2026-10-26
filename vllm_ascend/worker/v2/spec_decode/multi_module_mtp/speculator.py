@@ -11,7 +11,11 @@ from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
 )
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionState,
+    AscendMetadata,
+)
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_factory,
     build_attn_metadata_wrapper,
@@ -128,7 +132,59 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
         step,
         **kwargs,
     ):
-        assert self.input_batch is not None
+        if self.input_batch is None:
+            raise RuntimeError("Multi-module MTP input batch is missing")
+        if batch_desc.cg_mode == CUDAGraphMode.NONE:
+            # A FULL target may append dummy request ends to InputBatch's
+            # CPU query array. Eager draft metadata must count only real
+            # requests, not that target graph's final padded boundary.
+            query_start_loc_np = query_start_loc_np[: num_reqs + 1]
+            if (
+                len(query_start_loc_np) != num_reqs + 1
+                or num_reqs < 1
+                or int(query_start_loc_np[0]) != 0
+                or any(end < start for start, end in zip(query_start_loc_np, query_start_loc_np[1:]))
+                or int(query_start_loc_np[-1]) != self.input_batch.num_tokens
+                or not 0 <= self.input_batch.num_tokens <= batch_desc.num_tokens
+            ):
+                raise RuntimeError("Invalid eager MTP real query prefix")
+        offload_kwargs = None
+        if batch_desc.cg_mode == CUDAGraphMode.FULL and self.attn_backend is AscendAttentionBackend:
+
+            def prepare_fia_common_metadata(group_index, common):
+                groups = self.attn_groups[group_index]
+                if not any(group.backend is AscendAttentionBackend for group in groups):
+                    return
+                if any(group.backend is not AscendAttentionBackend for group in groups):
+                    raise RuntimeError("Mixed FIA MTP cache group is unsupported")
+                padded = batch_desc.num_reqs
+                width = batch_desc.uniform_token_count
+                if (
+                    padded is None
+                    or width is None
+                    or width <= 0
+                    or not 0 < num_reqs <= padded
+                    or padded * width != batch_desc.num_tokens
+                    or common.num_reqs != padded
+                ):
+                    raise RuntimeError("Invalid FIA MTP common graph descriptor")
+                query = common.query_start_loc_cpu
+                real_prefix = [i * width for i in range(num_reqs + 1)]
+                if (
+                    len(query) != padded + 1
+                    or query[: num_reqs + 1].tolist() != real_prefix
+                    or any(value != real_prefix[-1] for value in query[num_reqs + 1 :].tolist())
+                ):
+                    raise RuntimeError("Invalid FIA MTP common real query prefix")
+                # Normalize before the ordinary builder can append its own
+                # synthetic tail request. Copy only the CPU query metadata;
+                # the upstream device boundaries and PAD slots stay intact.
+                query = query.clone()
+                for index in range(num_reqs + 1, padded + 1):
+                    query[index] = index * width
+                common.query_start_loc_cpu = query
+
+            offload_kwargs = {"common_metadata_callback": prepare_fia_common_metadata}
         with build_attn_metadata_factory(
             self.input_buffers.positions,
             batch_desc.num_tokens,
@@ -136,6 +192,7 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
             seq_lens_cpu=self.input_buffers.seq_lens_cpu,
             attn_state=self.draft_attn_state,
             parallel_config=self.draft_vllm_config.parallel_config,
+            offload_kwargs=offload_kwargs,
         ):
             attn_metadata = super()._build_attn_metadata(
                 num_reqs,
@@ -145,10 +202,60 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
                 step,
                 **kwargs,
             )
-        assert attn_metadata is not None
+        if attn_metadata is None:
+            raise RuntimeError("Multi-module MTP attention metadata is missing")
         for metadata in attn_metadata.values():
             if metadata is not None:
                 metadata.attn_state = self.draft_attn_state
+        # Only the exact ordinary FIA backend consumes this host cumulative
+        # list. GQA subclasses such as C8-MXFP/QFA use device length buffers.
+        if batch_desc.cg_mode == CUDAGraphMode.FULL and self.attn_backend is AscendAttentionBackend:
+            num_reqs_padded = batch_desc.num_reqs
+            query_width = batch_desc.uniform_token_count
+            if (
+                num_reqs_padded is None
+                or query_width is None
+                or query_width <= 0
+                or not 0 < num_reqs <= num_reqs_padded
+                or num_reqs_padded * query_width != batch_desc.num_tokens
+            ):
+                raise RuntimeError("Invalid uniform FIA MTP graph descriptor")
+            updates = []
+            seen = set()
+            for metadata in attn_metadata.values():
+                if metadata is None or id(metadata) in seen:
+                    continue
+                seen.add(id(metadata))
+                # FIAParamProvider.resolve reads the direct AscendMetadata;
+                # nested decode wrappers are not ordinary FIA metadata.
+                if type(metadata) is not AscendMetadata:
+                    raise RuntimeError("Unsupported FIA MTP metadata type (including nested decode wrappers)")
+                query_ends = metadata.actual_seq_lengths_q
+                kv_lens = metadata.seq_lens_list
+                if (
+                    query_ends is None
+                    or len(query_ends) != num_reqs_padded
+                    or kv_lens is None
+                    or len(kv_lens) != num_reqs_padded
+                    or list(query_ends[:num_reqs]) != [(i + 1) * query_width for i in range(num_reqs)]
+                    or any(length != 0 for length in kv_lens[num_reqs:])
+                ):
+                    raise RuntimeError("Invalid FIA MTP real query boundaries or nonzero padded KV lengths")
+                real_end = query_ends[num_reqs - 1]
+                # Accept original collapsed no-op ends or already repaired
+                # shared metadata; reject stale/ambiguous padding boundaries.
+                fixed_ends = list(query_ends[:num_reqs]) + [
+                    (i + 1) * query_width for i in range(num_reqs, num_reqs_padded)
+                ]
+                if list(query_ends[num_reqs:]) not in (
+                    [real_end] * (num_reqs_padded - num_reqs),
+                    fixed_ends[num_reqs:],
+                ):
+                    raise RuntimeError("Invalid FIA MTP padded query boundaries")
+                # Validate every layer before modifying any query boundary.
+                updates.append((metadata, fixed_ends))
+            for metadata, fixed_ends in updates:
+                metadata.actual_seq_lengths_q = fixed_ends
         self._multi_module_attn_metadata = attn_metadata
         return attn_metadata
 
