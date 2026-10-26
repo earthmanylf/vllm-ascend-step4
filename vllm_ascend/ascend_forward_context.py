@@ -12,6 +12,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context, set_forwa
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
+from vllm_ascend.quantization.quant_type import A5_SUPPORT_MEGA_MOE_QUANT_TYPES, QuantType
 from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     MoECommPolicy,
@@ -142,15 +143,23 @@ def set_ascend_forward_context(
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
         max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
+        if is_draft_model:
+            draft_model_config = getattr(vllm_config.speculative_config, "draft_model_config", None)
+            draft_moe_quant_type = getattr(draft_model_config, "draft_moe_quant_type", QuantType.NONE)
+        else:
+            draft_moe_quant_type = QuantType.NONE
         moe_comm_type = select_moe_comm_method(
             max_num_tokens,
             vllm_config,
+            is_draft_model=is_draft_model,
+            draft_moe_quant_type=draft_moe_quant_type,
         )
 
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
         forward_context.is_decode_only_node = _is_decode_only_node(vllm_config)
         forward_context.use_mega_moe = use_cann_megamoe(vllm_config)
+        forward_context.draft_moe_quant_type = draft_moe_quant_type
 
         tp_world_size = get_tensor_model_parallel_world_size()
 
@@ -317,7 +326,19 @@ def _select_capacity_and_world_size_moe_comm_method(
     num_tokens: int,
     vllm_config: VllmConfig,
     mc2_tokens_capacity: int,
+    is_draft_model: bool = False,
+    draft_moe_quant_type: QuantType = QuantType.NONE,
 ) -> MoECommType:
+    if get_ascend_config().enable_fused_mc2 == 1:
+        if is_mega_moe_supported():
+            if is_draft_model and draft_moe_quant_type not in A5_SUPPORT_MEGA_MOE_QUANT_TYPES:
+                # The A5 mega moe (FUSED_MC2) operator only supports a subset of
+                # quantized weight layouts. An unquantized (or unsupported-quantized)
+                # MTP draft MoE layer must skip FUSED_MC2 and fall through to the
+                # original MoE path (MC2/ALLGATHER/ALLTOALL) below.
+                pass
+            else:
+                return MoECommType.FUSED_MC2
     num_experts_per_tok = getattr(
         vllm_config.model_config.hf_text_config,
         "num_experts_per_tok",
@@ -340,7 +361,12 @@ _MOE_COMM_SELECTORS = {
 }
 
 
-def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommType | None:
+def select_moe_comm_method(
+    num_tokens: int,
+    vllm_config: VllmConfig,
+    is_draft_model: bool = False,
+    draft_moe_quant_type: QuantType = QuantType.NONE,
+) -> MoECommType | None:
     """Select the MoE communication method from the active hardware policy,
     parallel settings, and token count.
 
@@ -371,6 +397,8 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommT
             num_tokens,
             vllm_config,
             mc2_tokens_capacity,
+            is_draft_model=is_draft_model,
+            draft_moe_quant_type=draft_moe_quant_type,
         )
     logger.debug(
         "MoE comm method selected: policy=%s, method=%s, num_tokens=%d, mc2_capacity=%s",
@@ -398,6 +426,7 @@ class _ExtraForwardContextProxy:
         "mc2_mask",
         "is_draft_model",
         "is_draft_model_prefill",
+        "draft_moe_quant_type",
         "prefetch_mlp_gate_up_proj",
         "prefetch_mlp_down_proj",
         "model_instance",

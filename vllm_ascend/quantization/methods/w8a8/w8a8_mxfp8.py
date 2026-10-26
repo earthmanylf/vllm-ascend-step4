@@ -25,11 +25,11 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
 from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
-from vllm_ascend.utils import FP8_METHOD
+from vllm_ascend.utils import FP8_METHOD, dispose_tensor
 
 from ..base import (
     AscendLinearScheme,
@@ -279,13 +279,23 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             topk_weights = topk_weights.to(x.dtype)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
+        # MegaMoe (FUSED_MC2 on A5) consumes the per-expert weight/scale lists
+        # built in process_weights_after_loading; the original fused tensors
+        # are disposed there and no longer exist.
+        if _EXTRA_CTX.use_mega_moe:
+            w1, w2 = layer.cann_mega_moe_w13_weight_list, layer.cann_mega_moe_w2_weight_list
+            w1_scale = layer.cann_mega_moe_w13_weight_scale_list
+            w2_scale = layer.cann_mega_moe_w2_weight_scale_list
+        else:
+            w1, w2 = layer.w13_weight, layer.w2_weight
+            w1_scale, w2_scale = layer.w13_weight_scale, layer.w2_weight_scale
         return moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
+                w1=w1,
+                w2=w2,
                 quant_type=self.quant_type,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=layer.ascend_expert_map,
@@ -299,8 +309,8 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 mxfp_scale_dtype=torch_npu.float8_e8m0fnu,
                 mxfp_per_token_scale_dtype=torch_npu.float8_e8m0fnu,
                 mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
             )
         )
 
@@ -342,14 +352,44 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 "w2_weight_scale": tuple(layer.w2_weight_scale.data.shape),
             }
 
-        g_num, n_size, k_size = layer.w13_weight_scale.shape
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
-        g_num, n_size, k_size = layer.w2_weight_scale.shape
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2)
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2)
+        if use_cann_megamoe(get_current_vllm_config()):
+            g_num, n_size, k_size = layer.w13_weight_scale.shape
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
+            g_num, n_size, k_size = layer.w2_weight_scale.shape
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
+
+            # MegaMoe (FUSED_MC2 on A5) consumes per-expert weights in their
+            # original (out, in) layout and reshaped, non-transposed E8M0 scales.
+            layer.cann_mega_moe_w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
+            layer.cann_mega_moe_w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
+
+            # Checkpoint E8M0 scales are stored as bytes; CANN requires their semantic dtype.
+            layer.cann_mega_moe_w13_weight_scale_list = [
+                w13_weight_scale.clone().view(torch.float8_e8m0fnu)
+                for w13_weight_scale in layer.w13_weight_scale.data.unbind(dim=0)
+            ]
+            layer.cann_mega_moe_w2_weight_scale_list = [
+                w2_weight_scale.clone().view(torch.float8_e8m0fnu)
+                for w2_weight_scale in layer.w2_weight_scale.data.unbind(dim=0)
+            ]
+
+            tensor_names = (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            )
+            for tensor_name in tensor_names:
+                dispose_tensor(getattr(layer, tensor_name))
+        else:
+            g_num, n_size, k_size = layer.w13_weight_scale.shape
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
+            g_num, n_size, k_size = layer.w2_weight_scale.shape
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
+            layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
+            layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2)
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2)
 
         # Mark as transformed
         layer._mxfp8_transformed = True

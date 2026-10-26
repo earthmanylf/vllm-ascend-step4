@@ -21,6 +21,7 @@ class HardwareCapability(Enum):
     ATB_WARMUP = auto()
     BGMV_SGMV_META_REGISTRATION = auto()
     CANN_MEGAMOE = auto()
+    CANN_MEGAMOE_MXFP = auto()
     CHUNKED_PREFILL_PHASE_SPLIT = auto()
     CLUSTER_CPU_TOPOLOGY = auto()
     COMPATIBILITY_OP_IMPLEMENTATIONS = auto()
@@ -246,6 +247,8 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.SWIGLU_OAI_MX_QUANT,
                     HardwareCapability.TRITON_BATCH_MEMCPY,
                     HardwareCapability.UNRESTRICTED_MLAPO,
+                    HardwareCapability.CANN_MEGAMOE,
+                    HardwareCapability.CANN_MEGAMOE_MXFP,
                 }
             ),
         ),
