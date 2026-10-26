@@ -35,9 +35,16 @@ class MooncakeTransferMetadata(KVConnectorHandshakeMetadata):
     block_size_scales: list[list[int]]
     local_ip: str = ""
     handshake_port: int = 0
+    is_step5: bool = False
+    block_dtypes: list[list[str]] | None = None
 
     def __post_init__(self) -> None:
         num_layers = len(self.layer_names)
+        if self.is_step5:
+            if self.block_dtypes is None or len(self.block_dtypes) != num_layers:
+                raise ValueError("Mooncake Step5 metadata requires component dtypes for every layer")
+            if any(len(dtypes) != len(addrs) for dtypes, addrs in zip(self.block_dtypes, self.kv_caches_base_addr)):
+                raise ValueError("Mooncake Step5 metadata component dtype count mismatch")
         per_layer_fields: tuple[tuple[str, Sequence[object]], ...] = (
             ("layer_block_sizes", self.layer_block_sizes),
             ("group_indices", self.group_indices),
@@ -105,6 +112,8 @@ class MooncakePPTransferMetadata:
     block_shapes: list[list[tuple[int, ...]]]
     block_size_scales: list[list[int]]
     metadata_by_pcp_rank: dict[int, MooncakePCPTransferMetadata]
+    is_step5: bool = False
+    block_dtypes: list[list[str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +129,7 @@ class MooncakeTransferMetadataGroups:
     tp_size: int
     use_kv_pp: bool
     metadata_by_pp_rank: dict[int, MooncakePPTransferMetadata]
+    is_step5: bool = False
 
 
 @dataclass

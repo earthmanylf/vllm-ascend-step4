@@ -99,6 +99,10 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
             )
             return None
 
+        if getattr(getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None) == "step5":
+            # Step5's Ascend consumers address token-major main K/V directly.
+            return "NHD"
+
         if vllm_config.model_config.use_mla:
             # MLA has no separate head dimension, so HND versus NHD does not
             # affect its transfer layout.

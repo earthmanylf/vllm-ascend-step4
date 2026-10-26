@@ -1,0 +1,42 @@
+diff --git a/include/catlass/epilogue/block/block_epilogue_fa_rescale_o_ascend950.hpp b/include/catlass/epilogue/block/block_epilogue_fa_rescale_o_ascend950.hpp
+index 141c9889..525fe884 100644
+--- a/include/catlass/epilogue/block/block_epilogue_fa_rescale_o_ascend950.hpp
++++ b/include/catlass/epilogue/block/block_epilogue_fa_rescale_o_ascend950.hpp
+@@ -124 +124 @@ private:
+-    __simd_vf__ inline void FlashUpdateNew(__ubuf__ T *updateUb,  __ubuf__ T *curUb, __ubuf__ T *expMaxUb,
++    __simd_vf__ static inline void FlashUpdateNew(__ubuf__ T *updateUb,  __ubuf__ T *curUb, __ubuf__ T *expMaxUb,
+@@ -156 +156 @@ private:
+-    __simd_vf__ inline void FlashUpdateLastNew(__ubuf__ T *updateUb, __ubuf__ T *curUb, __ubuf__ T *expMaxUb,
++    __simd_vf__ static inline void FlashUpdateLastNew(__ubuf__ T *updateUb, __ubuf__ T *curUb, __ubuf__ T *expMaxUb,
+@@ -193 +193 @@ private:
+-    __simd_vf__ inline void LastDivNew(__ubuf__ T *updateUb,  __ubuf__ T *curUb, __ubuf__ T *expSumUb,
++    __simd_vf__ static inline void LastDivNew(__ubuf__ T *updateUb,  __ubuf__ T *curUb, __ubuf__ T *expSumUb,
+diff --git a/include/catlass/epilogue/block/block_epilogue_fa_softmax_ascend950.hpp b/include/catlass/epilogue/block/block_epilogue_fa_softmax_ascend950.hpp
+index 2ca49990..9bb71545 100644
+--- a/include/catlass/epilogue/block/block_epilogue_fa_softmax_ascend950.hpp
++++ b/include/catlass/epilogue/block/block_epilogue_fa_softmax_ascend950.hpp
+@@ -255 +255 @@ private:
+-    __simd_vf__ inline void ComputeMaskandScale(__ubuf__ ElementS *srcUb, __ubuf__ uint8_t *maskUb, __ubuf__ uint8_t *maskUbUnroll,
++    __simd_vf__ static inline void ComputeMaskandScale(__ubuf__ ElementS *srcUb, __ubuf__ uint8_t *maskUb, __ubuf__ uint8_t *maskUbUnroll,
+@@ -313 +313 @@ private:
+-    __simd_vf__ inline void UpdateMax(
++    __simd_vf__ static inline void UpdateMax(
+@@ -329 +329 @@ private:
+-    __simd_vf__ inline void ComputeExpSubSum(__ubuf__ ElementP *expUb, __ubuf__ ElementS *srcUb,
++    __simd_vf__ static inline void ComputeExpSubSum(__ubuf__ ElementP *expUb, __ubuf__ ElementS *srcUb,
+@@ -391 +391 @@ private:
+-    __simd_vf__ inline void UpdateExpSumAndExpMax(__ubuf__ ElementS *sumUb, __ubuf__ ElementS *expMaxUb,
++    __simd_vf__ static inline void UpdateExpSumAndExpMax(__ubuf__ ElementS *sumUb, __ubuf__ ElementS *expMaxUb,
+diff --git a/include/catlass/epilogue/block/block_epilogue_per_group_per_block.hpp b/include/catlass/epilogue/block/block_epilogue_per_group_per_block.hpp
+index 9f2ee9c8..405dd437 100644
+--- a/include/catlass/epilogue/block/block_epilogue_per_group_per_block.hpp
++++ b/include/catlass/epilogue/block/block_epilogue_per_group_per_block.hpp
+@@ -168 +168 @@ private:
+-    __simd_vf__ void AivPerTensor(__ubuf__ CalcType* dst, __ubuf__ CType* l0cOut, __ubuf__ X1ScaleType* x1Scale,
++    __simd_vf__ static void AivPerTensor(__ubuf__ CalcType* dst, __ubuf__ CType* l0cOut, __ubuf__ X1ScaleType* x1Scale,
+@@ -172 +172 @@ private:
+-    __simd_vf__ void AivPerTensor(__ubuf__ CType* dst, __ubuf__ CType* l0cOut, X1ScaleType x1Scale,
++    __simd_vf__ static void AivPerTensor(__ubuf__ CType* dst, __ubuf__ CType* l0cOut, X1ScaleType x1Scale,
+@@ -176 +176 @@ private:
+-    __simd_vf__ void AddBias(
++    __simd_vf__ static void AddBias(

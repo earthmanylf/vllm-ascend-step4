@@ -1209,6 +1209,57 @@ def test_worker_run_marks_only_failed_requests_and_finishes_the_batch(
     request_queue.task_done.assert_called_once_with()
 
 
+def test_step5_nhd_tuple_uses_matching_rank_whole_blocks() -> None:
+    shapes = [[(16, 2, 8), (16, 2, 8)]]
+    local = replace(
+        make_transfer_metadata(
+            block_shapes=shapes,
+            base_addrs=[[1000, 2000]],
+            block_lens=[[512, 512]],
+            block_strides=[[640, 640]],
+            block_size_scales=[[1, 1]],
+        ),
+        is_step5=True,
+        block_dtypes=[["torch.float16", "torch.float16"]],
+    )
+    remote = replace(
+        make_pp_metadata(
+            block_shapes=shapes,
+            block_lens=[[512, 512]],
+            block_strides=[[768, 768]],
+            tp_base_addrs={1: [[5000, 6000]]},
+            block_size_scales=[[1, 1]],
+        ),
+        is_step5=True,
+        block_dtypes=local.block_dtypes,
+    )
+    thread = make_thread(
+        is_step5=True,
+        block_dtypes=local.block_dtypes,
+        local_metadata=local,
+        tp_rank=1,
+        tp_size=4,
+        pp_size=1,
+        kv_cache_specs=[make_full_spec(num_kv_heads=2)],
+        block_shapes=shapes,
+        kv_caches_base_addr=local.kv_caches_base_addr,
+        block_lens=local.block_lens,
+        block_strides=local.block_strides,
+        block_size_scales=local.block_size_scales,
+    )
+    src, dst, lengths = [], [], []
+    thread._append_spec_transfer_addresses(
+        0, 0, 1, 1, 4, 1, {(0, 0): [("request", [1, 2], [3, 4])]}, remote, src, dst, lengths
+    )
+    assert src == [1640, 2280, 2640, 3280]
+    assert dst == [7304, 8072, 8304, 9072]
+    assert lengths == [512] * 4
+    with pytest.raises(ValueError, match="Step5.*group_indices"):
+        thread._build_transfer_block_buckets(
+            replace(remote, group_indices=[1]), [(0, 0)], {(0, 0): [[1]]}, 1, 1, {"request": make_req_meta()}, {}
+        )
+
+
 def test_whole_block_mla_address_generation_uses_independent_stride() -> None:
     spec = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16)
     thread = make_thread(

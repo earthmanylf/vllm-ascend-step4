@@ -14,6 +14,44 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+STEP5_PD_BUFFER_ALIGNMENT = 2 * 1024 * 1024
+
+
+def validate_step5_kv_transfer_config(vllm_config) -> None:
+    """Local capability boundary; peer topology is checked by the handshake."""
+    transfer = vllm_config.kv_transfer_config
+    if transfer is None or not transfer.is_kv_transfer_instance:
+        return
+    if transfer.kv_connector not in ("MooncakeConnectorV2", "MooncakePullConnector") or (
+        transfer.kv_connector_module_path is not None
+    ):
+        raise ValueError(
+            "Step5 KV transfer requires the registered Ascend MooncakeConnectorV2 or "
+            "MooncakePullConnector implementation; other connectors and module overrides "
+            "do not implement the main KV, summary and ring transfer contract."
+        )
+    if transfer.kv_role not in ("kv_producer", "kv_consumer"):
+        raise ValueError(
+            "Step5 KV transfer requires kv_producer or kv_consumer; kv_both is not supported by Mooncake pull."
+        )
+    parallel = vllm_config.parallel_config
+    for field in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size"):
+        if getattr(parallel, field) != 1:
+            raise ValueError(f"Step5 KV transfer requires {field}=1 and matching P/D topology.")
+    if vllm_config.speculative_config is not None:
+        raise ValueError("Step5 KV transfer requires speculative decoding disabled (MTP off).")
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError("Step5 KV transfer requires prefix caching disabled.")
+    if vllm_config.model_config.is_multimodal_model:
+        raise ValueError("Step5 KV transfer currently requires a text-only model configuration.")
+
+
+def step5_tailring_alignment_reserve(vllm_config, groups) -> int:
+    """One alignment allocation per eligible PD slab, not per layer/group."""
+    if vllm_config.kv_transfer_config is not None and supports_step5_tailring_shared_backing(vllm_config, groups):
+        return STEP5_PD_BUFFER_ALIGNMENT
+    return 0
+
 
 def _layer_specs(groups):
     result = {}
@@ -94,7 +132,12 @@ def supports_step5_tailring_shared_backing(vllm_config, groups):
     if getattr(vllm_config.model_config.hf_text_config, "model_type", None) != "step5":
         return False
     if vllm_config.kv_transfer_config is not None:
-        return False
+        if not vllm_config.kv_transfer_config.is_kv_transfer_instance:
+            return False
+        try:
+            validate_step5_kv_transfer_config(vllm_config)
+        except ValueError:
+            return False
     additional = getattr(vllm_config, "additional_config", None) or {}
     if additional.get("enable_kvpp", False) or additional.get("sparse_kv_offload_config", {}).get("enabled", False):
         return False
@@ -138,7 +181,7 @@ def supports_step5_tailring_shared_backing(vllm_config, groups):
     return len(pages) == 1
 
 
-def allocate_step5_tailring_shared_backing(config, device):
+def allocate_step5_tailring_shared_backing(config, device, *, align_for_transfer=False):
     """Allocate one pool with descriptor-preserving main KV and sidecar views."""
     specs = _layer_specs(config.kv_cache_groups)
     sizes = {descriptor.size for descriptor in config.kv_cache_tensors}
@@ -148,12 +191,42 @@ def allocate_step5_tailring_shared_backing(config, device):
     if size <= 0:
         raise ValueError("Step5 TailRing backing size must be positive")
     regions = {}
+    pages = {spec.page_size_bytes for spec in specs.values()}
+    if len(pages) != 1:
+        raise ValueError("Step5 TailRing requires uniform physical pages")
     for descriptor in config.kv_cache_tensors:
+        num_blocks_of = getattr(config, "num_blocks_of", None)
+        if callable(num_blocks_of) and num_blocks_of(descriptor) != config.num_blocks:
+            raise ValueError("Step5 TailRing descriptor block count differs from the device pool")
+        if descriptor.layer_stride < 0:
+            raise ValueError("Step5 TailRing layer stride must be nonnegative")
         for index, name in enumerate(descriptor.layers):
             if name not in specs or name in regions or getattr(descriptor, "host_resident", False):
                 raise ValueError("Invalid Step5 TailRing descriptor layer")
             spec = specs[name]
             page = spec.page_size_bytes
+            itemsize = spec.dtype.itemsize
+            ratio = getattr(spec, "tokens_per_state", 1)
+            heads, dim, dim_v = spec.num_kv_heads, spec.head_size, spec.head_size_v
+            if (
+                page <= 0
+                or page % itemsize
+                or size % itemsize
+                or ratio <= 0
+                or spec.block_size <= 0
+                or spec.block_size % ratio
+                or heads <= 0
+                or dim <= 0
+                or dim_v < 0
+            ):
+                raise ValueError("Invalid Step5 TailRing page or state geometry")
+            payload = spec.block_size // ratio * heads * (dim + dim_v) * itemsize
+            if payload > page or (type(spec) is CircularBufferSpec and payload != page):
+                raise ValueError("Step5 TailRing payload exceeds or pads its physical page")
+            if dim_v and (dim_v != dim or ratio != 1):
+                raise ValueError("Step5 TailRing main K/V geometry must be symmetric")
+            if descriptor.layer_stride % page:
+                raise ValueError("Step5 TailRing layer stride must align to physical pages")
             offset = descriptor.offset + index * descriptor.layer_stride
             end = offset + (config.num_blocks - 1) * descriptor.block_stride + page
             if offset < 0 or descriptor.block_stride != page or offset % page or end > size:
@@ -167,12 +240,16 @@ def allocate_step5_tailring_shared_backing(config, device):
         )
         if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
             raise ValueError("Step5 layers in one group cannot overlap")
-    raw = torch.zeros(size, dtype=torch.int8, device=device)
+    reserve = STEP5_PD_BUFFER_ALIGNMENT if align_for_transfer else 0
+    raw = torch.zeros(size + reserve, dtype=torch.int8, device=device)
+    if align_for_transfer:
+        raw = raw.narrow(0, (-raw.data_ptr()) % STEP5_PD_BUFFER_ALIGNMENT, size)
     caches = {}
     for name, (offset, page) in regions.items():
         spec = specs[name]
         typed = raw.view(spec.dtype)
         itemsize = spec.dtype.itemsize
+        storage_offset = typed.storage_offset() + offset // itemsize
         heads, dim = spec.num_kv_heads, spec.head_size
         ratio = getattr(spec, "tokens_per_state", 1)
         states = spec.block_size // ratio
@@ -180,13 +257,13 @@ def allocate_step5_tailring_shared_backing(config, device):
             caches[name] = typed.as_strided(
                 (config.num_blocks, heads, states, dim),
                 (page // itemsize, states * dim, dim, 1),
-                offset // itemsize,
+                storage_offset,
             )
         else:
             strides = (page // itemsize, heads * dim, dim, 1)
             shape = (config.num_blocks, spec.block_size, heads, dim)
-            k = typed.as_strided(shape, strides, offset // itemsize)
-            v = typed.as_strided(shape, strides, offset // itemsize + spec.block_size * heads * dim)
+            k = typed.as_strided(shape, strides, storage_offset)
+            v = typed.as_strided(shape, strides, storage_offset + spec.block_size * heads * dim)
             caches[name] = (k, v)
     return caches
 

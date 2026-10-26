@@ -81,6 +81,8 @@ class MooncakeSchedulerSendingThread(threading.Thread):
         if self.use_kv_pp and self.dcp_size != 1:
             raise ValueError(f"Mooncake KVPP cannot be combined with DCP, got dcp_size={self.dcp_size}")
         metadata_by_pp_rank = self._merge_metadata_by_pp_rank(metadata)
+        self.is_step5 = all(pp_metadata.is_step5 for pp_metadata in metadata_by_pp_rank.values())
+        self.timed_out_requests: set[str] = set()
         self.encoded_metadata = encoder.encode(
             MooncakeTransferMetadataGroups(
                 engine_id=engine_id,
@@ -92,6 +94,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 tp_size=tp_size,
                 use_kv_pp=self.use_kv_pp,
                 metadata_by_pp_rank=metadata_by_pp_rank,
+                is_step5=self.is_step5,
             )
         )
         logger.info(
@@ -191,7 +194,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 for tp_rank, worker_metadata in workers_by_tp_rank.items():
                     mismatched_fields = [
                         field_name
-                        for field_name in ("block_size", "num_blocks")
+                        for field_name in ("block_size", "num_blocks", "is_step5")
                         if getattr(worker_metadata, field_name) != getattr(reference, field_name)
                     ]
                     if mismatched_fields:
@@ -232,6 +235,9 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                             worker_metadata.block_lens[local_layer_index],
                             worker_metadata.block_shapes[local_layer_index],
                             worker_metadata.block_size_scales[local_layer_index],
+                            worker_metadata.block_dtypes[local_layer_index]
+                            if worker_metadata.is_step5 and worker_metadata.block_dtypes is not None
+                            else None,
                         )
                         previous_signature = layer_signature_by_name.get(layer_name)
                         if previous_signature is not None and previous_signature != layer_signature:
@@ -242,6 +248,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                                 "block_lens",
                                 "block_shapes",
                                 "block_size_scales",
+                                "block_dtypes",
                             )
                             mismatched_layer_fields = [
                                 field_name
@@ -307,6 +314,12 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 block_shapes=block_shapes,
                 block_size_scales=block_size_scales,
                 metadata_by_pcp_rank=metadata_by_pcp_rank,
+                is_step5=reference.is_step5,
+                block_dtypes=[
+                    layer_source_by_name[name][0].block_dtypes[layer_source_by_name[name][1]] for name in layer_names
+                ]
+                if reference.is_step5
+                else None,
             )
         return merged
 
@@ -330,6 +343,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
             self.join()
         with self.state_lock:
             self.delayed_free_requests.clear()
+            self.timed_out_requests.clear()
         while not self.finished_requests.empty():
             self.finished_requests.get_nowait()
 
@@ -387,10 +401,28 @@ class MooncakeSchedulerSendingThread(threading.Thread):
             )
             return
         del self.delayed_free_requests[request_id]
+        if self.is_step5:
+            self.timed_out_requests.discard(request_id)
         self.finished_requests.put(request_id)
 
     def _retrieve_expired_requests_locked(self) -> None:
         current_time = time.time()
+        if self.is_step5:
+            # A local deadline cannot establish remote READ quiescence. Keep
+            # both the delayed free and its DONE eligibility, even after timeout.
+            for request_id, delay_start_time in self.delayed_free_requests.items():
+                if (
+                    current_time - delay_start_time > envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+                    and request_id not in self.timed_out_requests
+                ):
+                    self.timed_out_requests.add(request_id)
+                    logger.error(
+                        "Step5 Mooncake request %s timed out after %s seconds; retaining blocks until remote DONE "
+                        "confirms READ completion. Missing DONE can retain cache capacity indefinitely.",
+                        request_id,
+                        envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+                    )
+            return
         while self.delayed_free_requests:
             request_id = next(iter(self.delayed_free_requests))
             delay_start_time = self.delayed_free_requests[request_id]
@@ -588,6 +620,16 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         if params is not None and params.get("do_remote_prefill"):
             token_ids = request.prompt_token_ids or []
             actual = self._state_prefill_token_count(len(token_ids))
+            if (
+                getattr(self.vllm_config.model_config.hf_text_config, "model_type", None) == "step5"
+                and "remote_num_prompt_tokens" in params
+            ):
+                remote_tokens = params["remote_num_prompt_tokens"]
+                if type(remote_tokens) is not int or remote_tokens < 0:
+                    raise ValueError("Step5 remote_num_prompt_tokens must be a nonnegative integer")
+                # P's sampled token may be appended to D's input, but its KV
+                # has not been computed on P and must not receive remote credit.
+                actual = min(actual, remote_tokens)
             params["num_computed_tokens"] = num_computed_tokens
             count = max(actual - num_computed_tokens, 0)
             if count > 0:

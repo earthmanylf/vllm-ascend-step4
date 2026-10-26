@@ -59,6 +59,13 @@ def test_required_layout_is_hnd_for_regular_attention_and_none_for_mla() -> None
     assert MooncakeBaseConnector.get_required_kvcache_layout(config) is None  # type: ignore[arg-type]
 
 
+def test_required_layout_is_nhd_for_step5() -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=False, hf_text_config=SimpleNamespace(model_type="step5"))
+    )
+    assert MooncakeBaseConnector.get_required_kvcache_layout(config) == "NHD"
+
+
 def test_facade_delegates_scheduler_methods() -> None:
     connector = make_facade()
     request = MagicMock()

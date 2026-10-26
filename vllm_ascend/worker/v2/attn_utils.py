@@ -89,6 +89,7 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.core.step5_kv_cache import (
     allocate_step5_shared_kv_backing,
     allocate_step5_tailring_shared_backing,
+    step5_tailring_alignment_reserve,
     supports_step5_shared_kv_backing,
     supports_step5_tailring_shared_backing,
 )
@@ -1381,7 +1382,11 @@ def allocate_kv_cache_main(
     del layout
     vllm_config = get_current_vllm_config()
     if supports_step5_tailring_shared_backing(vllm_config, kv_cache_config.kv_cache_groups):
-        return allocate_step5_tailring_shared_backing(kv_cache_config, device)
+        return allocate_step5_tailring_shared_backing(
+            kv_cache_config,
+            device,
+            align_for_transfer=bool(step5_tailring_alignment_reserve(vllm_config, kv_cache_config.kv_cache_groups)),
+        )
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
     shared_layers = {
         layer_name: target_layer

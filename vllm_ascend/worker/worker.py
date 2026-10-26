@@ -55,7 +55,11 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.kv_cache_planning import get_kv_cache_groups, unify_hybrid_kv_cache_specs
+from vllm.v1.core.kv_cache_planning import (
+    _get_kv_cache_bytes_per_block,
+    get_kv_cache_groups,
+    unify_hybrid_kv_cache_specs,
+)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -86,7 +90,11 @@ from vllm_ascend.core.kv_cache_placement import (
 from vllm_ascend.core.profiling_chunk_predictor import (
     _attach_profiling_chunk_execution_time,
 )
-from vllm_ascend.core.step5_kv_cache import supports_step5_shared_kv_backing, supports_step5_tailring_shared_backing
+from vllm_ascend.core.step5_kv_cache import (
+    step5_tailring_alignment_reserve,
+    supports_step5_shared_kv_backing,
+    supports_step5_tailring_shared_backing,
+)
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device_allocator.camem import CaMemAllocator
@@ -654,7 +662,9 @@ class NPUWorker(WorkerBase):
                 GiB(kv_cache_memory_bytes),
             )
             return self._apply_kvpp_memory_budget(
-                self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
+                self._apply_kv_offload_decode_memory_constraints(
+                    self._apply_step5_tailring_alignment_reserve(kv_cache_memory_bytes)
+                )
             )
 
         # Execute a forward pass with dummy inputs to profile the memory usage
@@ -729,6 +739,42 @@ class NPUWorker(WorkerBase):
         )
         return self._apply_kvpp_memory_budget(self.available_kv_cache_memory_bytes)
 
+    def _apply_step5_tailring_alignment_reserve(self, available_memory: int, kv_cache_groups=None) -> int:
+        """Check PD overrides against the original budget, then reserve headroom."""
+        config = self.vllm_config
+        if (
+            config.kv_transfer_config is None
+            or not getattr(config, "use_v2_model_runner", False)
+            or getattr(config.model_config.hf_text_config, "model_type", None) != "step5"
+        ):
+            return available_memory
+        if kv_cache_groups is None:
+            specs = self.get_kv_cache_spec()
+            if not isinstance(specs, dict):
+                return available_memory
+            kv_cache_groups = get_kv_cache_groups(config, specs)
+        reserve = step5_tailring_alignment_reserve(config, kv_cache_groups)
+        if not reserve:
+            return available_memory
+        override = getattr(config.cache_config, "num_gpu_blocks_override", None)
+        if override is not None:
+            if type(override) is not int or override <= 0:
+                raise ValueError("Step5 PD num_gpu_blocks_override must be a positive integer.")
+            # The full upstream planner replaces available_memory with override
+            # capacity. Check before returning it; groups alias one padded pool.
+            bytes_per_block = _get_kv_cache_bytes_per_block(
+                kv_cache_groups, config.cache_config.get_resolved_kv_cache_layout()
+            )
+            required_memory = override * bytes_per_block + reserve
+            if required_memory > available_memory:
+                raise ValueError(
+                    f"Step5 PD num_gpu_blocks_override={override} requires {required_memory} bytes "
+                    f"({override} * {bytes_per_block} shared-pool bytes + {reserve} alignment reserve), "
+                    f"exceeding the original worker KV cache budget of {available_memory} bytes. "
+                    "Reduce num_gpu_blocks_override or increase the KV cache memory budget."
+                )
+        return max(0, available_memory - reserve)
+
     def _scale_kv_cache_memory_for_multi_group(self, available_memory: int) -> int:
         """Scale the KV cache budget for vllm main's multi-group layout.
 
@@ -748,7 +794,7 @@ class NPUWorker(WorkerBase):
         if not kv_cache_groups:
             return available_memory
         if supports_step5_tailring_shared_backing(self.vllm_config, kv_cache_groups):
-            return available_memory
+            return self._apply_step5_tailring_alignment_reserve(available_memory, kv_cache_groups)
         # vLLM #51718 removed the DSV4-specific packed planner. Ascend restores
         # that shared-tuple layout in patch_kv_cache_utils, so DSV4 already fits
         # all groups in one physical budget and must not take the generic

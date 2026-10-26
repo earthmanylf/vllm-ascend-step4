@@ -32,6 +32,8 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
+    _is_step5_summary_spec,
+    _validate_step5_components,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
@@ -99,6 +101,8 @@ class MooncakePullRecvingThread(threading.Thread):
         self.block_lens = local_metadata.block_lens
         self.block_shapes = local_metadata.block_shapes
         self.block_size_scales = local_metadata.block_size_scales
+        self.is_step5 = getattr(self.model_config.hf_text_config, "model_type", None) == "step5"
+        self.block_dtypes = local_metadata.block_dtypes
 
         self.use_mla = self.model_config.is_deepseek_mla
         hf_text_config = self.model_config.hf_text_config
@@ -223,6 +227,63 @@ class MooncakePullRecvingThread(threading.Thread):
             )
         return next(iter(endpoints))
 
+    @staticmethod
+    def _is_step5_summary_spec(spec: KVCacheSpec) -> bool:
+        return _is_step5_summary_spec(spec)
+
+    def _validate_step5_topology(self, remote_pcp_size: int, remote_tp_size: int, remote_dcp_size: int) -> None:
+        if (
+            self.tp_size != remote_tp_size
+            or self.pp_size != 1
+            or self.pcp_size != 1
+            or self.dcp_size != 1
+            or remote_pcp_size != 1
+            or remote_dcp_size != 1
+        ):
+            raise ValueError("Mooncake Step5 requires equal TP and PP/PCP/DCP=1")
+
+    def _validate_step5_layer(self, local_index: int, remote_index: int, remote: MooncakePPTransferMetadata) -> None:
+        if not remote.is_step5 or not self.local_metadata.is_step5:
+            raise ValueError("Mooncake Step5 requires Step5 metadata on both peers")
+        for field in (
+            "group_indices",
+            "layer_block_sizes",
+            "block_shapes",
+            "block_lens",
+            "block_size_scales",
+            "block_dtypes",
+        ):
+            local_values = getattr(self, field)
+            remote_values = getattr(remote, field)
+            if (
+                local_values is None
+                or remote_values is None
+                or local_values[local_index] != remote_values[remote_index]
+            ):
+                raise ValueError(f"Mooncake Step5 {field} mismatch for layer {self.layer_names[local_index]!r}")
+        spec = self.kv_cache_specs[self.spec_indices[local_index]]
+        if self.block_dtypes[local_index] != [str(spec.dtype)] * len(self.block_shapes[local_index]):
+            raise ValueError("Mooncake Step5 component dtype does not match the local cache spec")
+        local_group = self.group_indices[local_index]
+        remote_group = remote.group_indices[remote_index]
+        local_members = {name for name, group in zip(self.layer_names, self.group_indices) if group == local_group}
+        remote_members = {
+            name for name, group in zip(remote.layer_names, remote.group_indices) if group == remote_group
+        }
+        if local_members != remote_members:
+            raise ValueError("Mooncake Step5 group membership mismatch")
+        for descriptor, index in ((self, local_index), (remote, remote_index)):
+            if descriptor.layer_block_sizes[index] != spec.block_size:
+                raise ValueError("Mooncake Step5 logical block size does not match the cache spec")
+            _validate_step5_components(
+                spec,
+                descriptor.block_shapes[index],
+                descriptor.block_lens[index],
+                descriptor.block_strides[index],
+                descriptor.block_size_scales[index],
+                descriptor.block_dtypes[index],
+            )
+
     def _build_remote_transfer_layout(
         self,
         remote_metadata: MooncakeTransferMetadataGroups,
@@ -237,6 +298,10 @@ class MooncakePullRecvingThread(threading.Thread):
         one outer entry per required remote head/TP piece and one inner list of
         replica candidates (DCP=1) or participating DCP shards (DCP>1).
         """
+        if getattr(self, "is_step5", False):
+            self._validate_step5_topology(remote_metadata.pcp_size, remote_metadata.tp_size, remote_metadata.dcp_size)
+            if not remote_metadata.is_step5 or remote_metadata.pp_size != 1 or remote_metadata.use_kv_pp:
+                raise ValueError("Mooncake Step5 requires same-topology Step5 peers without KVPP")
         if remote_metadata.use_kv_pp and remote_metadata.dcp_size != 1:
             raise ValueError("Mooncake producer cannot enable KV parallel and DCP together")
         groups_by_pp_rank: dict[int, dict[tuple[int, int], list[list[int]]]] = {}
@@ -267,6 +332,8 @@ class MooncakePullRecvingThread(threading.Thread):
                 if remote_layer_index is None:
                     continue
 
+                if getattr(self, "is_step5", False):
+                    self._validate_step5_layer(local_layer_index, remote_layer_index, pp_metadata)
                 layer_pair = (local_layer_index, remote_layer_index)
                 layer_index_pairs.append(layer_pair)
                 matched_local_layer_indices.add(local_layer_index)
@@ -322,6 +389,15 @@ class MooncakePullRecvingThread(threading.Thread):
         remote_dcp_size: int,
     ) -> list[list[int]]:
         """Infer one matched layer's TP strategy and remote rank groups."""
+        if getattr(self, "is_step5", False):
+            self._validate_step5_topology(remote_pcp_size, remote_tp_size, remote_dcp_size)
+            self._validate_step5_layer(local_layer_index, remote_layer_index, remote_metadata)
+            if self._is_step5_summary_spec(spec) or is_circular_kv_cache_spec(spec):
+                return self._get_attention_remote_tp_rank_groups(remote_tp_size, 1, 1, 1, 1)
+            if isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+                # Main NHD K/V are head shards; never interpret tokens as heads.
+                return [[self.tp_rank]]
+            raise NotImplementedError(f"Mooncake Step5 transfer does not support {type(spec).__name__}")
         if isinstance(spec, MambaSpec):
             return self._get_mamba_remote_tp_rank_groups(
                 remote_pcp_size,
@@ -535,7 +611,7 @@ class MooncakePullRecvingThread(threading.Thread):
         tp_rank_groups_by_pp_rank = self.remote_tp_rank_groups[remote_engine_id]
         layer_pairs_by_pp_rank = self.remote_layer_index_pairs[remote_engine_id]
         # Cache block mappings for this producer-engine batch:
-        # request_id -> (local_spec_index, normalized_remote_tp_rank_groups) ->
+        # request_id -> (spec, local_group, remote_group, candidate_ranks) ->
         # [(selected_remote_tp_rank, local_kernel_block_ids,
         #   remote_kernel_block_ids), ...].
         # Layers with the same spec and candidate topology share their block
@@ -544,7 +620,7 @@ class MooncakePullRecvingThread(threading.Thread):
         transfer_block_ids_by_spec: dict[
             str,
             dict[
-                tuple[int, tuple[tuple[int, ...], ...]],
+                tuple[int, int, int, tuple[tuple[int, ...], ...]],
                 list[tuple[int, list[int], list[int]]],
             ],
         ] = {}
@@ -616,7 +692,7 @@ class MooncakePullRecvingThread(threading.Thread):
         transfer_block_ids_by_spec: dict[
             str,
             dict[
-                tuple[int, tuple[tuple[int, ...], ...]],
+                tuple[int, int, int, tuple[tuple[int, ...], ...]],
                 list[tuple[int, list[int], list[int]]],
             ],
         ],
@@ -645,7 +721,12 @@ class MooncakePullRecvingThread(threading.Thread):
                 spec = self.kv_cache_specs[spec_index]
                 layer_pair = (local_layer_index, remote_layer_index)
                 remote_tp_rank_groups = tp_rank_groups_by_layer[layer_pair]
-                if isinstance(spec, FullAttentionSpec):
+                group_index = self.group_indices[local_layer_index]
+                remote_group_index = remote_metadata.group_indices[remote_layer_index]
+                if getattr(self, "is_step5", False):
+                    self._validate_step5_layer(local_layer_index, remote_layer_index, remote_metadata)
+                    local_dcp_size = layer_remote_dcp_size = 1
+                elif isinstance(spec, FullAttentionSpec):
                     local_dcp_size, layer_remote_dcp_size = self._get_full_attention_dcp_sizes(
                         spec, local_layer_index, remote_layer_index, remote_metadata, remote_pcp_size, remote_dcp_size
                     )
@@ -653,11 +734,12 @@ class MooncakePullRecvingThread(threading.Thread):
                     local_dcp_size, layer_remote_dcp_size = self.dcp_size, remote_dcp_size
                 cache_key = (
                     spec_index,
+                    group_index,
+                    remote_group_index,
                     tuple(tuple(group) for group in remote_tp_rank_groups),
                 )
                 transfer_block_ids = request_block_ids_by_spec.get(cache_key)
                 if transfer_block_ids is None:
-                    group_index = self.group_indices[local_layer_index]
                     if not isinstance(spec, MambaSpec):
                         local_kernel_block_size = (
                             self.layer_block_sizes[local_layer_index] // self.block_size_scales[local_layer_index][0]
@@ -680,7 +762,7 @@ class MooncakePullRecvingThread(threading.Thread):
                         remote_metadata.layer_block_sizes[remote_layer_index],
                         request_metadata.local_block_ids[group_index],
                         request_metadata.local_full_block_ids[group_index],
-                        request_metadata.remote_block_ids[group_index],
+                        request_metadata.remote_block_ids[remote_group_index],
                         request_metadata.local_num_prompt_tokens,
                         request_metadata.remote_num_prompt_tokens,
                         request_metadata.num_computed_tokens,
@@ -690,6 +772,15 @@ class MooncakePullRecvingThread(threading.Thread):
                         selection_index,
                         local_dcp_size,
                     )
+                    if getattr(self, "is_step5", False):
+                        expected_count = (
+                            len(request_metadata.local_block_ids[group_index])
+                            * self.block_size_scales[local_layer_index][0]
+                        )
+                        if not transfer_block_ids or any(
+                            len(local_ids) != expected_count for _, local_ids, _ in transfer_block_ids
+                        ):
+                            raise ValueError("Mooncake Step5 block lists do not cover the requested local blocks")
                     request_block_ids_by_spec[cache_key] = transfer_block_ids
 
                 for remote_worker_rank, local_block_ids, remote_block_ids in transfer_block_ids:
@@ -1137,6 +1228,29 @@ class MooncakePullRecvingThread(threading.Thread):
     ) -> None:
         """Append all layers and requests belonging to one local spec."""
         spec = self.kv_cache_specs[spec_index]
+        # Equivalent specs in independent groups still have independent IDs.
+        entries_by_group: dict[tuple[int, int], dict[tuple[int, int], list[tuple[str, list[int], list[int]]]]] = {}
+        if getattr(self, "is_step5", False):
+            for layer_pair, entries in transfer_entries_by_layer.items():
+                local_index, remote_index = layer_pair
+                group_pair = (self.group_indices[local_index], remote_metadata.group_indices[remote_index])
+                entries_by_group.setdefault(group_pair, {})[layer_pair] = entries
+        if len(entries_by_group) > 1:
+            for group_entries in entries_by_group.values():
+                self._append_spec_transfer_addresses(
+                    spec_index,
+                    remote_pcp_rank,
+                    remote_tp_rank,
+                    remote_pcp_size,
+                    remote_tp_size,
+                    remote_dcp_size,
+                    group_entries,
+                    remote_metadata,
+                    src_list,
+                    dst_list,
+                    length_list,
+                )
+            return
         if isinstance(spec, MambaSpec):
             self._append_mamba_transfer_addresses(
                 spec,
@@ -1180,9 +1294,21 @@ class MooncakePullRecvingThread(threading.Thread):
             for request_id, (local_block_ids, remote_block_ids) in block_ids_by_request.items()
         }
         remote_tp_metadata = remote_metadata.metadata_by_pcp_rank[remote_pcp_rank].metadata_by_tp_rank[remote_tp_rank]
-        transfer_whole_block = is_circular_kv_cache_spec(spec) or isinstance(
-            spec,
-            (MLAAttentionSpec, SlidingWindowMLASpec, AscendSFAIndexerCacheSpec),
+        step5_whole_block = getattr(self, "is_step5", False)
+        if step5_whole_block:
+            self._validate_step5_topology(remote_pcp_size, remote_tp_size, remote_dcp_size)
+            for local_index, remote_index in transfer_entries_by_layer:
+                self._validate_step5_layer(local_index, remote_index, remote_metadata)
+            if not self._is_step5_summary_spec(spec) and not is_circular_kv_cache_spec(spec):
+                if remote_tp_rank != self.tp_rank:
+                    raise ValueError("Mooncake Step5 main cache requires matching TP rank")
+        transfer_whole_block = (
+            step5_whole_block
+            or is_circular_kv_cache_spec(spec)
+            or isinstance(
+                spec,
+                (MLAAttentionSpec, SlidingWindowMLASpec, AscendSFAIndexerCacheSpec),
+            )
         )
         if transfer_whole_block:
             for (local_layer_index, remote_layer_index), transfer_entries in transfer_entries_by_layer.items():

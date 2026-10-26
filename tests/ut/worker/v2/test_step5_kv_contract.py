@@ -10,6 +10,10 @@ import importlib.util
 import os
 import sys
 import unittest
+from collections import defaultdict
+from contextlib import nullcontext
+from dataclasses import dataclass
+from math import prod
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace as NS
@@ -83,11 +87,12 @@ def config():
     layout = NS(is_layer_compact=True, is_block_compact=True)
     return NS(
         use_v2_model_runner=True,
-        model_config=NS(hf_text_config=NS(model_type="step5")),
+        model_config=NS(hf_text_config=NS(model_type="step5"), is_multimodal_model=False),
+        speculative_config=None,
         kv_transfer_config=None,
         additional_config={},
-        parallel_config=NS(decode_context_parallel_size=1, prefill_context_parallel_size=1),
-        cache_config=NS(get_resolved_kv_cache_layout=lambda: layout),
+        parallel_config=NS(pipeline_parallel_size=1, decode_context_parallel_size=1, prefill_context_parallel_size=1),
+        cache_config=NS(get_resolved_kv_cache_layout=lambda: layout, enable_prefix_caching=False),
     )
 
 
@@ -161,7 +166,469 @@ def sidecar_view(name, spec, raw, blocks, *, is_ring=False):
     return view(name, spec, raw, blocks, is_ring=is_ring)
 
 
+def tailring_config():
+    page = 98304
+    specs = {
+        "main": FullAttentionSpec(),
+        "summary": FullAttentionSpec(
+            head_size=256, head_size_v=0, dtype=torch.uint8, tokens_per_state=8, page_size_padded=page
+        ),
+        "ring": CircularBufferSpec(head_size=384, head_size_v=0),
+    }
+    groups = [NS(layer_names=[name], kv_cache_spec=spec) for name, spec in specs.items()]
+    kv = NS(
+        num_blocks=4,
+        kv_cache_groups=groups,
+        kv_cache_tensors=[
+            NS(
+                size=8 * page,
+                layers=[name],
+                offset=4 * page,
+                layer_stride=4 * page,
+                block_stride=page,
+                host_resident=False,
+            )
+            for name in specs
+        ],
+        num_blocks_of=lambda descriptor: 4,
+    )
+    cfg = config()
+    cfg.kv_transfer_config = NS(
+        is_kv_transfer_instance=True,
+        kv_connector="MooncakeConnectorV2",
+        kv_connector_module_path=None,
+        kv_role="kv_producer",
+    )
+    return cfg, kv
+
+
+def load_cpu_upstream(relative, dependencies):
+    """Load real upstream containers/planning, excluding device imports only."""
+    source = vllm_source_file(relative)
+    tree = ast.parse(source.read_text())
+    tree.body = [
+        node for node in tree.body if not isinstance(node, ast.ImportFrom) or not (node.module or "").startswith("vllm")
+    ]
+    # Local CPU Python is 3.10; upstream's Self is annotation-only here.
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "typing":
+            node.names = [alias for alias in node.names if alias.name != "Self"]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "vllm.v1.attention.backend":
+            node.module = "types"
+            node.names = [ast.alias(name="SimpleNamespace", asname="MultipleOf")]
+    tree.body.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
+    ast.fix_missing_locations(tree)
+    module = ModuleType("cpu_upstream_" + source.stem)
+    module.__dict__.update({key: value for key, value in dependencies.items() if not key.startswith("__")})
+    with patch.dict(sys.modules, {module.__name__: module}):
+        exec(compile(tree, str(source), "exec"), module.__dict__)  # noqa: S102
+    return module
+
+
+def pd_upstream_fixture(counts=(2, 2, 2)):
+    logger = NS(info=lambda *a: None, warning=lambda *a: None)
+    deps = dict(
+        init_logger=lambda *a: logger,
+        cdiv=lambda n, d: (n + d - 1) // d,
+        round_up=lambda n, a: (n + a - 1) // a * a,
+        get_dtype_size=lambda dtype: dtype.itemsize,
+        format_gib=lambda n: str(n / 1024**3),
+    )
+    layout = load_cpu_upstream("v1/kv_cache_layout.py", {})
+    registry = load_cpu_upstream("v1/kv_cache_spec_registry.py", deps)
+    interface = load_cpu_upstream(
+        "v1/kv_cache_interface.py",
+        dict(
+            deps,
+            KVCacheSpecRegistry=registry.KVCacheSpecRegistry,
+            MambaAttentionBackendEnum=NS(MAMBA2="mamba2"),
+            KVCacheLayout=layout.KVCacheLayout,
+            _DIM_B=1,
+            _DIM_L=0,
+        ),
+    )
+    for name in ("FullAttentionSpec", "CircularBufferSpec", "SlidingWindowSpec"):
+        registry.KVCacheSpecRegistry.register(getattr(interface, name), manager_class=object)
+    cfg, _ = tailring_config()
+    cfg.cache_config.get_resolved_kv_cache_layout = lambda: layout.KVCacheLayout.LBNHC
+    cfg.cache_config.num_gpu_blocks_override = None
+    cfg.cache_config.prefix_cache_retention_interval = None
+    cfg.attention_config = NS(hisparse_config=None)
+    cfg.scheduler_config = NS(disable_hybrid_kv_cache_manager=False)
+    cfg.model_config.max_model_len = cfg.model_config.original_max_model_len = 1
+    cfg.parallel_config.tensor_parallel_size = 1
+    cfg.num_prefill_lookahead_tokens = 0
+    geometry = dict(block_size=128, num_kv_heads=1, head_size=192, dtype=torch.bfloat16)
+    main = interface.FullAttentionSpec(**geometry)
+    summary = interface.FullAttentionSpec(
+        **dict(geometry, head_size=256, head_size_v=0, dtype=torch.uint8),
+        tokens_per_state=8,
+        page_size_padded=main.page_size_bytes,
+    )
+    ring = interface.CircularBufferSpec(**dict(geometry, head_size=384, head_size_v=0))
+    specs = {
+        f"{name}.{i}": spec
+        for name, spec, count in zip(("main", "summary", "ring"), (main, summary, ring), counts)
+        for i in range(count)
+    }
+    planner = load_cpu_upstream(
+        "v1/core/kv_cache_planning.py",
+        dict(interface.__dict__, **deps, KVCacheConfigBuilder=object, get_hisparse_kv_cache_groups=lambda *a: None),
+    )
+    builder = NS(
+        get_kv_cache_groups=planner.get_kv_cache_groups,
+        _get_pool_bytes_per_block=lambda *a: None,
+        get_kv_cache_config_from_groups=lambda c, g, num_blocks: planner.get_kv_cache_config_from_groups(
+            c, g, num_blocks * planner._pool_bytes_per_block(c, g)
+        ),
+    )
+    builder_module = ModuleType("vllm.v1.core.kv_cache_config_builder")
+    builder_module.get_kv_cache_config_builder = lambda c: builder
+    candidate = importlib.util.module_from_spec(module_spec)
+    with patch.dict(sys.modules, {"vllm.v1.kv_cache_interface": interface}):
+        module_spec.loader.exec_module(candidate)
+    env = dict(planner.__dict__)
+    env.update(candidate.__dict__)
+    worker = NS(vllm_config=cfg, get_kv_cache_spec=lambda: dict(specs))
+    source = ROOT / "vllm_ascend/worker/worker.py"
+    worker._apply_step5_tailring_alignment_reserve = extract(
+        source, "_apply_step5_tailring_alignment_reserve", env
+    ).__get__(worker)
+    scale = extract(source, "_scale_kv_cache_memory_for_multi_group", env)
+    return NS(
+        cfg=cfg,
+        specs=specs,
+        planner=planner,
+        helper=candidate,
+        worker=worker,
+        scale=scale,
+        env=env,
+        builder_module=builder_module,
+    )
+
+
 class SharedCacheTests(unittest.TestCase):
+    def test_pd_override_upstream_reproduces_original_budget_overrun(self):
+        f = pd_upstream_fixture()
+        f.cfg.cache_config.num_gpu_blocks_override = 5
+        budget = 2883603
+        groups = f.planner.get_kv_cache_groups(f.cfg, dict(f.specs))
+        self.assertEqual(f.planner._pool_bytes_per_block(f.cfg, groups), 196608)
+        planned = f.planner.get_kv_cache_config_from_groups(f.cfg, groups, budget - 2097152)
+        raw = f.helper.allocate_step5_tailring_shared_backing(planned, "cpu", align_for_transfer=True)
+        actual = raw["main.0"][0].untyped_storage().nbytes()
+        self.assertEqual(actual, 3080192)
+        self.assertEqual(actual - budget, 196589)
+        # The real full planner accepts even a one-byte reported budget: override
+        # capacity replaces it before admission, so it cannot enforce this guard.
+        with patch.dict(sys.modules, {"vllm.v1.core.kv_cache_config_builder": f.builder_module}):
+            full = f.planner.get_kv_cache_configs(f.cfg, [dict(f.specs)], [1])[0]
+        self.assertEqual(full.num_blocks, 5)
+        self.assertEqual(full.kv_cache_tensors[0].size, 983040)
+
+    def test_pd_override_original_budget_guard_profile_and_explicit(self):
+        for path in ("profile", "explicit"):
+            for override, budget, safe in (
+                (4, 2883603, True),
+                (5, 2883603, False),
+                (5, 3080192, True),
+                (5, 3080191, False),
+                (0, 2883603, False),
+                (-1, 2883603, False),
+            ):
+                with self.subTest(path=path, override=override, budget=budget):
+                    f = pd_upstream_fixture()
+                    f.cfg.cache_config.num_gpu_blocks_override = override
+                    apply = f.scale if path == "profile" else lambda w, b: w._apply_step5_tailring_alignment_reserve(b)
+                    if not safe:
+                        with self.assertRaisesRegex(ValueError, "num_gpu_blocks_override"):
+                            apply(f.worker, budget)
+                        continue
+                    reduced = apply(f.worker, budget)
+                    self.assertEqual(reduced, budget - 2097152)
+                    self.assertEqual(f.cfg.cache_config.num_gpu_blocks_override, override)
+                    with patch.dict(sys.modules, {"vllm.v1.core.kv_cache_config_builder": f.builder_module}):
+                        planned = f.planner.get_kv_cache_configs(f.cfg, [dict(f.specs)], [reduced])[0]
+                    self.assertEqual(planned.num_blocks, override)
+                    raw = f.helper.allocate_step5_tailring_shared_backing(planned, "cpu", align_for_transfer=True)
+                    self.assertLessEqual(raw["main.0"][0].untyped_storage().nbytes(), budget)
+
+    def test_pd_override_group_padding_and_aliasing_use_actual_planner_bytes(self):
+        # Uneven buckets generate padding and multiple aliased groups. Neither
+        # sum(all layer pages) nor total layers / group count is the pool divisor.
+        for counts in ((3, 4, 3), (2, 5, 2)):
+            for path in ("profile", "explicit"):
+                with self.subTest(counts=counts, path=path):
+                    f = pd_upstream_fixture(counts)
+                    groups = f.planner.get_kv_cache_groups(f.cfg, dict(f.specs))
+                    self.assertEqual(len(groups), 3 if counts == (3, 4, 3) else 5)
+                    per_block = f.planner._pool_bytes_per_block(f.cfg, groups)
+                    self.assertEqual(per_block, (4 if counts == (3, 4, 3) else 2) * 98304)
+                    f.cfg.cache_config.num_gpu_blocks_override = 6
+                    exact_budget = 6 * per_block + 2097152
+                    apply = f.scale if path == "profile" else lambda w, b: w._apply_step5_tailring_alignment_reserve(b)
+                    self.assertEqual(apply(f.worker, exact_budget), exact_budget - 2097152)
+                    with self.assertRaisesRegex(ValueError, "num_gpu_blocks_override"):
+                        apply(f.worker, exact_budget - 1)
+
+    def test_pd_override_determine_memory_rejects_before_planning_or_allocation(self):
+        for path in ("profile", "explicit"):
+            for override in (4, 5):
+                with self.subTest(path=path, override=override):
+                    f = pd_upstream_fixture()
+                    budget = 2883603
+                    f.cfg.cache_config.num_gpu_blocks_override = override
+                    worker = f.worker
+                    worker.cache_config = f.cfg.cache_config
+                    worker.cache_config.kv_cache_memory_bytes = budget if path == "explicit" else None
+                    worker.parallel_config = NS(data_parallel_size=1)
+                    worker.init_snapshot = NS(free_memory=budget * 2)
+                    worker.requested_memory = budget + 100
+                    worker.device = "cpu"
+                    worker.model_runner = NS(profile_run=lambda **kwargs: None, model_memory_usage=100)
+                    worker._scale_kv_cache_memory_for_multi_group = f.scale.__get__(worker)
+                    worker._apply_kvpp_memory_budget = lambda b: b
+                    worker._apply_kv_offload_decode_memory_constraints = lambda b: b
+                    profile = NS(
+                        before_profile=NS(torch_peak=0),
+                        after_profile=NS(free_memory=budget),
+                        non_torch_increase=0,
+                        weights_memory=100,
+                    )
+                    f.env.update(
+                        torch=NS(inference_mode=torch.inference_mode, npu=NS(memory_stats=lambda d: {})),
+                        GiB_bytes=1024**3,
+                        maybe_apply_startup_plan=lambda w: None,
+                        envs=NS(VLLM_RANDOMIZE_DP_DUMMY_INPUTS=False),
+                        memory_profiling=lambda *a, result=profile, **kw: nullcontext(result),
+                        set_current_vllm_config=lambda c: nullcontext(),
+                        get_layerwise_reuse_config=lambda c: None,
+                        logger=NS(info=lambda *a: None, info_once=lambda *a, **kw: None, debug=lambda *a: None),
+                    )
+                    determine = extract(ROOT / "vllm_ascend/worker/worker.py", "determine_available_memory", f.env)
+                    with (
+                        patch.object(f.planner, "get_kv_cache_configs", side_effect=AssertionError("too late")),
+                        patch.object(torch, "zeros", side_effect=AssertionError("allocation reached")),
+                    ):
+                        if override == 5:
+                            with self.assertRaisesRegex(ValueError, "requires 3080192 bytes.*2883603"):
+                                determine(worker)
+                        else:
+                            self.assertEqual(determine(worker), budget - 2097152)
+
+    def test_non_pd_override_keeps_upstream_semantics(self):
+        f = pd_upstream_fixture()
+        f.cfg.kv_transfer_config = None
+        for override in (5, 0, -1):
+            f.cfg.cache_config.num_gpu_blocks_override = override
+            self.assertEqual(f.scale(f.worker, 1), 1)
+            self.assertEqual(f.worker._apply_step5_tailring_alignment_reserve(1), 1)
+            groups = f.planner.get_kv_cache_groups(f.cfg, dict(f.specs))
+            planned = f.planner.get_kv_cache_config_from_groups(f.cfg, groups, 1)
+            self.assertEqual(planned.num_blocks, override)
+
+    def test_pd_tailring_eligibility_and_negative_controls(self):
+        cfg, kv = tailring_config()
+        for connector in ("MooncakeConnectorV2", "MooncakePullConnector"):
+            for role in ("kv_producer", "kv_consumer"):
+                cfg.kv_transfer_config.kv_connector = connector
+                cfg.kv_transfer_config.kv_role = role
+                self.assertTrue(helper.supports_step5_tailring_shared_backing(cfg, kv.kv_cache_groups))
+        mutations = [
+            lambda c: setattr(c.kv_transfer_config, "kv_connector", "OtherConnector"),
+            lambda c: setattr(c.kv_transfer_config, "kv_connector_module_path", "custom.module"),
+            lambda c: setattr(c.kv_transfer_config, "kv_role", "kv_both"),
+            lambda c: setattr(c.kv_transfer_config, "is_kv_transfer_instance", False),
+            lambda c: setattr(c.parallel_config, "pipeline_parallel_size", 2),
+            lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2),
+            lambda c: setattr(c.parallel_config, "decode_context_parallel_size", 2),
+            lambda c: setattr(c, "speculative_config", NS(method="mtp")),
+            lambda c: setattr(c.cache_config, "enable_prefix_caching", True),
+            lambda c: setattr(c.model_config, "is_multimodal_model", True),
+            lambda c: c.additional_config.update(enable_kvpp=True),
+            lambda c: c.additional_config.update(sparse_kv_offload_config={"enabled": True}),
+            lambda c: setattr(c, "attention_config", NS(hisparse_config={})),
+        ]
+        for mutate in mutations:
+            invalid = copy.deepcopy(cfg)
+            mutate(invalid)
+            self.assertFalse(helper.supports_step5_tailring_shared_backing(invalid, kv.kv_cache_groups))
+        self.assertTrue(helper.supports_step5_tailring_shared_backing(config(), kv.kv_cache_groups))
+        self.assertFalse(helper.supports_step5_shared_kv_backing(cfg, caches().kv_cache_groups))
+
+    def test_pd_aligned_slab_views_keep_raw_storage_offset_and_registration(self):
+        cfg, kv = tailring_config()
+        alignment = 2 * 1024 * 1024
+        allocated = helper.allocate_step5_tailring_shared_backing(kv, "cpu", align_for_transfer=True)
+        env = dict(
+            get_current_vllm_config=lambda: cfg,
+            step5_tailring_alignment_reserve=helper.step5_tailring_alignment_reserve,
+            supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
+            allocate_step5_tailring_shared_backing=helper.allocate_step5_tailring_shared_backing,
+        )
+        dispatch = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "allocate_kv_cache_main", env)
+        dispatched = dispatch(kv, "cpu", None, [128] * 3)
+        self.assertEqual(dispatched["main"][0].untyped_storage().nbytes(), kv.kv_cache_tensors[0].size + alignment)
+        invalid = copy.deepcopy(kv)
+        invalid.kv_cache_tensors[0].offset = -1
+        with (
+            self.assertRaises(ValueError),
+            patch.object(helper.torch, "zeros", side_effect=AssertionError("no fallback")),
+        ):
+            dispatch(invalid, "cpu", None, [128] * 3)
+        k, v = allocated["main"]
+        storage = k.untyped_storage()
+        base = (storage.data_ptr() + alignment - 1) // alignment * alignment
+        self.assertEqual(storage.nbytes(), kv.kv_cache_tensors[0].size + alignment)
+        self.assertEqual(k.data_ptr(), base + kv.kv_cache_tensors[0].offset)
+        self.assertEqual(v.data_ptr() - k.data_ptr(), 128 * 192 * 2)
+        self.assertEqual(allocated["summary"].data_ptr(), k.data_ptr())
+        self.assertEqual(allocated["ring"].data_ptr(), k.data_ptr())
+        k[1].fill_(7)
+        v[1].fill_(9)
+        self.assertTrue(torch.all(k[1] == 7))
+        self.assertTrue(torch.all(v[1] == 9))
+        self.assertTrue(torch.all(k[0] == 0))
+        namespace = dict(torch=torch, dataclass=dataclass, get_kv_cache_tensor_layers=lambda d: d.layers)
+        source = ROOT / "vllm_ascend/distributed/kv_transfer/utils/utils.py"
+        tree = ast.parse(source.read_text())
+        node = next(n for n in tree.body if getattr(n, "name", None) == "RegisterRegions")
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+        namespace["tensor_storage_key"] = extract(source, "tensor_storage_key", namespace)
+        source = ROOT / "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/utils.py"
+        namespace["KV_CACHE_BUFFER_ALIGNMENT"] = alignment
+        for name in ("as_kv_cache_tensors", "_get_storage_nbytes", "_get_tensor_span_nbytes"):
+            extract(source, name, namespace)
+        collect = extract(source, "collect_configured_register_regions", namespace)
+        regions = collect(kv, allocated)
+        self.assertEqual(regions.ptrs, [base])
+        self.assertEqual(regions.lengths, [kv.kv_cache_tensors[0].size])
+
+    def test_pd_invalid_geometry_and_descriptors_fail_before_allocating(self):
+        _, kv = tailring_config()
+        mutations = [
+            lambda c: setattr(c.kv_cache_groups[2].kv_cache_spec, "head_size", 768),
+            lambda c: setattr(c.kv_cache_groups[2].kv_cache_spec, "head_size", 0),
+            lambda c: c.kv_cache_groups[2].kv_cache_spec.__dict__.update(head_size=768, page_size_padded=98304),
+            lambda c: c.kv_cache_groups[2].kv_cache_spec.__dict__.update(head_size=192, page_size_padded=98304),
+            lambda c: setattr(c.kv_cache_groups[1].kv_cache_spec, "tokens_per_state", 0),
+            lambda c: setattr(c.kv_cache_groups[1].kv_cache_spec, "page_size_padded", 2048),
+            lambda c: setattr(c.kv_cache_tensors[0], "offset", 1),
+            lambda c: setattr(c.kv_cache_tensors[0], "layer_stride", -1),
+            lambda c: setattr(c.kv_cache_tensors[0], "layer_stride", 1),
+            lambda c: setattr(c.kv_cache_tensors[0], "size", c.kv_cache_tensors[0].size + 1),
+            lambda c: setattr(c, "num_blocks_of", lambda d: 3),
+        ]
+        for mutate in mutations:
+            invalid = copy.deepcopy(kv)
+            mutate(invalid)
+            with (
+                patch.object(helper.torch, "zeros", side_effect=AssertionError("validate before allocating")),
+                self.assertRaises(ValueError),
+            ):
+                helper.allocate_step5_tailring_shared_backing(invalid, "cpu")
+
+    def test_pd_profile_and_explicit_budget_reserve_once(self):
+        cfg, kv = tailring_config()
+        env = dict(
+            get_kv_cache_groups=lambda *_: kv.kv_cache_groups,
+            supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
+            step5_tailring_alignment_reserve=helper.step5_tailring_alignment_reserve,
+            supports_step5_shared_kv_backing=helper.supports_step5_shared_kv_backing,
+            UniformTypeKVCacheSpecs=UniformTypeKVCacheSpecs,
+            AttentionSpec=AttentionSpec,
+            MambaSpec=type("MambaSpec", (), {}),
+            logger=NS(info=lambda *args: None),
+        )
+        source = ROOT / "vllm_ascend/worker/worker.py"
+        scale = extract(source, "_scale_kv_cache_memory_for_multi_group", env)
+        worker = NS(vllm_config=cfg, get_kv_cache_spec=lambda: {"main": FullAttentionSpec()})
+        worker._apply_step5_tailring_alignment_reserve = extract(
+            source, "_apply_step5_tailring_alignment_reserve", env
+        ).__get__(worker)
+        budget = 16 * 1024 * 1024
+        self.assertEqual(scale(worker, budget), budget - 2 * 1024 * 1024)
+        self.assertEqual(scale(worker, 1), 0)
+        cfg.kv_transfer_config.kv_connector = "OtherConnector"
+        worker.model_config = cfg.model_config
+        self.assertEqual(scale(worker, budget), int(budget * (1 / 3)))
+        cfg.kv_transfer_config.kv_connector = "MooncakeConnectorV2"
+        # Execute the actual explicit-memory fast path; no NPU profiling is reached.
+        worker.cache_config = NS(kv_cache_memory_bytes=budget)
+        worker.parallel_config = NS(data_parallel_size=1)
+        worker.model_runner = NS(profile_run=lambda **kwargs: None)
+        worker.init_snapshot = NS(free_memory=budget * 2)
+        worker._apply_step5_tailring_alignment_reserve = extract(
+            source, "_apply_step5_tailring_alignment_reserve", env
+        ).__get__(worker)
+        worker._apply_kvpp_memory_budget = lambda b: b
+        worker._apply_kv_offload_decode_memory_constraints = lambda b: b
+        env.update(
+            torch=torch,
+            GiB_bytes=1024**3,
+            maybe_apply_startup_plan=lambda w: None,
+            envs=NS(VLLM_RANDOMIZE_DP_DUMMY_INPUTS=False),
+            set_current_vllm_config=lambda c: nullcontext(),
+            logger=NS(info=lambda *a: None),
+        )
+        determine = extract(source, "determine_available_memory", env)
+        self.assertEqual(determine(worker), budget - 2 * 1024 * 1024)
+        worker.vllm_config = config()
+        worker.get_kv_cache_spec = lambda: (_ for _ in ()).throw(AssertionError("non-PD fast path must stay fast"))
+        self.assertEqual(determine(worker), budget)
+
+    def test_pd_upstream_planner_descriptors_fit_reserved_slab(self):
+        cfg, kv = tailring_config()
+        layout = cfg.cache_config.get_resolved_kv_cache_layout()
+        layout.is_block_outermost = False
+        layout.stride_order = (0, 1, 3, 2, 4)  # LBNHC
+        cfg.attention_config = NS(hisparse_config=None)
+        cfg.cache_config.num_gpu_blocks_override = None
+        cfg.cache_config.prefix_cache_retention_interval = None
+        for group in kv.kv_cache_groups:
+            group.layer_names.append(group.layer_names[0] + ".second")
+            spec = group.kv_cache_spec
+            spec.get_block_stride_alignment = lambda: 1
+            spec.num_heads = spec.num_kv_heads
+            spec.state_content_size_bytes = (spec.head_size + spec.head_size_v) * spec.dtype.itemsize
+            spec.get_num_kernel_states = lambda bs, s=spec: bs // getattr(s, "tokens_per_state", 1)
+        cfg.cache_config.enable_prefix_caching = False
+        env = dict(
+            UniformTypeKVCacheSpecs=UniformTypeKVCacheSpecs,
+            defaultdict=defaultdict,
+            prod=prod,
+            KVCacheTensor=lambda **kw: NS(host_resident=False, **kw),
+            KVCacheConfig=lambda **kw: NS(**kw),
+            round_up=lambda n, a: (n + a - 1) // a * a,
+            _DIM_L=0,
+            _DIM_B=1,
+        )
+        interface = vllm_source_file("v1/kv_cache_interface.py")
+        extract(interface, "compute_layer_kv_cache_shape_bytes", env)
+        extract(interface, "compute_layout_strides", env)
+        source = vllm_source_file("v1/core/kv_cache_planning.py")
+        for name in (
+            "_get_per_layer_spec",
+            "_get_layer_block_stride",
+            "_get_kv_cache_bytes_per_block",
+            "validate_kv_cache_layout",
+            "may_override_num_blocks",
+        ):
+            extract(source, name, env)
+        plan = extract(source, "get_kv_cache_config_from_groups", env)
+        budget = 2 * 1024 * 1024 + 8 * 98304 + 19
+        reserved = budget - helper.step5_tailring_alignment_reserve(cfg, kv.kv_cache_groups)
+        planned = plan(cfg, kv.kv_cache_groups, reserved)
+        planned.num_blocks_of = extract(interface, "num_blocks_of", {}).__get__(planned)
+        self.assertEqual(planned.num_blocks, 4)
+        allocated = helper.allocate_step5_tailring_shared_backing(planned, "cpu", align_for_transfer=True)
+        self.assertLessEqual(allocated["main"][0].untyped_storage().nbytes(), budget)
+        self.assertEqual(allocated["ring"].shape, (4, 1, 128, 384))
+        self.assertEqual(allocated["main.second"][0].data_ptr() - allocated["main"][0].data_ptr(), 4 * 98304)
+        allocated["main"][0][1].fill_(7)
+        self.assertTrue(torch.all(allocated["main.second"][0] == 0))
+
     def test_tailring_shared_backing_uses_descriptor_offsets_and_one_allocation(self):
         page = 98304
         specs = {
@@ -206,6 +673,7 @@ class SharedCacheTests(unittest.TestCase):
         self.assertEqual(k.untyped_storage().nbytes(), 4 * page)
         env = dict(
             get_current_vllm_config=config,
+            step5_tailring_alignment_reserve=helper.step5_tailring_alignment_reserve,
             supports_step5_tailring_shared_backing=helper.supports_step5_tailring_shared_backing,
             allocate_step5_tailring_shared_backing=helper.allocate_step5_tailring_shared_backing,
         )
@@ -215,6 +683,9 @@ class SharedCacheTests(unittest.TestCase):
         env.update(get_kv_cache_groups=lambda *_: groups, UniformTypeKVCacheSpecs=UniformTypeKVCacheSpecs)
         scale = extract(ROOT / "vllm_ascend/worker/worker.py", "_scale_kv_cache_memory_for_multi_group", env)
         worker = NS(vllm_config=config(), get_kv_cache_spec=lambda: specs)
+        worker._apply_step5_tailring_alignment_reserve = extract(
+            ROOT / "vllm_ascend/worker/worker.py", "_apply_step5_tailring_alignment_reserve", env
+        ).__get__(worker)
         self.assertEqual(scale(worker, 123456), 123456)
         for mutate in (
             lambda c: setattr(c.kv_cache_tensors[0], "offset", -page),
@@ -223,9 +694,11 @@ class SharedCacheTests(unittest.TestCase):
         ):
             invalid = copy.deepcopy(kv)
             mutate(invalid)
-            with patch.object(helper.torch, "zeros", side_effect=AssertionError("validate before allocating")):
-                with self.assertRaises(ValueError):
-                    helper.allocate_step5_tailring_shared_backing(invalid, "cpu")
+            with (
+                patch.object(helper.torch, "zeros", side_effect=AssertionError("validate before allocating")),
+                self.assertRaises(ValueError),
+            ):
+                helper.allocate_step5_tailring_shared_backing(invalid, "cpu")
 
     def test_step5_summary_page_view_preserves_padding_and_block_ids(self):
         spec = NS(
@@ -501,7 +974,9 @@ class SharedCacheTests(unittest.TestCase):
             v[2].fill_(19)
             original = raw.clone().reshape(4, page_elements)
             entries = [summary, (k, v), ring] if summary_first else [(k, v), ring, summary]
-            copy_blocks = extract(ROOT / "vllm_ascend/worker/utils.py", "copy_kv_cache_blocks_inplace", {"torch": torch})
+            copy_blocks = extract(
+                ROOT / "vllm_ascend/worker/utils.py", "copy_kv_cache_blocks_inplace", {"torch": torch}
+            )
             copy_blocks(entries, 4, [NS(src_block_id=1, dst_block_id=2), NS(src_block_id=2, dst_block_id=3)])
             actual = raw.reshape(4, page_elements)
             self.assertTrue(torch.equal(actual[0], original[0]))

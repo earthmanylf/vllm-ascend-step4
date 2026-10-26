@@ -94,6 +94,7 @@ import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its impor
 from vllm_ascend.device.device_op import DeviceOperator
 
 from vllm_ascend import envs
+from vllm_ascend.core.step5_kv_cache import validate_step5_kv_transfer_config as _validate_step5_kv_transfer_config
 from vllm_ascend.models.step5._step5_compat import (
     Step5FP32RouterLinear,
 )
@@ -110,6 +111,15 @@ from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache
 from vllm_ascend.quantization.configs.fp8_config import AscendFp8Config, Step5Fp8BlockConfig
 
 logger = init_logger(__name__)
+
+
+def validate_step5_kv_transfer_config(vllm_config: VllmConfig) -> None:
+    """Bound Ascend Step5 to the implemented same-topology pull protocol.
+
+    This local capability check does not certify full-model online PD validation.
+    Peer topology and cache descriptors are checked by the Mooncake handshake.
+    """
+    _validate_step5_kv_transfer_config(vllm_config)
 
 
 def _kv_cache_torch_dtype(cache_config, vllm_config) -> torch.dtype:
@@ -1617,6 +1627,7 @@ class AscendStep5ForCausalLM(Step5ForCausalLM):
         vllm_config: VllmConfig,
         prefix: str = "",
     ):
+        validate_step5_kv_transfer_config(vllm_config)
         nn.Module.__init__(self)
         self.vllm_config = vllm_config
         model_config = vllm_config.model_config

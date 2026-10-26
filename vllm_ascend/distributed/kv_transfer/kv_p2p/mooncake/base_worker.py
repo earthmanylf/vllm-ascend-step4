@@ -22,7 +22,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -30,7 +32,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, is_circular_kv_cache_spec
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
@@ -97,6 +99,61 @@ def _is_component_major_mla_binding(spec: KVCacheSpec, caches: tuple[torch.Tenso
 
     nope_block_elems = nope.shape[1] * nope.shape[2] * nope.shape[3]
     return rope.storage_offset() - nope.storage_offset() == nope_block_elems
+
+
+def _is_step5_summary_spec(spec: KVCacheSpec) -> bool:
+    # The upstream summary is a FullAttentionSpec, not a distinct type.
+    return (
+        type(spec) is FullAttentionSpec
+        and spec.num_kv_heads == 1
+        and spec.head_size == 256
+        and spec.head_size_v == 0
+        and spec.dtype == torch.uint8
+        and spec.tokens_per_state == 8
+    )
+
+
+def _validate_step5_components(
+    spec: KVCacheSpec,
+    shapes: list[tuple[int, ...]],
+    lengths: list[int],
+    strides: list[int],
+    scales: list[int],
+    dtypes: list[str],
+) -> None:
+    """Validate one Step5 descriptor against its own spec before using scale[0]."""
+    if not scales or any(type(scale) is not int or scale <= 0 or scale != scales[0] for scale in scales):
+        raise ValueError("Mooncake Step5 requires positive equal component block size scales")
+    scale = scales[0]
+    if spec.block_size % scale:
+        raise ValueError("Mooncake Step5 component scale must divide the logical block size")
+    dtype = next((dtype for dtype in STR_DTYPE_TO_TORCH_DTYPE.values() if str(dtype) == str(spec.dtype)), None)
+    if dtype is None:
+        raise ValueError("Mooncake Step5 unknown component dtype")
+    element_size = get_dtype_size(dtype)
+    if is_circular_kv_cache_spec(spec) or _is_step5_summary_spec(spec):
+        if (
+            spec.num_states % scale
+            or spec.state_content_size_bytes % element_size
+            or (is_circular_kv_cache_spec(spec) and scale != 1)
+        ):
+            raise ValueError("Mooncake Step5 sidecar requires whole spec-consistent states")
+        expected_shapes = [(spec.num_heads, spec.num_states // scale, spec.state_content_size_bytes // element_size)]
+    else:
+        expected_shapes = [
+            (spec.block_size // scale, spec.num_kv_heads, spec.head_size),
+            (spec.block_size // scale, spec.num_kv_heads, spec.head_size_v),
+        ]
+    count = len(expected_shapes)
+    if any(len(values) != count for values in (shapes, lengths, strides, scales, dtypes)):
+        raise ValueError("Mooncake Step5 component count does not match the cache spec")
+    if shapes != expected_shapes or any(any(dim <= 0 for dim in shape) for shape in shapes):
+        raise ValueError("Mooncake Step5 component shapes do not match the cache spec")
+    if dtypes != [str(dtype)] * count:
+        raise ValueError("Mooncake Step5 component dtype does not match the cache spec")
+    for shape, length, stride in zip(shapes, lengths, strides):
+        if length != math.prod(shape) * element_size or stride < length:
+            raise ValueError("Mooncake Step5 payload bytes must match the shape and fit the physical block stride")
 
 
 class MooncakeBaseConnectorWorker:
@@ -307,6 +364,12 @@ class MooncakeBaseConnectorWorker:
                 spec_index = self.layer_name_to_spec_index[layer_name]
                 spec = self.kv_cache_specs[spec_index]
                 caches = as_kv_cache_tensors(cache_or_caches)
+                if getattr(self.vllm_config.model_config.hf_text_config, "model_type", None) == "step5":
+                    if any(
+                        cache.shape[0] <= 0 or cache.shape[0] % self.num_blocks or not cache[0].is_contiguous()
+                        for cache in caches
+                    ):
+                        raise ValueError("Mooncake Step5 requires whole, internally contiguous cache blocks")
                 shared_page_metadata = (
                     self._get_shared_page_metadata(caches)
                     if isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
@@ -343,6 +406,15 @@ class MooncakeBaseConnectorWorker:
                         block_shapes.append(block_shape)
                         block_size_scales.append(tensor_num_blocks // self.num_blocks)
 
+                if getattr(self.vllm_config.model_config.hf_text_config, "model_type", None) == "step5":
+                    _validate_step5_components(
+                        spec,
+                        block_shapes,
+                        block_lens,
+                        block_strides,
+                        block_size_scales,
+                        [str(cache.dtype) for cache in caches],
+                    )
                 layer_names.append(layer_name)
                 layer_block_size = spec.block_size
                 if isinstance(spec, AscendSFAIndexerCacheSpec):
@@ -382,6 +454,12 @@ class MooncakeBaseConnectorWorker:
             block_size_scales=block_size_scales_per_layer,
             local_ip=self.side_channel_host,
             handshake_port=self.handshake_port,
+            is_step5=getattr(self.vllm_config.model_config.hf_text_config, "model_type", None) == "step5",
+            block_dtypes=[
+                [str(cache.dtype) for cache in as_kv_cache_tensors(kv_caches[layer_name])] for layer_name in layer_names
+            ]
+            if getattr(self.vllm_config.model_config.hf_text_config, "model_type", None) == "step5"
+            else None,
         )
         self.transfer_metadata = transfer_metadata
         self.xfer_handshake_metadata = transfer_metadata
