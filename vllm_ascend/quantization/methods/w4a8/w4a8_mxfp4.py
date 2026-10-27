@@ -243,3 +243,14 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
         layer.w2_weight_scale.data = (
             layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).view(torch.uint8).transpose(-3, -2)
         )
+
+
+@register_scheme("W4A8_MXFP_DS", "moe")
+class AscendW4A8MXFPDSMoEScheme(AscendW4A8MXFPDSDynamicFusedMoEMethod):
+    """W4A8 MXFP MoE for Step5 (LLM-Compressor / DS-original e8m0 scale).
+
+    Same as ``ds_w4a8_moe`` but reachable through the ModelSlim
+    ``quant_model_description.json`` ("W4A8_MXFP_DS" / layer_type "moe") so
+    Step5 checkpoints whose ``weight_scale`` is stored as ``float8_e8m0fnu``
+    (e.g. ``moe_backend=deep_gemm``) are handled correctly.
+    """

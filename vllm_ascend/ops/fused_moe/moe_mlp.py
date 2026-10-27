@@ -312,12 +312,20 @@ def quant_apply_mlp(
                 "output_dtype": torch.bfloat16,
             }
             if use_mxfp_quant:
-                gmm1_kwargs.update(
-                    {
-                        "scale_dtype": torch_npu.float8_e8m0fnu,
-                        "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
-                    }
-                )
+                if mxfp_quant_dtype == QuantType.W4A8MXFP:
+                    gmm1_kwargs.pop("scale", None)
+                    gmm1_kwargs["antiquant_scale"] = (
+                        w1_scale if isinstance(w1_scale, list) else [w1_scale]
+                    )
+                    gmm1_kwargs["weight_dtype"] = weight_quant_type
+                    gmm1_kwargs["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
+                else:
+                    gmm1_kwargs.update(
+                        {
+                            "scale_dtype": torch_npu.float8_e8m0fnu,
+                            "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
+                        }
+                    )
             hidden_states = torch_npu.npu_grouped_matmul(**gmm1_kwargs)[0]
             hidden_states = AscendSwigluStepAndMul.swiglustep_forward(
                 hidden_states,
@@ -552,6 +560,16 @@ def quant_apply_mlp(
                             "antiquant_scale": scale,
                             "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
                             "weight_dtype": torch_npu.float4_e2m1fn_x2,
+                            "output_dtype": torch.bfloat16,
+                        }
+                    )
+                elif mxfp_quant_dtype == QuantType.W4A8MXFP:
+                    gmm1_kwargs.update(
+                        {
+                            "scale": None,
+                            "antiquant_scale": scale,
+                            "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
+                            "weight_dtype": weight_quant_type,
                             "output_dtype": torch.bfloat16,
                         }
                     )
