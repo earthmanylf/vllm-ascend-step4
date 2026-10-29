@@ -3,6 +3,12 @@ FROM ${BASE_IMAGE}
 USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV TORCH_DEVICE_BACKEND_AUTOLOAD=0 SOC_VERSION=ascend950dt_9582 MAX_JOBS=16 CARGO_BUILD_JOBS=16
+# vllm-ascend is compiled from the archive the build context carries, which is
+# exported from the current HEAD. The image has no .git, so setup.py cannot
+# derive a version: the build passes it in. Default keeps an unversioned build
+# obviously unversioned instead of silently claiming a pinned one.
+ARG VLLM_ASCEND_VERSION=0.0.0
+ARG VLLM_ASCEND_COMMIT=unknown
 # CANN 9.2.0 formal release from quay.io/ascend/cann:9.2.0-950-openeuler24.03-py3.12-devel
 COPY cann92-release/cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz /opt/upgrade/cann92-release/cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz
 RUN echo '6068329c27a345701d5cb7c1f76b7264f2c3320df9cfe2f8673ff37186f45c8f  /opt/upgrade/cann92-release/cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz' | sha256sum -c - && \
@@ -33,7 +39,7 @@ RUN source /opt/upgrade/cann92-env.sh && python3 -m pip uninstall -y vllm && \
     python3 -m pip install -e /opt/upgrade/src/vllm --no-build-isolation --no-deps
 COPY cann92-build-env.sh /opt/upgrade/cann92-build-env.sh
 RUN source /opt/upgrade/cann92-build-env.sh && cd /opt/upgrade/src/vllm-ascend && \
-    COMPILE_CUSTOM_KERNELS=1 SETUPTOOLS_SCM_PRETEND_VERSION=0.19.1rc2.dev2977+g143f3649d8 \
+    COMPILE_CUSTOM_KERNELS=1 SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_ASCEND_VERSION}" \
     python3 -m pip wheel . --no-build-isolation --no-deps -w /opt/upgrade/wheels && \
     cd /tmp && python3 -m pip uninstall -y vllm-ascend && \
     python3 -m pip install --force-reinstall --no-deps /opt/upgrade/wheels/vllm_ascend-*.whl
@@ -47,7 +53,9 @@ RUN source /opt/upgrade/cann92-build-env.sh && cd /opt/upgrade/source-assets/ops
     bash build.sh --torch_extension && python3 /opt/upgrade/install_ops.py build_out && \
     cd /tmp && python3 /opt/upgrade/probe_environment.py > /opt/upgrade/evidence/development.json
 COPY cann92-entrypoint.sh /opt/upgrade/cann92-entrypoint.sh
-LABEL org.opencontainers.image.base.name="quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler" \
+LABEL step5.vllm-ascend.version="${VLLM_ASCEND_VERSION}" \
+      step5.vllm-ascend.commit="${VLLM_ASCEND_COMMIT}" \
+      org.opencontainers.image.base.name="quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler" \
       step5.cann.version="9.2.0" step5.cann.arm64.manifest="sha256:811ca9bb37475ba1a8db6cd1f52731651c13f5860a4cfb58773a32e603e02f57"
 WORKDIR /workspace
 ENTRYPOINT ["/bin/bash", "/opt/upgrade/cann92-entrypoint.sh"]
