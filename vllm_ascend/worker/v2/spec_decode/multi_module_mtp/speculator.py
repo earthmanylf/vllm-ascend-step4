@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
+import os
 from typing import Any
 
 import torch
@@ -33,8 +34,14 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
     """Run upstream's multi-head MTP algorithm in one Ascend draft graph."""
 
     draft_attn_state = AscendAttentionState.SpecDecoding
+    # Exact draft KV lengths need a device readback that drains the whole target
+    # forward before the drafter builds its metadata, costing one full device
+    # pass per step. The metadata builder falls back to the per-request CPU
+    # upper bound when no exact list is supplied, so keep the readback opt-in.
+    _exact_draft_seq_lens: bool = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        self._exact_draft_seq_lens = bool(int(os.getenv("VLLM_ASCEND_MTP_EXACT_SEQ_LENS", "0")))
         parallel_config = vllm_config.parallel_config
         if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
             raise NotImplementedError("Ascend multi-module MTP currently requires PCP=1 and DCP=1")
@@ -118,10 +125,14 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
 
     def _prepare_inputs(self, *args, **kwargs) -> None:
         super()._prepare_inputs(*args, **kwargs)
-        # Multi-module re-prefill rewinds by max(rejected - 1, 0), unlike AR.
-        # Snapshot the exact upstream result once per proposal. FIA's host-side
-        # length lists require this synchronization; there is no per-head D2H.
-        self.input_buffers.seq_lens_cpu.copy_(self.input_buffers.seq_lens.to(device="cpu"))
+        # Multi-module re-prefill rewinds by max(rejected - 1, 0), unlike AR, so
+        # the exact result only exists on the device. Reading it back here blocks
+        # on the target forward that was just submitted and unloads the host
+        # run-ahead for a whole step. Upstream computes the same rewind inside
+        # its prepare-inputs kernel and hands the builder a CPU *upper* bound, so
+        # keep the readback opt-in for backends that really need exact lengths.
+        if self._exact_draft_seq_lens:
+            self.input_buffers.seq_lens_cpu.copy_(self.input_buffers.seq_lens.to(device="cpu"))
 
     def _build_attn_metadata(
         self,
@@ -189,7 +200,7 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
             self.input_buffers.positions,
             batch_desc.num_tokens,
             torch.from_numpy(self.input_batch.is_prefilling_np),
-            seq_lens_cpu=self.input_buffers.seq_lens_cpu,
+            seq_lens_cpu=self.input_buffers.seq_lens_cpu if self._exact_draft_seq_lens else None,
             attn_state=self.draft_attn_state,
             parallel_config=self.draft_vllm_config.parallel_config,
             offload_kwargs=offload_kwargs,
