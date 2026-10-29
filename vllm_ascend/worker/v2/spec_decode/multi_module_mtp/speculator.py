@@ -46,14 +46,6 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
         if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
             raise NotImplementedError("Ascend multi-module MTP currently requires PCP=1 and DCP=1")
         super().__init__(vllm_config, device)
-        transfer = getattr(vllm_config, "kv_transfer_config", None)
-        text = getattr(getattr(vllm_config, "model_config", None), "hf_text_config", None)
-        self._step5_mtp_seed_consumer = bool(
-            transfer is not None
-            and transfer.is_kv_consumer
-            and getattr(text, "model_type", None) == "step5"
-            and vllm_config.speculative_config.num_speculative_tokens == 3
-        )
         num_modules = self.draft_model_config.hf_config.num_nextn_predict_layers
         if self.num_speculative_steps > num_modules:
             raise NotImplementedError(
@@ -107,7 +99,6 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
     ) -> torch.Tensor:
         self.input_batch = input_batch
         self._multi_module_attn_metadata = None
-        self._mtp_seed_restore_active = not (dummy_run or is_profile)
         try:
             with build_attn_metadata_wrapper(), torch_gather_wrapper():
                 return super().propose(
@@ -131,19 +122,8 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
                 )
         finally:
             self._multi_module_attn_metadata = None
-            self._mtp_seed_restore_active = False
 
     def _prepare_inputs(self, *args, **kwargs) -> None:
-        if getattr(self, "_step5_mtp_seed_consumer", False) and getattr(self, "_mtp_seed_restore_active", False):
-            from vllm.distributed.kv_transfer import get_kv_transfer_group
-
-            from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.mtp_state import restore_mtp_seed_batch
-
-            states = get_kv_transfer_group().get_mtp_seed_store()
-            if states:
-                batch = kwargs["input_batch"] if "input_batch" in kwargs else args[1]
-                rejected = kwargs["num_rejected"] if "num_rejected" in kwargs else args[5]
-                restore_mtp_seed_batch(self, batch, rejected, states)
         super()._prepare_inputs(*args, **kwargs)
         # Multi-module re-prefill rewinds by max(rejected - 1, 0), unlike AR, so
         # the exact result only exists on the device. Reading it back here blocks

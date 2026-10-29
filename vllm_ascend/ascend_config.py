@@ -569,9 +569,8 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: (
-            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
-        )
+        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
+        == DeviceAdaptorFamily.FP8_OPTIMIZED
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -758,17 +757,27 @@ class AscendConfig:
             and vc.parallel_config.enable_expert_parallel
             and vc.parallel_config.tensor_parallel_size > 1
         )
-        # Respect upstream backend selection; SP eligibility is shared with
-        # the model and MoE configuration through ParallelConfig.
-        if (
-            "enable_flashcomm1" in (vc.additional_config or {})
-            or os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1") is not None
-        ):
-            logger.warning_once(
-                "FlashComm is deprecated; remove enable_flashcomm1 and "
-                "VLLM_ASCEND_ENABLE_FLASHCOMM1. Use --all2all-backend with "
-                "--enable-expert-parallel to configure MoE sequence parallelism."
+        # FlashComm remains the SP MoE switch on Ascend.
+        flashcomm_explicitly_enabled = validate_additional_config_bool(
+            (vc.additional_config or {}).get("enable_flashcomm1", False),
+            "additional_config.enable_flashcomm1",
+        ) or os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower() in ("1", "true")
+        # DSA-CP depends on FlashComm: auto-enable FlashComm when DSA-CP is on
+        # so users only need `enable_dsa_cp=true` in additional_config.
+        if self.enable_dsa_cp and not flashcomm_explicitly_enabled:
+            logger.info_once("DSA-CP is enabled. Auto-enabling FlashComm .")
+
+        effective_flashcomm = flashcomm_explicitly_enabled or self.enable_dsa_cp
+
+        if not effective_flashcomm:
+            vllm_config.parallel_config.all2all_backend = (
+                "flashinfer_all2allv"  # TODO: a tricky way to disable SP moe. Disable this when SP is supported.
             )
+            logger.info_once("FlashComm1 is disabled. Using flashinfer_all2allv as the all2all backend.")
+        elif not vc.parallel_config.use_sequence_parallel_moe:
+            logger.warning_once("FlashComm1 is enabled, but the current config does not support sp MoE. Disabling")
+        else:
+            logger.info_once("FlashComm1 is enabled.")
 
         if self.enable_dsa_cp:
             tp_size = vc.parallel_config.tensor_parallel_size

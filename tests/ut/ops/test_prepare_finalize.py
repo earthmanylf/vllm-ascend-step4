@@ -133,47 +133,6 @@ class TestPrepareAndFinalize(unittest.TestCase):
                     self.assertEqual(len(prepared_ids), len(expected_mask))
                     torch.testing.assert_close(layer.finalize(prepared.hidden_states, reduce_results=False), local)
 
-    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=4)
-    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank")
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
-    def test_mc2_sp_preserves_profile_sized_shards(self, mock_context, mock_tp_rank, mock_tp_size):
-        """Prepare consumes the o_proj shard without splitting it again.
-
-        Missing attention metadata does not bypass o_proj: projection must
-        reduce-scatter before handing its output to the SP MoE path.
-        """
-        tp_size = 4
-        num_tokens = 512
-        padded_num_tokens = 512
-        shard_size = num_tokens // tp_size
-
-        hidden = torch.arange(num_tokens * 8, dtype=torch.float32).reshape(num_tokens, 8)
-        logits = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
-        context = MagicMock()
-        context.mc2_mask = torch.ones(padded_num_tokens, dtype=torch.bool)
-        context.padded_num_tokens = padded_num_tokens
-        mock_context.return_value = context
-
-        for rank in range(tp_size):
-            with self.subTest(rank=rank):
-                mock_tp_rank.return_value = rank
-                layer = PrepareAndFinalizeWithMC2(self.moe_config)
-                expected_shard = hidden[rank * shard_size : (rank + 1) * shard_size]
-                expected_logits = logits[rank * shard_size : (rank + 1) * shard_size]
-                with patch("vllm_ascend.ops.fused_moe.prepare_finalize.sequence_parallel_chunk") as chunk:
-                    prepared = layer.prepare(expected_shard, expected_logits, replace_allreduce=True)
-                chunk.assert_not_called()
-                expected_mask = context.mc2_mask[rank * shard_size : (rank + 1) * shard_size]
-                torch.testing.assert_close(prepared.hidden_states[:shard_size], expected_shard)
-                torch.testing.assert_close(prepared.router_logits[:shard_size], expected_logits)
-                torch.testing.assert_close(prepared.mc2_mask, expected_mask)
-                self.assertEqual(prepared.hidden_states.shape[0], shard_size)
-                self.assertEqual(prepared.router_logits.shape[0], shard_size)
-                torch.testing.assert_close(
-                    layer.finalize(prepared.hidden_states, reduce_results=False),
-                    expected_shard,
-                )
-
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=2)
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")

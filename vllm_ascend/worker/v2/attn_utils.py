@@ -89,7 +89,6 @@ from vllm_ascend.core.kv_cache_interface import (
     supports_component_major_mla_pd,
 )
 from vllm_ascend.core.step5_kv_cache import (
-    allocate_step5_pd_blnhc,
     allocate_step5_shared_kv_backing,
     allocate_step5_tailring_shared_backing,
     step5_blnhc_layer_views,
@@ -1409,11 +1408,7 @@ def allocate_kv_cache_main(
         specs = validate_step5_blnhc_descriptors(kv_cache_config, layout)
         if any(size != 128 for size in kernel_block_sizes):
             raise ValueError("Step5 BLNHC currently requires 128-token kernel blocks")
-        transfer = vllm_config.kv_transfer_config
-        if transfer is not None and transfer.is_kv_transfer_instance:
-            caches = allocate_step5_pd_blnhc(kv_cache_config, device, layout, kernel_block_sizes)
-        else:
-            caches = allocate_upstream_kv_cache(kv_cache_config, device, layout, kernel_block_sizes)
+        caches = allocate_upstream_kv_cache(kv_cache_config, device, layout, kernel_block_sizes)
         return step5_blnhc_layer_views(caches, specs)
     if supports_step5_tailring_shared_backing(vllm_config, kv_cache_config.kv_cache_groups):
         return allocate_step5_tailring_shared_backing(

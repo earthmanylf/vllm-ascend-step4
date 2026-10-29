@@ -7,7 +7,6 @@ and the network engine are doubles, never the address or block mapping logic.
 
 import ast
 import ctypes
-import importlib.util
 import math
 import os
 import queue
@@ -236,6 +235,7 @@ def test_step5_rejects_topology_before_transfer(production, field, value):
         ("block_shapes", [[(2, 16, 4)]]),
         ("block_lens", [[64]]),
         ("block_dtypes", [["torch.float16"]]),
+        ("group_indices", [1]),
         ("layer_block_sizes", [32]),
         ("block_size_scales", [[2]]),
     ],
@@ -400,11 +400,11 @@ def registration(dtype_registry):
     return namespace
 
 
-def register_cpu(registration, caches, specs, *, kv_cache_config=None, return_worker=False):
+def register_cpu(registration, caches, specs):
     worker = registration["MooncakeBaseConnectorWorker"].__new__(registration["MooncakeBaseConnectorWorker"])
     names = list(caches)
     worker.vllm_config = NS(model_config=NS(hf_text_config=NS(model_type="step5")))
-    worker.kv_cache_config = kv_cache_config or NS(
+    worker.kv_cache_config = NS(
         num_blocks=8,
         kv_cache_groups=[NS(layer_names=[name], kv_cache_spec=spec) for name, spec in zip(names, specs)],
         kv_cache_tensors=[NS(layers=[name], size=0) for name in names],
@@ -412,251 +412,11 @@ def register_cpu(registration, caches, specs, *, kv_cache_config=None, return_wo
     worker.ascend_config = NS(kvpp_config=NS(size=1))
     worker.pcp_rank = worker.tp_rank = 0
     worker.tp_size = 1
-    worker.block_size = 16 if kv_cache_config is None else kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+    worker.block_size = 16
     worker.engine_id, worker.te_rpc_port = "cpu-fixture", 9000
     worker.side_channel_host, worker.handshake_port = "localhost", 5000
     worker.register_kv_caches(caches)
-    return worker if return_worker else worker.transfer_metadata
-
-
-@pytest.fixture
-def mixed_page_plan(production, registration):
-    fixture_path = ROOT / "tests/ut/worker/v2/test_step5_kv_contract.py"
-    module_spec = importlib.util.spec_from_file_location("mixed_page_cpu_fixture", fixture_path)
-    cpu_fixture = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(cpu_fixture)
-    upstream = cpu_fixture.pd_upstream_fixture(counts=(2, 2, 0))
-    layout = upstream.helper.KVCacheLayout.BLNHC
-    upstream.cfg.cache_config.get_resolved_kv_cache_layout = lambda: layout
-    specs = {
-        name: replace(spec, block_stride_alignment=384)
-        if name.startswith("main.")
-        else replace(spec, page_size_padded=None)
-        for name, spec in upstream.specs.items()
-    }
-    groups = upstream.planner.get_kv_cache_groups(upstream.cfg, specs)
-    assert len(groups) == 1
-    assert isinstance(groups[0].kv_cache_spec, upstream.planner.UniformTypeKVCacheSpecs)
-    stride = upstream.planner._pool_bytes_per_block(upstream.cfg, groups)
-    planned = upstream.planner.get_kv_cache_config_from_groups(upstream.cfg, groups, 8 * stride)
-    assert planned.num_blocks == 8
-    assert stride == 205056  # Four-layer tile, rounded to the main backend's 384-byte alignment.
-    assert {descriptor.block_stride for descriptor in planned.kv_cache_tensors} == {stride}
-    # Replace only spec containers with their real upstream classes. Mapping,
-    # registration, rank selection and address methods remain production code.
-    for namespace in (registration, production.__init__.__globals__):
-        for name in ("FullAttentionSpec", "SlidingWindowSpec", "CircularBufferSpec", "UniformTypeKVCacheSpecs"):
-            namespace[name] = getattr(upstream.planner, name)
-        namespace["is_circular_kv_cache_spec"] = lambda spec: isinstance(spec, upstream.planner.CircularBufferSpec)
-    return NS(upstream=upstream, layout=layout, specs=specs, planned=planned, stride=stride)
-
-
-def mixed_page_storage(plan, *, producer_rank=None):
-    prefix, suffix = 64, 64
-    raw = torch.full((prefix + plan.planned.kv_cache_tensors[0].size + suffix,), 0xA5, dtype=torch.uint8)
-    backing = raw[prefix:-suffix]
-    canonical = {}
-    for descriptor in plan.planned.kv_cache_tensors:
-        spec = plan.specs[descriptor.layers[0]]
-        views = plan.upstream.planner.create_kv_cache_views(
-            backing, spec, plan.planned.num_blocks, plan.layout, descriptor
-        )
-        canonical.update(zip(descriptor.layers, views))
-    layer_specs = plan.upstream.helper.validate_step5_blnhc_descriptors(plan.planned, plan.layout)
-    caches = plan.upstream.helper.step5_blnhc_layer_views(canonical, layer_specs)
-    for layer_index, value in enumerate(caches.values()):
-        for component_index, view in enumerate(value if isinstance(value, tuple) else (value,)):
-            assert view.storage_offset() > 0
-            if producer_rank is not None:
-                for block in range(plan.planned.num_blocks):
-                    # Rank tags distinguish replica sources without mocking selection.
-                    view[block].fill_(1 + producer_rank * 40 + layer_index * 8 + component_index * 2 + block)
-    return raw, caches
-
-
-@pytest.mark.parametrize("prompt_tokens", [128, 129, 256])
-def test_step5_mixed_page_per_layer_cpu_roundtrip(production, registration, mixed_page_plan, prompt_tokens):
-    plan = mixed_page_plan
-    local_raw, local_caches = mixed_page_storage(plan)
-    worker = register_cpu(registration, local_caches, [], kv_cache_config=plan.planned, return_worker=True)
-    local = worker.transfer_metadata
-    assert worker.layer_name_to_group_index == {name: 0 for name in plan.specs}
-    assert worker.layer_name_to_spec_index == {"main.0": 0, "main.1": 0, "summary.0": 1, "summary.1": 1}
-    assert worker.kv_cache_specs == [plan.specs["main.0"], plan.specs["summary.0"]]
-    assert local.block_lens == [[49152, 49152], [49152, 49152], [4096], [4096]]
-    assert local.block_strides == [[plan.stride] * len(parts) for parts in local.block_lens]
-    assert local.block_size_scales == [[1] * len(parts) for parts in local.block_lens]
-    assert local.layer_block_sizes == [128] * 4
-    assert local.block_size == 128
-    regions = registration["collect_configured_register_regions"](plan.planned, local_caches)
-    assert len(regions.ptrs) == len(regions.lengths) == 1
-    for layer, name in enumerate(local.layer_names):
-        value = local_caches[name]
-        views = value if isinstance(value, tuple) else (value,)
-        assert local.kv_caches_base_addr[layer] == [view.data_ptr() for view in views]
-        assert worker._get_shared_page_metadata(views) is None
-        for view in views:
-            span = (plan.planned.num_blocks - 1) * plan.stride + view[0].numel() * view.element_size()
-            assert regions.ptrs[0] <= view.data_ptr()
-            assert view.data_ptr() + span <= regions.ptrs[0] + regions.lengths[0]
-    peers, peer_storage = {}, {}
-    for rank in range(4):
-        raw, caches = mixed_page_storage(plan, producer_rank=rank)
-        peer_storage[rank] = (raw, caches, raw.clone())
-        peers[rank] = register_cpu(registration, caches, [], kv_cache_config=plan.planned)
-    scheduler = registration["MooncakeSchedulerSendingThread"].__new__(registration["MooncakeSchedulerSendingThread"])
-    scheduler.engine_id = local.engine_id
-    scheduler.pp_size = scheduler.pcp_size = 1
-    scheduler.tp_size = 4
-    scheduler.use_kv_pp = False
-    remote = scheduler._merge_metadata_by_pp_rank(peers)[0]
-    topology = NS(
-        is_step5=True, pp_size=1, pcp_size=1, dcp_size=1, tp_size=4, use_kv_pp=False, metadata_by_pp_rank={0: remote}
-    )
-    thread = thread_from(production, worker.kv_cache_specs, local, rank=3)
-    thread.spec_indices = [worker.layer_name_to_spec_index[name] for name in local.layer_names]
-    thread.kv_caches_base_addr = local.kv_caches_base_addr
-    groups, pairs = thread._build_remote_transfer_layout(topology)
-    assert groups[0] == {(0, 0): [[3]], (1, 1): [[3]], (2, 2): [[0, 1, 2, 3]], (3, 3): [[0, 1, 2, 3]]}
-    blocks = (prompt_tokens + 127) // 128
-    requests = {
-        f"req.{index}": NS(
-            local_block_ids=([1 + index * 2, 2 + index * 2][:blocks],),
-            local_full_block_ids=([1 + index * 2, 2 + index * 2][:blocks],),
-            remote_block_ids=([3 + index * 2, 4 + index * 2][:blocks],),
-            local_num_prompt_tokens=prompt_tokens,
-            remote_num_prompt_tokens=prompt_tokens,
-            num_computed_tokens=0,
-        )
-        for index in range(2)
-    }
-    mapping_cache = {}
-    buckets, _ = thread._build_transfer_block_buckets(remote, pairs[0], groups[0], 1, 1, requests, mapping_cache)
-    assert {rank: set(specs) for rank, specs in buckets.items()} == {(0, 3): {0}, (0, 0): {1}, (0, 1): {1}}
-    assert all(len(cache) == 2 for cache in mapping_cache.values())
-    expected = local_raw.clone()
-    transferred_bytes = 0
-    for (_, rank), specs in buckets.items():
-        for spec_index, entries in specs.items():
-            targets, sources, lengths = [], [], []
-            thread._append_spec_transfer_addresses(
-                spec_index, 0, rank, 1, 4, 1, entries, remote, targets, sources, lengths
-            )
-            assert len(lengths) == sum(
-                len(items) * len(local.block_lens[layer]) * blocks for (layer, _), items in entries.items()
-            )
-            assert all(length in (49152, 4096) for length in lengths)
-            for (layer, _), items in entries.items():
-                name = local.layer_names[layer]
-                dst_views = local_caches[name]
-                src_views = peer_storage[rank][1][name]
-                dst_views = dst_views if isinstance(dst_views, tuple) else (dst_views,)
-                src_views = src_views if isinstance(src_views, tuple) else (src_views,)
-                for _, local_ids, remote_ids in items:
-                    for dst_view, src_view in zip(dst_views, src_views):
-                        for local_id, remote_id in zip(local_ids, remote_ids):
-                            dst_offset = (dst_view.data_ptr() - local_raw.data_ptr()) + local_id * plan.stride
-                            src_offset = (
-                                src_view.data_ptr() - peer_storage[rank][0].data_ptr()
-                            ) + remote_id * plan.stride
-                            payload = dst_view[0].numel() * dst_view.element_size()
-                            expected[dst_offset : dst_offset + payload] = peer_storage[rank][0][
-                                src_offset : src_offset + payload
-                            ]
-            assert len(targets) == len(sources) == len(lengths)
-            for target, source, length in zip(targets, sources, lengths):
-                assert local_raw.data_ptr() <= target <= local_raw.data_ptr() + local_raw.numel() - length
-                peer_raw = peer_storage[rank][0]
-                assert peer_raw.data_ptr() <= source <= peer_raw.data_ptr() + peer_raw.numel() - length
-                ctypes.memmove(target, source, length)
-            # Compare the whole backing after each spec/rank, including other
-            # layers, null/unselected blocks, tile holes and storage guards.
-            assert torch.equal(local_raw, expected)
-            transferred_bytes += sum(lengths)
-    assert transferred_bytes == 2 * blocks * (2 * 98304 + 2 * 4096)
-    assert all(torch.equal(raw, before) for raw, _, before in peer_storage.values())
-
-
-@pytest.mark.parametrize("prompt_tokens,hit_tokens", [(129, 128), (256, 128), (513, 128), (513, 256), (513, 512)])
-def test_step5_mixed_pages_preserve_cached_prefix(production, registration, mixed_page_plan, prompt_tokens, hit_tokens):
-    plan = mixed_page_plan
-    local_raw, local_caches = mixed_page_storage(plan)
-    remote_raw, remote_caches = mixed_page_storage(plan, producer_rank=3)
-    worker = register_cpu(registration, local_caches, [], kv_cache_config=plan.planned, return_worker=True)
-    local = worker.transfer_metadata
-    peer = register_cpu(registration, remote_caches, [], kv_cache_config=plan.planned)
-    sender = registration["MooncakeSchedulerSendingThread"].__new__(registration["MooncakeSchedulerSendingThread"])
-    sender.engine_id = peer.engine_id
-    sender.pp_size = sender.pcp_size = 1
-    sender.tp_size = 4
-    sender.use_kv_pp = False
-    remote = sender._merge_metadata_by_pp_rank({rank: peer for rank in range(4)})[0]
-    topology = NS(
-        is_step5=True, pp_size=1, pcp_size=1, dcp_size=1, tp_size=4, use_kv_pp=False, metadata_by_pp_rank={0: remote}
-    )
-    receiver = thread_from(production, worker.kv_cache_specs, local, rank=3)
-    receiver.spec_indices = [worker.layer_name_to_spec_index[name] for name in local.layer_names]
-    receiver.kv_caches_base_addr = local.kv_caches_base_addr
-    groups, pairs = receiver._build_remote_transfer_layout(topology)
-    pages = (prompt_tokens + 127) // 128
-    cached_pages = hit_tokens // 128
-    d_ids, p_ids = list(range(1, 1 + pages)), list(range(2, 2 + pages))
-    request = NS(
-        local_block_ids=(d_ids[cached_pages:],),
-        local_full_block_ids=(d_ids,),
-        remote_block_ids=(p_ids,),
-        local_num_prompt_tokens=prompt_tokens + 1,
-        remote_num_prompt_tokens=prompt_tokens,
-        num_computed_tokens=hit_tokens,
-    )
-    buckets, _ = receiver._build_transfer_block_buckets(remote, pairs[0], groups[0], 1, 1, {"hit": request}, {})
-    expected, producer_before = local_raw.clone(), remote_raw.clone()
-    copied_bytes = 0
-    for (_, rank), specs in buckets.items():
-        for spec_index, entries in specs.items():
-            targets, sources, lengths = [], [], []
-            receiver._append_spec_transfer_addresses(
-                spec_index, 0, rank, 1, 4, 1, entries, remote, targets, sources, lengths
-            )
-            for (layer, _), requests in entries.items():
-                for _, local_ids, remote_ids in requests:
-                    assert local_ids == d_ids[cached_pages:]
-                    assert remote_ids == p_ids[cached_pages:]
-                    name = local.layer_names[layer]
-                    d_views, p_views = local_caches[name], remote_caches[name]
-                    d_views = d_views if isinstance(d_views, tuple) else (d_views,)
-                    p_views = p_views if isinstance(p_views, tuple) else (p_views,)
-                    for dv, pv in zip(d_views, p_views):
-                        payload = dv[0].numel() * dv.element_size()
-                        for di, pi in zip(local_ids, remote_ids):
-                            start = dv.data_ptr() - local_raw.data_ptr() + di * plan.stride
-                            source = pv.data_ptr() - remote_raw.data_ptr() + pi * plan.stride
-                            expected[start : start + payload] = remote_raw[source : source + payload]
-            for target, source, length in zip(targets, sources, lengths):
-                ctypes.memmove(target, source, length)
-            copied_bytes += sum(lengths)
-    assert torch.equal(local_raw, expected)  # prefix, null, gaps and other requests unchanged
-    assert torch.equal(remote_raw, producer_before)
-    assert copied_bytes == (pages - cached_pages) * (2 * 98304 + 2 * 4096)
-
-
-def test_step5_mixed_page_cow_preserves_source_null_and_tile_holes(mixed_page_plan):
-    plan = mixed_page_plan
-    raw, caches = mixed_page_storage(plan, producer_rank=2)
-    namespace = {"torch": torch}
-    load_definitions(ROOT / "vllm_ascend/worker/utils.py", {"copy_kv_cache_blocks_inplace"}, namespace)
-    before, expected = raw.clone(), raw.clone()
-    copies = [NS(src_block_id=1, dst_block_id=2), NS(src_block_id=2, dst_block_id=1)]
-    for value in caches.values():
-        for view in value if isinstance(value, tuple) else (value,):
-            payload = view[0].numel() * view.element_size()
-            offset = view.data_ptr() - raw.data_ptr()
-            for copy in copies:
-                source = offset + copy.src_block_id * plan.stride
-                target = offset + copy.dst_block_id * plan.stride
-                expected[target : target + payload] = before[source : source + payload]
-    namespace["copy_kv_cache_blocks_inplace"](caches.values(), plan.planned.num_blocks, copies)
-    assert torch.equal(raw, expected)
+    return worker.transfer_metadata
 
 
 def test_step5_registration_requires_dense_inner_blocks(registration):
@@ -766,162 +526,6 @@ def test_step5_all_groups_registered_cpu_roundtrip(production, registration, pro
                 expected[start : start + count] = remote_raws[raw_index][source : source + count]
             assert torch.equal(local_raws[raw_index], expected)
             raw_index += 1
-
-
-@pytest.mark.parametrize("prompt_tokens", [128, 129])
-def test_step5_pp4_registered_multigroup_byte_roundtrip(production, registration, prompt_tokens):
-    specs = [
-        FullAttentionSpec(block_size=128),
-        FullAttentionSpec(
-            block_size=128, num_kv_heads=1, head_size=256, head_size_v=0, dtype=torch.uint8, tokens_per_state=8
-        ),
-        CircularBufferSpec(block_size=128),
-        FullAttentionSpec(block_size=128),
-    ]
-    shapes = [(128, 2, 4), (1, 16, 256), (1, 128, 32), (128, 2, 4)]
-    names_by_group = [[f"model.layers.{pp}.{kind}" for pp in range(4)] for kind in ("main", "summary", "ring")]
-    names_by_group.append(["draft.layers.92.attn"])
-    target, sources, raw_refs = {}, [{} for _ in range(4)], []
-    for group, (spec, shape, names) in enumerate(zip(specs, shapes, names_by_group)):
-        for index, name in enumerate(names):
-            pp = index if group < 3 else 3
-            dst_views, src_views = [], []
-            for component in range(2 if group in (0, 3) else 1):
-                elements = math.prod(shape)
-                dst_raw = torch.full((8 * (elements + 16) + 16,), 5, dtype=spec.dtype)
-                src_raw = torch.arange(8 * (elements + 32) + 16).to(spec.dtype)
-                inner = (shape[1] * shape[2], shape[2], 1)
-                dst_view = torch.as_strided(dst_raw, (8, *shape), (elements + 16, *inner), 8)
-                src_view = torch.as_strided(src_raw, (8, *shape), (elements + 32, *inner), 8)
-                dst_views.append(dst_view)
-                src_views.append(src_view)
-                raw_refs.append((group, dst_raw, src_raw, dst_view, src_view))
-            target[name] = tuple(dst_views)
-            sources[pp][name] = tuple(src_views)
-
-    def configuration(caches):
-        return NS(
-            num_blocks=8,
-            kv_cache_groups=[
-                NS(layer_names=[n for n in names if n in caches], kv_cache_spec=spec)
-                for names, spec in zip(names_by_group, specs)
-            ],
-            kv_cache_tensors=[NS(layers=[name], size=0) for name in caches],
-        )
-
-    local_worker = register_cpu(registration, target, specs, kv_cache_config=configuration(target), return_worker=True)
-    metadata_by_rank = {
-        (pp, 0): register_cpu(registration, caches, specs, kv_cache_config=configuration(caches))
-        for pp, caches in enumerate(sources)
-    }
-    scheduler_cls = registration["MooncakeSchedulerSendingThread"]
-    scheduler = scheduler_cls.__new__(scheduler_cls)
-    scheduler.engine_id = "cpu-fixture"
-    scheduler.pp_size, scheduler.tp_size, scheduler.pcp_size = 4, 1, 1
-    scheduler.use_kv_pp = False
-    stages = scheduler._merge_metadata_by_pp_rank(metadata_by_rank)
-    topology = NS(
-        is_step5=True, pp_size=4, tp_size=1, pcp_size=1, dcp_size=1, use_kv_pp=False, metadata_by_pp_rank=stages
-    )
-    thread = thread_from(production, local_worker.kv_cache_specs, local_worker.transfer_metadata, rank=0, tp=1)
-    thread.spec_indices = [local_worker.layer_name_to_spec_index[n] for n in thread.layer_names]
-    thread.kv_caches_base_addr = local_worker.transfer_metadata.kv_caches_base_addr
-    groups, pairs = thread._build_remote_transfer_layout(topology)
-    count = 1 if prompt_tokens == 128 else 2
-    local_ids = ([1, 2][:count], [3, 4][:count], [5], [2, 3][:count])
-    remote_ids = ([4, 5][:count], [1, 2][:count], [6], [3, 4][:count])
-    request = NS(
-        local_block_ids=local_ids,
-        local_full_block_ids=local_ids,
-        remote_block_ids=remote_ids,
-        local_num_prompt_tokens=prompt_tokens,
-        remote_num_prompt_tokens=prompt_tokens,
-        num_computed_tokens=0,
-    )
-    for pp, stage in stages.items():
-        buckets, _ = thread._build_transfer_block_buckets(stage, pairs[pp], groups[pp], 1, 1, {"req": request}, {})
-        src, dst, lengths = [], [], []
-        for spec_index, entries in buckets[(0, 0)].items():
-            thread._append_spec_transfer_addresses(spec_index, 0, 0, 1, 1, 1, entries, stage, src, dst, lengths)
-        for target_ptr, source_ptr, length in zip(src, dst, lengths):
-            ctypes.memmove(target_ptr, source_ptr, length)
-    for group, dst_raw, src_raw, dst_view, src_view in raw_refs:
-        expected = torch.full_like(dst_raw, 5)
-        for local_id, remote_id in zip(local_ids[group], remote_ids[group]):
-            start = dst_view.storage_offset() + local_id * dst_view.stride(0)
-            source = src_view.storage_offset() + remote_id * src_view.stride(0)
-            expected[start : start + dst_view[0].numel()] = src_raw[source : source + src_view[0].numel()]
-        assert torch.equal(dst_raw, expected)
-
-
-def pp4_peer_metadata():
-    stages = {}
-    for pp in range(4):
-        stage = metadata([[(16, 2, 4)] * 2], groups=[2])
-        stage.layer_names = [f"layer.{pp}"]
-        stage.block_strides = [[512, 512]]
-        grouped(stage)
-        stages[pp] = stage
-    return NS(is_step5=True, pp_size=4, pcp_size=1, dcp_size=1, tp_size=4, use_kv_pp=False, metadata_by_pp_rank=stages)
-
-
-def test_step5_pp4_to_pp1_group_projection_and_addresses(production):
-    local = metadata([[(16, 2, 4)] * 2] * 4, groups=[0] * 4, strides=[[2048, 2048]] * 4)
-    thread = thread_from(production, [FullAttentionSpec()] * 4, local)
-    remote = pp4_peer_metadata()
-    _, pairs = thread._build_remote_transfer_layout(remote)
-    assert pairs == {pp: [(pp, 0)] for pp in range(4)}
-    for pp in range(4):
-        src, dst, lengths = [], [], []
-        thread._append_spec_transfer_addresses(
-            pp, 0, 1, 1, 4, 1, {(pp, 0): [("req", [1], [3])]}, remote.metadata_by_pp_rank[pp], src, dst, lengths
-        )
-        assert src == [3048, 3048]
-        assert dst == [6536, 6536]
-        assert lengths == [256, 256]
-
-
-@pytest.mark.parametrize("defect", ["missing", "duplicate", "split_group", "missing_stage"])
-def test_step5_pp_projection_rejects_incomplete_or_ambiguous_groups(production, defect):
-    local = metadata([[(16, 2, 4)] * 2] * 4, groups=[0] * 4)
-    thread = thread_from(production, [FullAttentionSpec()] * 4, local)
-    remote = pp4_peer_metadata()
-    if defect == "missing":
-        remote.metadata_by_pp_rank[3].layer_names = ["unrelated"]
-    elif defect == "duplicate":
-        remote.metadata_by_pp_rank[3].layer_names = ["layer.0"]
-    elif defect == "split_group":
-        remote.metadata_by_pp_rank[3].group_indices = [3]
-    else:
-        del remote.metadata_by_pp_rank[3]
-    with pytest.raises(ValueError, match="Step5|missing layers"):
-        thread._build_remote_transfer_layout(remote)
-
-
-def test_step5_peer_group_ids_are_independent_address_spaces(production):
-    shapes = [[(16, 2, 4)] * 2]
-    local = metadata(shapes, groups=[0], strides=[[1024, 1024]])
-    remote = metadata(shapes, groups=[2], strides=[[2048, 2048]])
-    thread = thread_from(production, [FullAttentionSpec()], local)
-    peer = grouped(remote)
-    thread._build_remote_transfer_layout(peer)
-    src, dst, lengths = [], [], []
-    thread._append_spec_transfer_addresses(
-        0,
-        0,
-        1,
-        1,
-        4,
-        1,
-        {(0, 0): [("req", [1], [3])]},
-        remote,
-        src,
-        dst,
-        lengths,
-    )
-    assert src == [2024, 2024]
-    assert dst == [11144, 11144]
-    assert lengths == [256, 256]
 
 
 def test_step5_rejects_different_group_membership(production):
@@ -1238,7 +842,8 @@ def test_step5_guard_rejects_unsupported_transfer_names(connector, role):
         ("parallel_config", "pipeline_parallel_size", 2, "pipeline_parallel_size=1"),
         ("parallel_config", "prefill_context_parallel_size", 2, "prefill_context_parallel_size=1"),
         ("parallel_config", "decode_context_parallel_size", 2, "decode_context_parallel_size=1"),
-        ("cache_config", "enable_prefix_caching", True, "V2 BLNHC"),
+        ("cache_config", "enable_prefix_caching", True, "prefix caching disabled"),
+        ("model_config", "is_multimodal_model", True, "text-only"),
         ("kv_transfer_config", "kv_connector_module_path", "custom.connector", "registered Ascend"),
     ],
 )
@@ -1255,7 +860,7 @@ def test_step5_guard_rejects_out_of_slice_config(section, field, value, message)
 def test_step5_guard_rejects_speculative_transfer(speculation):
     config = step5_config(transfer_config())
     config.speculative_config = speculation
-    with pytest.raises(ValueError, match="V2 eager MTP3"):
+    with pytest.raises(ValueError, match="speculative decoding disabled"):
         call_step5_guard(config)
 
 
@@ -1409,7 +1014,6 @@ def test_step5_staggered_remote_futures_do_not_publish_before_all_groups(product
     receiver.remote_layer_index_pairs = {"p": pairs}
     receiver._get_remote_metadata = lambda *args: topology
     receiver.finished_requests = queue.SimpleQueue()
-    receiver.quarantined_requests = {}
     receiver.can_report_invalid_block_ids = False
     receiver.ready_event = threading.Event()
     receiver.device = "cpu"
@@ -1437,7 +1041,7 @@ def test_step5_staggered_remote_futures_do_not_publish_before_all_groups(product
         torch=NS(**(vars(torch) | {"npu": NS(set_device=lambda device: None)})),
         time=NS(perf_counter=lambda: 0),
     )
-    namespace["logger"] = NS(info=lambda *args: None, exception=lambda *args: None, error=lambda *args: None)
+    namespace["logger"] = NS(info=lambda *args: None, exception=lambda *args: None)
     entered = {group: threading.Event() for group in ("main", "summary", "ring")}
     gates = {group: threading.Event() for group in entered}
     completed_ranks = queue.Queue()
@@ -1482,9 +1086,8 @@ def test_step5_staggered_remote_futures_do_not_publish_before_all_groups(product
             for gate in gates.values():
                 gate.set()
     results = receiver.get_and_clear_finished_requests()
-    assert results.finished_recving == (set() if failed_group else {"req"})
-    assert results.failed_recving == set()
-    assert receiver.quarantined_requests == ({"req": request} if failed_group else {})
+    assert results.finished_recving == {"req"}
+    assert results.failed_recving == ({"req"} if failed_group else set())
     assert len(sessions) == 2  # main shard and independently selected sidecar replica
 
 
@@ -1506,7 +1109,6 @@ def lifecycle(registration, production):
     load_definitions(
         source_root / "vllm/distributed/kv_transfer/kv_connector/v1/base.py", {"KVConnectorTransferResults"}, namespace
     )
-    load_definitions("mtp_state.py", {"is_step5_mtp3_pd", "redact_mtp_seed_params"}, namespace)
     load_definitions("base_scheduler.py", {"MooncakeBaseConnectorScheduler"}, namespace)
     load_definitions(
         "pull_scheduler.py", {"MooncakePullConnectorScheduler", "MooncakeSchedulerSendingThread"}, namespace
@@ -1759,40 +1361,6 @@ def test_step5_remote_prefix_credit_does_not_include_producer_sample(
     if remote_len is not None:
         params["remote_num_prompt_tokens"] = remote_len
     request = NS(prompt_token_ids=list(range(prompt_len)), kv_transfer_params=params)
-    assert scheduler.get_num_new_matched_tokens(request, computed) == (expected, expected > 0)
-
-
-@pytest.mark.parametrize("computed", [1, 7, 8, 127, 129, -128, True])
-def test_step5_prefix_cache_rejects_unaligned_credit(lifecycle, computed):
-    cls = lifecycle["MooncakePullConnectorScheduler"]
-    scheduler = cls.__new__(cls)
-    scheduler.need_truncate = False
-    scheduler.block_size = 128
-    scheduler.vllm_config = NS(
-        model_config=NS(hf_text_config=NS(model_type="step5")), cache_config=NS(enable_prefix_caching=True)
-    )
-    params = {"do_remote_prefill": True, "remote_num_prompt_tokens": 513}
-    request = NS(prompt_token_ids=list(range(514)), kv_transfer_params=params)
-    with pytest.raises(ValueError, match="aligned"):
-        scheduler.get_num_new_matched_tokens(request, computed)
-    assert "num_computed_tokens" not in params
-
-
-@pytest.mark.parametrize(
-    "computed,remote,expected", [(0, 513, 513), (128, 513, 385), (256, 513, 257), (512, 513, 1), (128, 128, 0)]
-)
-def test_step5_prefix_cache_aligned_credit(lifecycle, computed, remote, expected):
-    cls = lifecycle["MooncakePullConnectorScheduler"]
-    scheduler = cls.__new__(cls)
-    scheduler.need_truncate = False
-    scheduler.block_size = 128
-    scheduler.vllm_config = NS(
-        model_config=NS(hf_text_config=NS(model_type="step5")), cache_config=NS(enable_prefix_caching=True)
-    )
-    request = NS(
-        prompt_token_ids=list(range(remote + 1)),
-        kv_transfer_params={"do_remote_prefill": True, "remote_num_prompt_tokens": remote},
-    )
     assert scheduler.get_num_new_matched_tokens(request, computed) == (expected, expected > 0)
 
 

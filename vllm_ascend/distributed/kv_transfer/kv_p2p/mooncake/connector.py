@@ -34,7 +34,6 @@ from vllm.logger import logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
-from vllm_ascend.core.step5_kv_cache import uses_step5_blnhc
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
     MooncakeBaseConnectorScheduler,
 )
@@ -101,9 +100,7 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
             return None
 
         if getattr(getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None) == "step5":
-            # Negotiate the physical group layout, not native K/V plane axes.
-            if getattr(vllm_config, "use_v2_model_runner", False) and uses_step5_blnhc(vllm_config):
-                return "BLNHC"
+            # Step5's Ascend consumers address token-major main K/V directly.
             return "NHD"
 
         if vllm_config.model_config.use_mla:
@@ -198,8 +195,6 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_transfer_results(self, finished_req_ids: set[str]) -> KVConnectorTransferResults:
         assert self.connector_worker is not None
-        if finished_req_ids and getattr(self.connector_worker, "mtp_seed_states", None) is not None:
-            self.connector_worker.clear_mtp_seed_requests(finished_req_ids)
         return self.connector_worker.get_transfer_results()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -225,19 +220,6 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         per_engine_labelvalues: dict[int, list[object]],
     ) -> KVConnectorPromMetrics:
         return MooncakePromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
-
-    def get_mtp_capture_context(self) -> tuple[dict[str, int], tuple[str, int, str], int] | None:
-        metadata = self._connector_metadata
-        if not isinstance(metadata, MooncakeConnectorMetadata) or not metadata.mtp_producer_prompt_lens:
-            return None
-        if metadata.mtp_seed_endpoint is None or self.connector_worker is None:
-            raise RuntimeError("MTP producer capture metadata is incomplete")
-        return dict(metadata.mtp_producer_prompt_lens), metadata.mtp_seed_endpoint, self.connector_worker.tp_rank
-
-    def get_mtp_seed_store(self) -> dict[str, Any]:
-        if self.connector_worker is None:
-            raise RuntimeError("MTP consumer worker is not initialized")
-        return self.connector_worker.mtp_seed_states
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         assert self.connector_worker is not None

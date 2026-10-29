@@ -156,9 +156,6 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.requests: dict[str, ReqMeta] = {}
         self.requests_to_send: dict[str, float] = {}
         self.reqs_in_batch: set[str] = set()
-        self.mtp_producer_prompt_lens: dict[str, int] = {}
-        self.mtp_seed_endpoint: tuple[str, int, str] | None = None
-        self.mtp_restore_requests: dict[str, dict[str, Any]] = {}
 
     def add_new_req(
         self,

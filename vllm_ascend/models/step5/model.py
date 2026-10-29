@@ -90,11 +90,11 @@ from vllm.models.step5.nvidia.model import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
-
 import vllm_ascend.ops  # noqa: F401  (loads before device_op to avoid its import cycle)
+from vllm_ascend.device.device_op import DeviceOperator
+
 from vllm_ascend import envs
 from vllm_ascend.core.step5_kv_cache import validate_step5_kv_transfer_config as _validate_step5_kv_transfer_config
-from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.step5._step5_compat import (
     Step5FP32RouterLinear,
 )
@@ -740,8 +740,15 @@ class AscendStep5FusedMoEBlock(Step5MoE):
             self.tp_size,
             get_dp_group().world_size,
         )
-        # Use the same SP policy as Ascend's prepare/finalize collectives.
-        enable_sp_moe = parallel_config.use_sequence_parallel_moe
+        # MoE sequence parallelism, DeepseekV32-style gating minus the DP
+        # requirement: any TP>1 expert-parallel deployment runs the
+        # AG-attn-RS-MoE(shard) loop instead of all-reducing attention
+        # outputs and feeding the MoE full sequences.
+        enable_sp_moe = (
+            parallel_config.enable_expert_parallel
+            and self.tp_size > 1
+            and (vllm_config.additional_config or {}).get("enable_flashcomm1", False)
+        )
 
         # reduce_results=False: AscendMoERunner owns the shared-expert TP
         # reduction (fused into the token combine for MC2/All2All, or a
@@ -1282,8 +1289,15 @@ class AscendStep5DecoderLayer(Step5DecoderLayer):
             dtype=norm_dtype,
         )
         self.prefix = prefix
-        # Dense layers keep their full-sequence MLP and residual path.
-        self.use_sequence_parallel_moe = self.use_moe and vllm_config.parallel_config.use_sequence_parallel_moe
+        # DeepseekV32-style MoE sequence parallelism, gated on TP>1 + EP only
+        # (no DP requirement). Dense layers never join: their MLP keeps the
+        # un-reduced + fused-AR-norm path.
+        self.use_sequence_parallel_moe = (
+            vllm_config.parallel_config.enable_expert_parallel
+            and self.tp_group.world_size > 1
+            and self.use_moe
+            and (vllm_config.additional_config or {}).get("enable_flashcomm1", False)
+        )
         self.use_attention_o_proj_reduce_scatter = self.use_sequence_parallel_moe
         if self.use_sequence_parallel_moe:
             logger.info_once(
