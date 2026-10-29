@@ -75,6 +75,8 @@ stub.FullAttentionSpec = FullAttentionSpec
 stub.CircularBufferSpec = CircularBufferSpec
 stub.SlidingWindowSpec = SlidingWindowSpec
 stub.UniformTypeKVCacheSpecs = UniformTypeKVCacheSpecs
+stub.compute_layer_kv_cache_shape_bytes = lambda *a, **kw: None
+stub.compute_layout_strides = lambda *a, **kw: None
 module_spec = importlib.util.spec_from_file_location(
     "step5_shared_candidate", ROOT / "vllm_ascend/core/step5_kv_cache.py"
 )
@@ -219,10 +221,12 @@ def load_cpu_upstream(relative, dependencies):
     for node in tree.body:
         if isinstance(node, ast.ImportFrom) and node.module == "typing":
             node.names = [alias for alias in node.names if alias.name != "Self"]
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "vllm.v1.attention.backend":
-            node.module = "types"
-            node.names = [ast.alias(name="SimpleNamespace", asname="MultipleOf")]
+
+    class StripBackendImports(ast.NodeTransformer):
+        def visit_ImportFrom(self, node):
+            return None if node.module == "vllm.v1.attention.backend" else node
+
+    tree = StripBackendImports().visit(tree)
     tree.body.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
     ast.fix_missing_locations(tree)
     module = ModuleType("cpu_upstream_" + source.stem)
@@ -234,7 +238,12 @@ def load_cpu_upstream(relative, dependencies):
 
 def pd_upstream_fixture(counts=(2, 2, 2)):
     logger = NS(info=lambda *a: None, warning=lambda *a: None)
+    backend = ast.parse(vllm_source_file("v1/attention/backend.py").read_text())
+    multiple = next(node for node in backend.body if getattr(node, "name", None) == "MultipleOf")
+    env = {"dataclass": dataclass}
+    exec(compile(ast.Module(body=[multiple], type_ignores=[]), "cpu-multiple-of", "exec"), env)
     deps = dict(
+        MultipleOf=env["MultipleOf"],
         init_logger=lambda *a: logger,
         cdiv=lambda n, d: (n + d - 1) // d,
         round_up=lambda n, a: (n + a - 1) // a * a,
@@ -318,7 +327,136 @@ def pd_upstream_fixture(counts=(2, 2, 2)):
 
 
 class SharedCacheTests(unittest.TestCase):
-    def test_supported_v2_pd_selects_compact_layout_not_local_blnhc(self):
+    def test_prefix_cache_pd_uses_real_pages_and_private_ring(self):
+        f = pd_upstream_fixture()
+        f.cfg.cache_config.enable_prefix_caching = True
+        for role in ("kv_producer", "kv_consumer"):
+            with self.subTest(role=role):
+                f.cfg.kv_transfer_config.kv_role = role
+                f.helper.validate_step5_kv_transfer_config(f.cfg)
+                self.assertTrue(f.helper.uses_step5_blnhc(f.cfg))
+                specs = {name: replace(spec, page_size_padded=None) for name, spec in f.specs.items()}
+                groups = f.planner.get_kv_cache_groups(f.cfg, specs)
+                for group in groups:
+                    spec = group.kv_cache_spec
+                    if isinstance(spec, f.planner.CircularBufferSpec):
+                        self.assertFalse(spec.prefix_cacheable)
+                    else:
+                        self.assertTrue(spec.prefix_cacheable)
+                self.assertEqual(specs["summary.0"].page_size_bytes, 4096)
+
+    def test_mtp3_prefix_pd_requires_validated_eager_draft_profile(self):
+        f = pd_upstream_fixture()
+        f.cfg.cache_config.enable_prefix_caching = True
+        f.cfg.model_config.enforce_eager = True
+        f.cfg.model_config.hf_text_config.hidden_size = 4096
+        draft = NS(model_type="step5_mtp", num_nextn_predict_layers=3, hidden_size=4096)
+        f.cfg.speculative_config = NS(
+            method="mtp",
+            num_speculative_tokens=3,
+            enforce_eager=True,
+            draft_model_config=NS(hf_text_config=draft),
+            num_speculative_tokens_per_batch_size=None,
+        )
+        f.helper.validate_step5_kv_transfer_config(f.cfg)
+        self.assertTrue(f.helper.uses_step5_blnhc(f.cfg))
+        f.cfg.speculative_config.enforce_eager = False
+        with self.assertRaisesRegex(ValueError, "eager"):
+            f.helper.validate_step5_kv_transfer_config(f.cfg)
+        f.cfg.speculative_config.enforce_eager = True
+        f.cfg.speculative_config.num_speculative_tokens_per_batch_size = None
+        f.helper.validate_step5_kv_transfer_config(f.cfg)
+        f.cfg.kv_transfer_config.kv_role = "kv_consumer"
+        f.helper.validate_step5_kv_transfer_config(f.cfg)
+
+    def test_vendor_graph_async_dp2_tp4_profile_and_negative_controls(self):
+        f = pd_upstream_fixture()
+        f.cfg.cache_config.enable_prefix_caching = True
+        f.cfg.model_config.enforce_eager = False
+        f.cfg.model_config.hf_text_config.hidden_size = 4096
+        f.cfg.parallel_config.tensor_parallel_size = 4
+        f.cfg.parallel_config.data_parallel_size = 2
+        f.cfg.parallel_config.data_parallel_size_local = 2
+        f.cfg.parallel_config.enable_expert_parallel = True
+        f.cfg.scheduler_config.max_num_seqs = 256
+        f.cfg.scheduler_config.async_scheduling = True
+        f.cfg.compilation_config = NS(
+            mode=3, cudagraph_mode=NS(name="FULL_DECODE_ONLY"), cudagraph_capture_sizes=[4, 8, 512]
+        )
+        f.cfg.speculative_config = NS(
+            method="mtp",
+            num_speculative_tokens=3,
+            enforce_eager=False,
+            draft_model_config=NS(
+                hf_text_config=NS(model_type="step5_mtp", num_nextn_predict_layers=3, hidden_size=4096)
+            ),
+            num_speculative_tokens_per_batch_size=None,
+        )
+        f.helper.validate_step5_kv_transfer_config(f.cfg)
+        f.cfg.parallel_config.data_parallel_size = 4
+        f.cfg.kv_transfer_config.kv_role = "kv_consumer"
+        f.helper.validate_step5_kv_transfer_config(f.cfg)
+        for obj, name, wrong in (
+            (f.cfg.parallel_config, "data_parallel_size", 3),
+            (f.cfg.scheduler_config, "async_scheduling", False),
+            (f.cfg.compilation_config, "mode", 0),
+            (f.cfg.compilation_config, "cudagraph_capture_sizes", [4, 510]),
+            (f.cfg.model_config, "enforce_eager", True),
+        ):
+            old = getattr(obj, name)
+            setattr(obj, name, wrong)
+            with self.assertRaises(ValueError):
+                f.helper.validate_step5_kv_transfer_config(f.cfg)
+            setattr(obj, name, old)
+
+    def test_pp4_tp4_graph_producer_only_profile(self):
+        f = pd_upstream_fixture()
+        cfg = f.cfg
+        cfg.kv_transfer_config.kv_role = "kv_producer"
+        cfg.model_config.enforce_eager = False
+        cfg.model_config.hf_text_config.hidden_size = 4096
+        cfg.parallel_config.pipeline_parallel_size = 4
+        cfg.parallel_config.tensor_parallel_size = 4
+        cfg.parallel_config.data_parallel_size = 1
+        cfg.parallel_config.data_parallel_size_local = 1
+        cfg.parallel_config.enable_expert_parallel = True
+        cfg.scheduler_config.max_num_seqs = 32
+        cfg.scheduler_config.async_scheduling = True
+        cfg.compilation_config = NS(
+            mode=3, cudagraph_mode=NS(name="FULL_DECODE_ONLY"), cudagraph_capture_sizes=[4, 8, 512]
+        )
+        cfg.speculative_config = NS(
+            method="mtp",
+            num_speculative_tokens=3,
+            enforce_eager=False,
+            draft_model_config=NS(
+                hf_text_config=NS(model_type="step5_mtp", num_nextn_predict_layers=3, hidden_size=4096)
+            ),
+            num_speculative_tokens_per_batch_size=None,
+        )
+        f.helper.validate_step5_kv_transfer_config(cfg)
+        cfg.speculative_config.num_speculative_tokens_per_batch_size = None
+        f.helper.validate_step5_kv_transfer_config(cfg)
+        for obj, key, value in (
+            (cfg.kv_transfer_config, "kv_role", "kv_consumer"),
+            (cfg.parallel_config, "tensor_parallel_size", 8),
+            (cfg.parallel_config, "pipeline_parallel_size", 2),
+            (cfg.scheduler_config, "async_scheduling", False),
+        ):
+            previous = getattr(obj, key)
+            setattr(obj, key, value)
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                f.helper.validate_step5_kv_transfer_config(cfg)
+            setattr(obj, key, previous)
+
+    def test_prefix_cache_pd_still_rejects_non_v2_runner(self):
+        f = pd_upstream_fixture()
+        f.cfg.cache_config.enable_prefix_caching = True
+        f.cfg.use_v2_model_runner = False
+        with self.assertRaisesRegex(ValueError, "V2"):
+            f.helper.validate_step5_kv_transfer_config(f.cfg)
+
+    def test_supported_v2_pd_selects_validated_blnhc(self):
         f = pd_upstream_fixture()
         for connector in ("MooncakeConnectorV2", "MooncakePullConnector"):
             for role in ("kv_producer", "kv_consumer"):
@@ -326,7 +464,7 @@ class SharedCacheTests(unittest.TestCase):
                     f.cfg.kv_transfer_config.kv_connector = connector
                     f.cfg.kv_transfer_config.kv_role = role
                     f.helper.validate_step5_kv_transfer_config(f.cfg)
-                    self.assertFalse(f.helper.uses_step5_blnhc(f.cfg))
+                    self.assertTrue(f.helper.uses_step5_blnhc(f.cfg))
                     groups = f.planner.get_kv_cache_groups(f.cfg, dict(f.specs))
                     self.assertTrue(f.helper.supports_step5_tailring_shared_backing(f.cfg, groups))
         f.cfg.kv_transfer_config.is_kv_transfer_instance = False
@@ -338,10 +476,8 @@ class SharedCacheTests(unittest.TestCase):
         f = pd_upstream_fixture()
         groups = f.planner.get_kv_cache_groups(f.cfg, dict(f.specs))
         planned = f.planner.get_kv_cache_config_from_groups(f.cfg, groups, 4 * 196608)
-        f.env.update(get_current_vllm_config=lambda: f.cfg)
-        allocate = extract(ROOT / "vllm_ascend/worker/v2/attn_utils.py", "allocate_kv_cache_main", f.env)
         with patch.object(torch, "zeros", wraps=torch.zeros) as alloc:
-            views = allocate(planned, "cpu", f.cfg.cache_config.get_resolved_kv_cache_layout(), [128] * len(groups))
+            views = f.helper.allocate_step5_tailring_shared_backing(planned, "cpu", align_for_transfer=True)
         self.assertEqual(alloc.call_count, 1)
         k, v = views["main.0"]
         self.assertEqual(k.data_ptr() % f.helper.STEP5_PD_BUFFER_ALIGNMENT, 0)
@@ -367,14 +503,15 @@ class SharedCacheTests(unittest.TestCase):
         views = f.helper.allocate_step5_tailring_shared_backing(planned, "cpu", align_for_transfer=True)
         self.assertLessEqual(views["main.0"][0].untyped_storage().nbytes(), budget)
 
-    def test_pd_layout_selection_leaves_capability_validation_separate(self):
+    def test_pd_layout_selection_validates_capability(self):
         f = pd_upstream_fixture()
         f.cfg.kv_transfer_config.kv_connector = "UnsupportedConnector"
-        self.assertFalse(f.helper.uses_step5_blnhc(f.cfg))
+        with self.assertRaisesRegex(ValueError, "registered Ascend"):
+            f.helper.uses_step5_blnhc(f.cfg)
         with self.assertRaisesRegex(ValueError, "registered Ascend"):
             f.helper.validate_step5_kv_transfer_config(f.cfg)
 
-    def test_pd_backend_and_summary_spec_retain_compact_padded_profile(self):
+    def test_pd_backend_and_summary_spec_select_real_page_blnhc(self):
         f = pd_upstream_fixture()
         namespace = dict(f.env, AttentionBackend=object, replace=replace)
         source = ROOT / "vllm_ascend/models/step5/dsa_attention.py"
@@ -388,8 +525,8 @@ class SharedCacheTests(unittest.TestCase):
         config_module = ModuleType("vllm.config")
         config_module.get_current_vllm_config_or_none = lambda: f.cfg
         with patch.dict(sys.modules, {"vllm.config": config_module}):
-            self.assertIsNone(namespace[backend.name].supported_kv_cache_layouts())
-            self.assertIs(namespace[backend.name].customize_spec(f.specs["main.0"]), f.specs["main.0"])
+            self.assertEqual(namespace[backend.name].supported_kv_cache_layouts(), (f.helper.KVCacheLayout.BLNHC,))
+            self.assertEqual(namespace[backend.name].customize_spec(f.specs["main.0"]).block_stride_alignment, 384)
 
         class Base:
             def get_kv_cache_spec(self, _):
@@ -407,8 +544,8 @@ class SharedCacheTests(unittest.TestCase):
         main = NS(get_kv_cache_spec=lambda _: f.specs["main.0"])
         summary._main_layer_ref = lambda: main
         padded = summary.get_kv_cache_spec(f.cfg)
-        self.assertEqual(padded.page_size_bytes, 98304)
-        self.assertEqual(padded.page_size_padded, 98304)
+        self.assertEqual(padded.page_size_bytes, 4096)
+        self.assertIsNone(padded.page_size_padded)
         self.assertEqual(padded.tokens_per_state, 8)
         f.cfg.kv_transfer_config = None
         local = summary.get_kv_cache_spec(f.cfg)
@@ -552,8 +689,10 @@ class SharedCacheTests(unittest.TestCase):
             lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2),
             lambda c: setattr(c.parallel_config, "decode_context_parallel_size", 2),
             lambda c: setattr(c, "speculative_config", NS(method="mtp")),
-            lambda c: setattr(c.cache_config, "enable_prefix_caching", True),
-            lambda c: setattr(c.model_config, "is_multimodal_model", True),
+            lambda c: (
+                setattr(c.cache_config, "enable_prefix_caching", True),
+                setattr(c, "use_v2_model_runner", False),
+            ),
             lambda c: c.additional_config.update(enable_kvpp=True),
             lambda c: c.additional_config.update(sparse_kv_offload_config={"enabled": True}),
             lambda c: setattr(c, "attention_config", NS(hisparse_config={})),
@@ -564,6 +703,24 @@ class SharedCacheTests(unittest.TestCase):
             self.assertFalse(helper.supports_step5_tailring_shared_backing(invalid, kv.kv_cache_groups))
         self.assertTrue(helper.supports_step5_tailring_shared_backing(config(), kv.kv_cache_groups))
         self.assertFalse(helper.supports_step5_shared_kv_backing(cfg, caches().kv_cache_groups))
+
+    def test_pd_accepts_unified_vl_weights_without_text_only_view(self):
+        """The vendor ships one unified VL checkpoint (Step5ForConditionalGeneration
+        with a vision sub-config). Step5 PD must accept it directly instead of
+        forcing a text-only target/draft split, which is what forced
+        ``--model /work/run/target-text92`` plus a separate
+        ``/work/run/draft-mtp3``."""
+        cfg = config()
+        cfg.kv_transfer_config = NS(
+            kv_connector="MooncakeConnectorV2",
+            kv_connector_module_path=None,
+            kv_role="kv_producer",
+            is_kv_transfer_instance=True,
+        )
+        cfg.model_config.is_multimodal_model = True
+        # No speculative config: this test isolates the multimodal rejection.
+        self.assertIsNone(cfg.speculative_config)
+        helper.validate_step5_kv_transfer_config(cfg)
 
     def test_pd_aligned_slab_views_keep_raw_storage_offset_and_registration(self):
         cfg, kv = tailring_config()

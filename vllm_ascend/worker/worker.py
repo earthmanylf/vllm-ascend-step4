@@ -745,6 +745,7 @@ class NPUWorker(WorkerBase):
         config = self.vllm_config
         if (
             config.kv_transfer_config is None
+            or not config.kv_transfer_config.is_kv_transfer_instance
             or not getattr(config, "use_v2_model_runner", False)
             or getattr(config.model_config.hf_text_config, "model_type", None) != "step5"
         ):
@@ -752,7 +753,7 @@ class NPUWorker(WorkerBase):
         if kv_cache_groups is None:
             specs = self.get_kv_cache_spec()
             if not isinstance(specs, dict):
-                return available_memory
+                raise ValueError("Step5 PD alignment reserve requires layer cache specs.")
             kv_cache_groups = get_kv_cache_groups(config, specs)
         reserve = step5_tailring_alignment_reserve(config, kv_cache_groups)
         if not reserve:
@@ -762,7 +763,7 @@ class NPUWorker(WorkerBase):
             if type(override) is not int or override <= 0:
                 raise ValueError("Step5 PD num_gpu_blocks_override must be a positive integer.")
             # The full upstream planner replaces available_memory with override
-            # capacity. Check before returning it; groups alias one padded pool.
+            # capacity. Check the actual shared-pool stride before planning.
             bytes_per_block = _get_kv_cache_bytes_per_block(
                 kv_cache_groups, config.cache_config.get_resolved_kv_cache_layout()
             )
@@ -789,9 +790,8 @@ class NPUWorker(WorkerBase):
         buffers to fit.
         """
         if uses_step5_blnhc(self.vllm_config):
-            # The upstream BLNHC allocator consumes the upstream planner's
-            # exact single backing; no per-layer private-allocation scaling.
-            return available_memory
+            # No private-allocation scaling; active PD reserves one slab alignment.
+            return self._apply_step5_tailring_alignment_reserve(available_memory)
         kv_cache_spec = self.get_kv_cache_spec()
         if not isinstance(kv_cache_spec, dict):
             return available_memory
