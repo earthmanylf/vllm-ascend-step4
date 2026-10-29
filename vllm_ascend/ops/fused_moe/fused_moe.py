@@ -16,6 +16,8 @@
 #
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from vllm.distributed import (
@@ -28,6 +30,10 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoERouter
 from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_shared, _unpack
 from vllm.utils.torch_utils import direct_register_custom_op
+
+# Shared+routed combine form; see AscendMoERunner.forward. The multi-tensor
+# add is kept only as an A/B escape hatch for multi-output layers.
+_MOE_COMBINE_FOREACH = bool(int(os.environ.get("VLLM_ASCEND_MOE_COMBINE_FOREACH", "0")))
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -161,16 +167,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         through the OOT PluggableLayer dispatch of ``MoERunner``).
 
         Upstream inlines the shared+routed output combine, which is not
-        exposed as an overridable hook. On NPU the combine goes through the
-        fused multi-tensor add kernel (``torch._foreach_add``), whose kernel
-        launch count is independent of the tensor-list length and which is
-        the NPU-validated fast path for the MoE combine. Every other step,
-        including the runtime-aware reduction hooks (#16550), is inherited
-        unchanged.
-
-        Future plan: once the aclnnAdd_AddAiCore_Add kernel is available via
-        the superkernel integration, upstream's plain add becomes the fast
-        path and this override can be dropped.
+        exposed as an overridable hook. This runner always combines exactly
+        one (shared, routed) pair, and for a single pair the multi-tensor add
+        is the slower form on Ascend950: ``_foreach_add`` keeps its list
+        materialisation and list-shaped dispatch, then still lands on one
+        AI-core add kernel per layer (measured 5.4 us vs 3.0 us for the plain
+        add; 88 MoE layers, about 0.2 ms per decode step). The fused
+        multi-tensor kernel only pays off once a layer has several outputs to
+        add, which this path never has -- ``VLLM_ASCEND_MOE_COMBINE_FOREACH=1``
+        keeps the old form for A/B runs. Every other step, including the
+        runtime-aware reduction hooks (#16550), is inherited unchanged.
         """
         # Apply transform for routed experts (e.g., latent projection for
         # latent MoE). When the caller pre-applies the routed input transform
@@ -233,7 +239,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
-            result = torch._foreach_add([shared_output], [fused_output])[0]
+            if _MOE_COMBINE_FOREACH:
+                result = torch._foreach_add([shared_output], [fused_output])[0]
+            else:
+                result = shared_output + fused_output
         else:
             result = fused_output
 

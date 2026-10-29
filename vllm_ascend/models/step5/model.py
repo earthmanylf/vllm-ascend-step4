@@ -476,6 +476,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         index_q: torch.Tensor,
         index_k: torch.Tensor,
         index_z: torch.Tensor,
+        index_row: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Indexer norm+rope and head scores, all local shapes.
 
@@ -491,7 +492,22 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         heads_per_group = num_index_q_heads // self.num_kv_heads
 
         if self.use_fused_indexer_norm_rope:
-            x_cat = torch.cat([index_q, index_k, index_z], dim=-1)
+            # ``index_q|index_k|index_z`` are consecutive column slices of the
+            # fused qkv+indexer projection, so the concatenated buffer the
+            # kernel wants is already sitting in ``qkzg`` rows. Hand the row
+            # over in place (the kernel walks rows by an explicit token
+            # stride and only ever reads the first q|k|z columns) and skip one
+            # 23-per-step ``torch.cat`` plus its temporary allocation.
+            x_cat = index_q
+            row_stride = 0
+            if index_row is not None and index_row.stride(-1) == 1:
+                # q|k|z are the leading columns; gate (if any) follows them.
+                packed = int(index_q.shape[-1]) + int(index_k.shape[-1]) + int(index_z.shape[-1])
+                if int(index_row.shape[-1]) >= packed:
+                    x_cat = index_row
+                    row_stride = int(index_row.stride(0))
+            if x_cat is index_q:
+                x_cat = torch.cat([index_q, index_k, index_z], dim=-1)
             index_q, index_k, index_z = fused_indexer_qkz_kv_norm_rope(
                 x_cat,
                 self.sparse_indexer_q_norm.weight,
@@ -510,6 +526,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
                 k_norm_weight_bias=0.0,
                 subtract_mean_q=False,
                 subtract_mean_k=True,
+                row_stride=row_stride,
             )
             index_q = index_q.reshape(num_tokens, self.num_kv_heads, heads_per_group, proxy_dim)
             index_k = index_k.reshape(num_tokens, num_index_k_heads, proxy_dim)
@@ -580,7 +597,7 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
 
         index_q_raw, index_k_raw, index_z_raw, gate = self.qkv_indexer_proj.split_indexer(qkzg)
         index_q, index_k, index_z, weights = self._finish_indexer(
-            positions, hidden_states, index_q_raw, index_k_raw, index_z_raw
+            positions, hidden_states, index_q_raw, index_k_raw, index_z_raw, index_row=qkzg
         )
 
         num_tokens = int(hidden_states.shape[0])
@@ -1091,9 +1108,20 @@ class AscendStep5Attention(Step5Attention):
             extra_dims = None
         elif self.fuse_qkv_gate:
             qkvg, _ = self.qkvg_proj(hidden_states)
-            qkv, extra_dims = qkvg.split([self.q_size + 2 * self.kv_size, self.num_heads], dim=-1)
-            qkv = qkv.contiguous()
-            extra_dims = extra_dims.contiguous()
+            # ``qkvg`` carries q|k|v|gate packed in one row. The fused norm+rope
+            # kernel walks rows with an explicit token stride and addresses the
+            # q/k/v heads by offset, so it can read the packed row in place and
+            # the leading q|k|v block never needs its own contiguous copy --
+            # 72 sliding layers x 1 step used to spend a T x 3456 bf16 copy
+            # here (about 0.2 ms at 128K/bs96). Only the gate tail is
+            # materialised, because its consumer is an elementwise sigmoid.
+            gate_slice = slice(self.q_size + 2 * self.kv_size, None)
+            extra_dims = qkvg[:, gate_slice].contiguous()
+            qkv = (
+                qkvg
+                if self.use_fused_qknorm_rope
+                else qkvg[:, : self.q_size + 2 * self.kv_size].contiguous()
+            )
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             qkzg = None

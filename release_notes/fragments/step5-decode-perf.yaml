@@ -1,0 +1,9 @@
+entries:
+  - category: performance
+    text: >-
+      Step5 decode reads the sparse indexer summary from a dense table (the
+      BLNHC tile stride made the fused region scorer repack every visible
+      region per layer and step), feeds the fused norm+rope kernels the packed
+      projection rows directly, and combines the shared and routed MoE outputs
+      with a plain add. Restored the fused Step5 shared-expert SwiGLU
+      activation with device-side valid-row clipping for routed experts.

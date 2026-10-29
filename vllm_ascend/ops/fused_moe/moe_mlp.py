@@ -102,7 +102,14 @@ def _unified_apply_activation(
             swiglu_beta=mlp_compute_input.swiglu_beta,
         )
     elif activation == MoEActivation.SWIGLUSTEP:
-        hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=7.0)
+        # MC2 uses count mode; cumulative mode must be converted on device.
+        # Type-2 sparse group tables require extra context: safely compute all rows.
+        group_list = mlp_compute_input.group_list
+        if mlp_compute_input.group_list_type == 0:
+            group_list = torch.diff(group_list, prepend=group_list.new_zeros(1))
+        elif mlp_compute_input.group_list_type != 1:
+            group_list = None
+        hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=7.0, group_list=group_list)
     elif activation == MoEActivation.GELU:
         gate, up = hidden_states.chunk(2, dim=-1)
         hidden_states = torch.nn.functional.gelu(gate) * up

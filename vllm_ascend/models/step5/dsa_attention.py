@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend Step5 DSA with SWF per-page state and persistent request journal.
+"""Ascend Step5 DSA on the TailRing summary contract.
 
-The NPU summary producer follows the fixed SWF ordered FP32 update and
-request-indexed rollback contract. Ascend IndexerRegionScore and GenericBlockSparseAttention operators
-consume the materialized FP8 summaries; each row excludes future regions,
-force-includes its current region and applies an exact token causal mask.
+The summary producer keeps each request's open-region ``[key | z]`` rows in a
+circular buffer and materializes a region's FP8 summary once, from the row
+that closes it; a rejected draft therefore needs no rollback, the next step
+simply overwrites its row (see ``summary_kernels``). Ascend
+IndexerRegionScore and GenericBlockSparseAttention consume those
+summaries; each row excludes future regions, force-includes its current
+region and applies an exact token causal mask.
 """
 
 from __future__ import annotations
@@ -31,7 +34,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_ascend.core.step5_kv_cache import uses_step5_blnhc
-from vllm_ascend.models.step5._step5_compat import Step5DSAScratchWorkspace
 from vllm_ascend.models.step5.generic_block_sparse_attention import (
     gbsa_expected_counts,
     gbsa_sparse_attention,
@@ -42,13 +44,6 @@ from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache
 from vllm_ascend.models.step5.summary_kernels import build_prefill_groups
 
 logger = init_logger(__name__)
-
-
-def _is_graph_capturing() -> bool:
-    try:
-        return bool(torch.npu.is_current_stream_capturing())
-    except Exception:
-        return False
 
 
 class AscendStep5DSABackend(AttentionBackend):
@@ -303,7 +298,7 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
         return buffer
 
     def _prepare_gbsa_metadata(self, md: AscendStep5DSAMetadata) -> None:
-        """Schedule native attention outside the model, without touching journals."""
+        """Schedule native attention outside the model, from device positions only."""
         padded_graph = getattr(md, "graph_decode", None) is not None
         graph_shape = padded_graph or (
             not getattr(self, "supports_padded_decode_graph", False) and md.num_actual_tokens in self.capture_sizes
@@ -412,13 +407,14 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
         # The CPU mirror is an optimistic upper bound whenever async spec decode
         # is active: it assumes every draft of the previous step was accepted,
         # while the device value also subtracts the re-prefill rewind
-        # max(0, num_rejected - 1). The device value is authoritative and never
-        # larger than this bound, and the gap is bounded by `width - 1` because a
-        # rewind cannot discard more than one query window's drafts. Comparing
-        # the bound straight against `capacity` would therefore reject a batch
-        # whose exact length still fits, so allow exactly that slack. The device
-        # copy below carries the exact value into the graph, so this stays a
-        # guard, not the source of truth.
+        # max(0, num_rejected - 1). The device value is authoritative and is
+        # never larger than this bound, and the gap is bounded by `width - 1`
+        # because a rewind cannot discard more than one query window's drafts.
+        # Comparing the bound directly against `capacity` would therefore fail a
+        # batch whose exact length still fits, so allow exactly that slack. The
+        # device copy below (`buffers.seq_lens[:real].copy_`) carries the exact
+        # value into the graph, so this check stays a guard, not the source of
+        # truth.
         host_slack = width - 1
         if any(length < width or length > capacity + host_slack for length in lengths[:real]) or any(
             length != 0 for length in lengths[real:]
@@ -671,63 +667,12 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         # carries each request's open-region rows and addresses the summary
         # updates. Created with the model so memory profiling counts it.
         self.csa_ring = None
-        self._dsa_scratch_workspace = Step5DSAScratchWorkspace()
-        self._dsa_scratch_bound = False
 
     # -- upstream-compatible side-storage contract ---------------------------
 
     @property
     def sparse_region_block_size(self) -> int:
         return self.region_size
-
-    def bind_scratch_workspace(self, workspace: Step5DSAScratchWorkspace) -> None:
-        """Use one fixed scratch pool for every DSA layer in this model."""
-        self._dsa_scratch_workspace = workspace
-        self._dsa_scratch_bound = False
-
-    def _dsa_virtual_engine(self) -> int:
-        from vllm.forward_context import is_forward_context_available
-
-        if is_forward_context_available():
-            return int(getattr(get_forward_context(), "virtual_engine", 0) or 0)
-        return 0
-
-    def _get_dsa_tensor_buffer_at_least(
-        self,
-        name: str,
-        shape: tuple[int, ...],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Fixed-capacity scratch from the model-wide DSA workspace.
-
-        All DSA layers share one pool and run sequentially on one stream, so
-        a per-name buffer is reused across layers; preallocating the maximum
-        size at bind keeps the pointers stable for ACL-graph capture.
-        """
-        virtual_engine = self._dsa_virtual_engine()
-        self._dsa_scratch_workspace.get_order_token(virtual_engine, device=device)
-        buffers = self._dsa_scratch_workspace.tensor_buffers_by_engine.setdefault(virtual_engine, {})
-        required = 1
-        for dim in shape:
-            required *= int(dim)
-        out = buffers.get(name)
-        if out is None or out.device != device or out.dtype != dtype or int(out.numel()) < int(required):
-            if self._dsa_scratch_workspace.allocations_locked or getattr(self, "_dsa_scratch_bound", False):
-                raise RuntimeError(
-                    "Step5 DSA scratch capacity was exceeded after bind: "
-                    f"name={name!r}, requested_shape={shape}, "
-                    f"required_elements={int(required)}."
-                )
-            if _is_graph_capturing():
-                raise RuntimeError(
-                    "Step5 DSA tensor scratch buffers must be initialized "
-                    f"before graph capture; name={name!r}, shape={shape}."
-                )
-            out = torch.empty((int(required),), device=device, dtype=dtype)
-            buffers[name] = out
-        return out[: int(required)].view(*shape)
 
     def bind_summary_cache(
         self,
@@ -745,7 +690,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         if initialize_runtime_state:
             self.summary_cache = summary_cache
 
-    # -- SWF summary producer -------------------------------------------------
+    # -- TailRing summary producer --------------------------------------------
 
     def _maybe_update_summary_cache(
         self,

@@ -150,6 +150,16 @@ def ring_state_update_skipped() -> bool:
     return _SKIP_RING_STATE_UPDATE.get()
 
 
+def bind_fa3_kv_cache(attn_groups, forward_context: dict) -> None:
+    """Bind planner-owned views to each target and draft FA3 builder."""
+    for groups in attn_groups:
+        for group in groups:
+            for builder in group.metadata_builders:
+                bind = getattr(builder, "bind_fa3_kv_cache", None)
+                if bind is not None:
+                    bind(forward_context)
+
+
 def unwrap_mamba_kv_cache_groups(kv_cache_config: KVCacheConfig) -> KVCacheConfig:
     """Expose homogeneous Mamba specs to the upstream MRV2 initializer.
 

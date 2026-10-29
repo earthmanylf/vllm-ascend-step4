@@ -80,3 +80,36 @@ def test_swiglustep_triton_handles_non_contiguous_input():
 
     assert out_triton.shape == out_ref.shape
     assert torch.allclose(out_triton, out_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("valid_rows", [0, 1, 96, 3072])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_swiglustep_count_mode_capacity(valid_rows, dtype):
+    init_device_properties_triton()
+    x = torch.randn(3072, 4096, dtype=dtype, device="npu")
+    # Poison padding: the kernel must not read it, even on full-graph replay.
+    x[valid_rows:] = float("nan")
+    counts = torch.tensor([valid_rows, 0, 0], dtype=torch.int64, device="npu")
+    actual = swiglustep_forward_triton(x, group_list=counts)
+    expected = _swiglustep_reference(x[:valid_rows])
+    torch.testing.assert_close(actual[:valid_rows], expected, rtol=2e-2, atol=2e-2)
+    assert actual.shape == (3072, 2048)
+
+
+@torch.inference_mode()
+def test_swiglustep_fullgraph_updates_counts():
+    init_device_properties_triton()
+    x = torch.randn(3072, 4096, dtype=torch.bfloat16, device="npu")
+    counts = torch.tensor([96, 0, 0], dtype=torch.int64, device="npu")
+    swiglustep_forward_triton(x, group_list=counts)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = swiglustep_forward_triton(x, group_list=counts)
+    for valid_rows in (1, 192, 0, 96):
+        counts.copy_(torch.tensor([valid_rows, 0, 0], dtype=torch.int64, device="npu"))
+        graph.replay()
+        torch.npu.synchronize()
+        expected = _swiglustep_reference(x[:valid_rows])
+        torch.testing.assert_close(actual[:valid_rows], expected, rtol=2e-2, atol=2e-2)

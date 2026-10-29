@@ -802,6 +802,11 @@ class AscendAutoRegressiveSpeculator(AscendDraftSpeculatorMixin, AutoRegressiveS
         if self.attn_architecture in ("DSA", "SFA"):
             return
 
+        if attn_metadata and all(getattr(metadata, "uses_device_fa3", False) for metadata in attn_metadata.values()):
+            # FA3 eager/MTP builds consume the runner's current device lengths
+            # at every step. They do not own FIA's exact host-length lists.
+            return
+
         attn_meta = next(iter(attn_metadata.values()))
         num_reqs_padded = attn_meta.seq_lens_cpu.shape[0]
         seq_lens_cpu = self._get_seq_lens_cpu(num_reqs_padded)

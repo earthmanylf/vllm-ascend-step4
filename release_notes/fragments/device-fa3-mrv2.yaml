@@ -1,0 +1,4 @@
+entries:
+  - category: feature
+    text: Added opt-in device-tiling FA3 attention on Model Runner V2 with independent K/V block strides and captured writer-slot buffers, using upstream allocation and layout negotiation for bounded local Step5 while preserving multi-module MTP FULL graphs and profiling lifecycle arguments.
+    hardware: [A5]
