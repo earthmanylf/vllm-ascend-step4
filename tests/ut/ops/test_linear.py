@@ -219,6 +219,189 @@ class TestAscendRowParallelLinear(BaseLinearTest):
         linear(input_tensor)
 
 
+class TestAscendRowParallelLinearReduceScatter(BaseLinearTest):
+    """Sequence-parallel o_proj contract (audit item fcfbd6c0a8).
+
+    Step5's SP-MoE layers call ``o_proj(x, reduce_scatter_results=True,
+    reduce_scatter_dim=0)`` and then hand the result to the MoE with
+    ``input_is_sequence_parallel=True``, i.e. they expect a TP *shard* back.
+    Swallowing those kwargs silently returns the full sequence instead, which
+    makes ``_forward_ffn`` skip its chunking and feeds an unsharded tensor into
+    the MoE -- the shape the MoE MC2 dispatch then rejects.
+    """
+
+    @patch("vllm_ascend.ops.linear.get_current_vllm_config", return_value=MagicMock())
+    @patch(
+        "vllm.model_executor.layers.linear.RowParallelLinear.forward",
+        new=lambda self, input_: torch.nn.functional.linear(input_, self.weight, self.bias),
+    )
+    @patch("vllm.distributed.tensor_model_parallel_reduce_scatter")
+    def test_reduce_scatter_results_returns_tp_shard(self, mock_rs, mock_get_current_vllm_config):
+        ascend_config._ASCEND_CONFIG = MagicMock()
+        ascend_config._ASCEND_CONFIG.scheduler_config.recompute_scheduler_enable = False
+        ascend_config._ASCEND_CONFIG.finegrained_tp_config.oproj_tensor_parallel_size = 0
+        ascend_config._ASCEND_CONFIG.ascend_scheduler_config.enabled = False
+
+        tp_size = 2
+        num_tokens = 8
+        # prefix matches neither "o_proj" nor "down_proj", so custom_op stays
+        # None and the plain row-parallel branch is the one under test.
+        linear = AscendRowParallelLinear(
+            input_size=16,
+            output_size=8,
+            prefix="",
+        )
+        self.assertIsNone(linear.custom_op)
+        self.assertEqual(linear.tp_size, tp_size)
+
+        # No forward context in a UT, so the fused mm+reduce-scatter path must
+        # stay off and the two-step GEMM + reduce-scatter must be taken.
+        self.assertFalse(linear._use_mmrs_fusion(torch.randn(num_tokens, 8)))
+
+        # Stand in for the TP reduce-scatter returning this rank's shard.
+        mock_rs.side_effect = lambda out, dim: out[: out.shape[0] // tp_size]
+
+        with patch.object(
+            linear.quant_method,
+            "apply",
+            side_effect=lambda layer, inputs, bias: torch.nn.functional.linear(inputs, layer.weight, bias),
+        ):
+            out = linear(
+                torch.randn(num_tokens, 8),
+                reduce_scatter_results=True,
+                reduce_scatter_dim=0,
+            )
+        if linear.return_bias:
+            out, output_bias = out
+            self.assertIsNone(output_bias)
+
+        self.assertTrue(
+            mock_rs.called,
+            "reduce_scatter_results=True must reach the reduce-scatter, not be swallowed",
+        )
+        self.assertEqual(mock_rs.call_args[0][1], 0, "reduce_scatter_dim must be forwarded")
+        self.assertEqual(
+            out.shape[0],
+            num_tokens // tp_size,
+            "output must be a TP shard, not the full sequence",
+        )
+
+    @patch("vllm_ascend.ops.linear.get_current_vllm_config", return_value=MagicMock())
+    @patch(
+        "vllm.model_executor.layers.linear.RowParallelLinear.forward",
+        new=lambda self, input_: torch.nn.functional.linear(input_, self.weight, self.bias),
+    )
+    def test_default_path_still_all_reduces(self, mock_get_current_vllm_config):
+        ascend_config._ASCEND_CONFIG = MagicMock()
+        ascend_config._ASCEND_CONFIG.scheduler_config.recompute_scheduler_enable = False
+        ascend_config._ASCEND_CONFIG.finegrained_tp_config.oproj_tensor_parallel_size = 0
+        ascend_config._ASCEND_CONFIG.ascend_scheduler_config.enabled = False
+
+        num_tokens = 8
+        linear = AscendRowParallelLinear(input_size=16, output_size=8, prefix="")
+        self.assertIsNone(linear.custom_op)
+
+        out = linear(torch.randn(num_tokens, 8))
+
+        self.assertEqual(
+            out.shape[0],
+            num_tokens,
+            "the default path must stay full-length so non-SP callers are unaffected",
+        )
+
+
+class TestMMRSWeightFormat(unittest.TestCase):
+    def setUp(self):
+        self.layer = object.__new__(AscendRowParallelLinear)
+        torch.nn.Module.__init__(self.layer)
+        self.layer.weight = torch.nn.Parameter(torch.ones(4, 8, dtype=torch.bfloat16))
+        self.layer.prefix = "test.mmrs"
+        self.layer._mmrs_hcom = None
+        self.layer._mmrs_weight = None
+        self.layer._mmrs_unavailable = False
+
+    @patch("vllm_ascend.ops.linear.torch.device", return_value=torch.device("cpu"))
+    @patch("vllm_ascend.ops.linear.torch.distributed.get_rank", return_value=0)
+    @patch("vllm.distributed.get_tp_group")
+    @patch("vllm_ascend.ops.linear.torch_npu.get_npu_format", create=True)
+    def test_rejects_non_nd_before_hcom_init(self, get_format, get_tp_group, get_rank, device):
+        for weight_format in (29, 0):
+            with self.subTest(weight_format=weight_format):
+                self.layer._mmrs_unavailable = False
+                get_format.reset_mock()
+                get_format.return_value = weight_format
+                self.assertFalse(self.layer._mmrs_fusion_ready())
+                get_format.assert_called_once_with(self.layer.weight)
+                self.assertTrue(self.layer._mmrs_unavailable)
+                self.assertIsNone(self.layer._mmrs_weight)
+                self.assertIsNone(self.layer._mmrs_hcom)
+                get_tp_group.assert_not_called()
+                get_format.reset_mock()
+                self.assertFalse(self.layer._mmrs_fusion_ready())
+                get_format.assert_not_called()
+
+    @patch("vllm.distributed.get_tp_group")
+    @patch(
+        "vllm_ascend.ops.linear.torch_npu.get_npu_format",
+        side_effect=RuntimeError("format unavailable"),
+        create=True,
+    )
+    def test_format_query_failure_falls_back_before_hcom_init(self, get_format, get_tp_group):
+        self.assertFalse(self.layer._mmrs_fusion_ready())
+        get_format.assert_called_once_with(self.layer.weight)
+        self.assertTrue(self.layer._mmrs_unavailable)
+        self.assertIsNone(self.layer._mmrs_weight)
+        self.assertIsNone(self.layer._mmrs_hcom)
+        get_tp_group.assert_not_called()
+
+    @patch("vllm_ascend.ops.linear.torch.device", return_value=torch.device("cpu"))
+    @patch("vllm_ascend.ops.linear.torch.distributed.get_rank", return_value=0)
+    @patch("vllm.distributed.get_tp_group")
+    @patch("vllm_ascend.ops.linear.torch_npu.get_npu_format", return_value=2, create=True)
+    def test_nd_weight_initializes_and_caches_transpose(self, get_format, get_tp_group, get_rank, device):
+        backend = get_tp_group.return_value.device_group._get_backend.return_value
+        backend.get_hccl_comm_name.return_value = "test_hcom"
+        self.assertTrue(self.layer._mmrs_fusion_ready())
+        get_format.assert_called_once_with(self.layer.weight)
+        backend.get_hccl_comm_name.assert_called_once_with(0)
+        self.assertEqual(self.layer._mmrs_hcom, "test_hcom")
+        torch.testing.assert_close(self.layer._mmrs_weight, self.layer.weight.data.t())
+        self.assertEqual(self.layer._mmrs_weight.data_ptr(), self.layer.weight.data_ptr())
+        self.assertFalse(self.layer._mmrs_unavailable)
+        self.assertTrue(self.layer._mmrs_fusion_ready())
+        get_format.assert_called_once()
+        get_tp_group.assert_called_once()
+
+
+class TestMMRSFusionEligibility(unittest.TestCase):
+    @patch("vllm_ascend.ops.linear.get_forward_context")
+    def test_raw_mmrs_rejects_quantized_bias_and_dtype_mismatch(self, context):
+        context.return_value.mmrs_fusion = True
+        layer = object.__new__(AscendRowParallelLinear)
+        torch.nn.Module.__init__(layer)
+        layer.tp_size = 2
+        layer.skip_bias_add = False
+        layer.weight = torch.nn.Parameter(torch.ones(4, 8, dtype=torch.bfloat16))
+        layer.bias = None
+        layer.quant_method = AscendUnquantizedLinearMethod()
+        inputs = torch.ones(1024, 8, dtype=torch.bfloat16)
+        with patch.object(layer, "_mmrs_fusion_ready", return_value=True) as ready:
+            self.assertTrue(layer._use_mmrs_fusion(inputs))
+            ready.reset_mock()
+            layer.bias = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+            self.assertFalse(layer._use_mmrs_fusion(inputs))
+            layer.skip_bias_add = True
+            self.assertTrue(layer._use_mmrs_fusion(inputs))
+            ready.reset_mock()
+            layer.quant_method = MagicMock()
+            self.assertFalse(layer._use_mmrs_fusion(inputs))
+            ready.assert_not_called()
+            layer.quant_method = AscendUnquantizedLinearMethod()
+            self.assertFalse(layer._use_mmrs_fusion(inputs.float()))
+            layer.tp_size = 1
+            self.assertFalse(layer._use_mmrs_fusion(inputs))
+
+
 class TestAscendMergedColumnParallelLinear(BaseLinearTest):
     def test_merged_mlp_tp_init(self):
         ascend_config._ASCEND_CONFIG = MagicMock()
