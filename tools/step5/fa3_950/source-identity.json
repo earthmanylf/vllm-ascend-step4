@@ -1,0 +1,160 @@
+{
+  "base_image_id": "sha256:f08bc4a9db87295fa7465b4b6d847bbf851b12adb1e2a7f3023b3378a6f9fb00",
+  "base_source_dir": "/opt/step5/flash-attention-npu",
+  "template_contract": "4481 family, two bools retained; independent uint64 strides",
+  "changes": [
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/device_triu_mask.h",
+      "before_sha256": "6c7e5d80b241c33ba2f486af5986c45ede74e6fc0ea7bfd5a3068fa91141f7d5",
+      "after_sha256": "dd08b0a5e25367030c1dde1e45aa3c05863d942ab73a1025d92ecdd46cc88e6a"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fa_block.h",
+      "before_sha256": null,
+      "after_sha256": "b39d6d309163f6fcad3428b13f2d0d850e686900bf53f32209d43fbb162d812a"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fa_metadata.aicpu",
+      "before_sha256": "22c09db314653965d2d3c36c6c9a2a685e047062fcda710612d5b160ff662934",
+      "after_sha256": "5cf6d880a707e4d39eeb988e27327fed1437f6fc4ae47f52b2d2575e14b7827e"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fa_metadata_args.h",
+      "before_sha256": "372a9f02fd2ae95f250eda205c3209030a65d55b459e0d556eace7bad1b59048",
+      "after_sha256": "1b3f03e5afaddae1d33d1900a9a332aea6771a70d0d9911875203aa070c0c93a"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fag_common.h",
+      "before_sha256": "d84b900ded1635446ff337c00a76d0b2181e7d88b55fae26c84cc2be0640a0e7",
+      "after_sha256": "77dd936295aa252d56da9b339e079653a1e62dba0a9467c8dbe17fb8a0e59c76"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fag_det_schedule_host.hpp",
+      "before_sha256": "4f0e939f1eb688a4eeaff4078e10113a543634216709b1544e2eea55a2fa9172",
+      "after_sha256": "67a1b2cd0d2f9993435a1f31d2662ac9e137afa7606333e0e0ac29391fc548c6"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fag_epilogue_scaled_mask_softmax.hpp",
+      "before_sha256": "3692654116ee909b86afcbf399dd8d2fddd90815ee674453fd904ec9c11465b6",
+      "after_sha256": "804a3dbf0f3ec212eada5959b5fb9593a2377ac7979111e9166a7b3b56ab43dc"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fag_epilogue_sub_mul.hpp",
+      "before_sha256": "db3e96a84457dcb31f844f6d1ddb49f370eb344f31f01e4466544f5e4501ed0b",
+      "after_sha256": "47b8d57214dc7e63c8f6e87c050ee5e85db5b221840c53ac45a1c4d9ac8c7d57"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fag_kernel.cpp",
+      "before_sha256": "124e0cc49403a2e85ab272b4fc8a105a29e88a1640bdc468fdd96c4f4a71f1d0",
+      "after_sha256": "2fa1cf6fff8b00a9fb43e597524b862a95cb16f210979eb9de55ff13f7f68f59"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fag_tiling.cpp",
+      "before_sha256": "08cd4e866c7271ed332827e26b23e2af6c2b98f0fa1bb80ce17f865925d2ffe1",
+      "after_sha256": "c535d5ce50436634dae7422990d02f7ab94c8d53e2dda057781eccecbd36f4eb"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fd_combine.hpp",
+      "before_sha256": "3ac31d9c27a372238c5fcdac8985d0a6fb6e7b4a580485610eb876b3de9806ac",
+      "after_sha256": "9a71a2bb258efb202da3fbf94ab0eb12cd66d8c96246a5a4e0f2a3cce2dc46a2"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/flash_api.cpp",
+      "before_sha256": "5a858cce0b2fb7e98cb0198e8b6e7c7a4ad8ded076af2d5db99bcddcc400967d",
+      "after_sha256": "0464ddb0bc1d7fc1244acd8bf4ea3abb8d4b42343507e8943ea004e304fdccc3"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fwd_dispatch.hpp",
+      "before_sha256": "96e073df703554a87a225594426bcbdc003ffd45f851542d177fc9427ee9b0c1",
+      "after_sha256": "49a81760d2697033702f58a26dbef1de696afb2d8751f222366302cb68aa5157"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fwd_dispatch_impl.hpp",
+      "before_sha256": "5f820309b7e8b4e269c76671c982cec3b45b7c87b9c543b870ec287e55928ff7",
+      "after_sha256": "832af156f517cced6136b3549accf3f26aefce6152f92555f240d79ce4ba8f47"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/fwd_kernel.cpp",
+      "before_sha256": "b08c79773a0452580293cfc24a28c0c3f7d20398637cb7de9287561eabccc91a",
+      "after_sha256": "5b577b6526f8e95489fb326a61b1ae7a7c01497d7a5d8c797de7fc95eaeec312"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/kernel_common.hpp",
+      "before_sha256": "f28147fafbf59b550c2d29eb9a14a39080fe0b118d7f3e4ee26dc1b64e53cdc8",
+      "after_sha256": "23c11b1795e8a4d684d194e44b29d1e33d5d879dc21de958ec20cf23a469620c"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/mha_bwd.cpp",
+      "before_sha256": "09bb59d4e44c7de5b3087835dbc99e8b2d9691694926f88fb34ce90c12e0611d",
+      "after_sha256": "20faedd687351275b2cfaf92e9a484acdee90a0fd318cdcddc9ff2b2e69db640"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/mha_fwd.cpp",
+      "before_sha256": "de4ff7bb507a274c9f3e153434e964c65b2fe76198a1dca84e689b8b4554593d",
+      "after_sha256": "61dcf6e0c21bacbad8c3558fcb28beaf0d14361abb891c58b3d6bc99a9fd77a1"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/online_softmax.hpp",
+      "before_sha256": "8f078865fecf7c7e0b576bf97d8e863f565f32b77a43519634ba291673b0415e",
+      "after_sha256": "c787c62b0aebed5b9845d1c3c1b653957a859fd0dc8eeffab102e0b427133859"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/paged_stride.hpp",
+      "before_sha256": null,
+      "after_sha256": "7ac683c181b9ff879c4f80bf95881e2fc96566ce884d30fb4ef5c1038bdf4079"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/pv_matmul.hpp",
+      "before_sha256": "25d5e18613a91283f831d889aac0eb546f647c62b119dd45f9c5072e0d3d1144",
+      "after_sha256": "4e4655bc07e201bb3433e4beef8baae3e540c34c5874183bbd3ee0184b303e3b"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/qk_matmul.hpp",
+      "before_sha256": "0f1f7a72634e3ddcbaba33ecdfb4fc12a6c9fae3e28adb41f95b6a7353e2121e",
+      "after_sha256": "7ea64752bb83e04a2b3aace8a3463053fd61d72f181b48d0297bd0fa2119f900"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/qk_matmul_DN.hpp",
+      "before_sha256": "e223afaf5aae9a0f39f5a5d76190f2bc71b921e2fc68e8af9bd4bc56c6d75864",
+      "after_sha256": "fb115f403a79cc566ab55e0e77f8d05f3d9c513edf56c5d7b2b0ad750670bca0"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/rescale_o.hpp",
+      "before_sha256": "9599e482feca051af335b54e100d6f14899470c00318abb5f1b5686abc5c2cfb",
+      "after_sha256": "b9db3d714099c6c59127c8eccbf459c8edf53fb964a0910a056b065637740fc6"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/tiling.cpp",
+      "before_sha256": "551c0e55fe0b197b78a6fd2340019213f5d41d9a2848fc8c6ee54c4d124faf70",
+      "after_sha256": "8f690332b188888a81464792fc006b68f39e200db1f405d48b9ac2650a47295b"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/tiling_from_tensors.hpp",
+      "before_sha256": "639d22d7aa0e959a3a2ad9583d2462664a1b317e1e1fe9c6c106aec5dc223356",
+      "after_sha256": "189a5360e2849bfa6661e2cbe2b8d1f72aad5ca2ab0939280d90975fcec81393"
+    },
+    {
+      "path": "csrc/ascend950/flash_attn_npu_3/tilingdata.h",
+      "before_sha256": "243969ad77b1a8db63531a23be03ccdd36d1798791b86c8acdf317ca20f6d969",
+      "after_sha256": "7ef823674bfaf068d6eb9ad4b05107a9df35e8236a4b060e3beb0eea499d37f1"
+    },
+    {
+      "path": "flash_attn_npu_3/__init__.py",
+      "before_sha256": "0d2bc4695dc007dd313e2e07791e9dfabceb7a96a71e732425c88b4f89a00aeb",
+      "after_sha256": "e8dd58a54f33849d5012ccbceda23511590b076e032adab9ac1a0622de426090"
+    },
+    {
+      "path": "flash_attn_npu_3/flash_attn_npu_interface_950.py",
+      "before_sha256": "499cec472362862d0a7237ac6ecca55ed67ed148630af1e5879eb684d1db4bed",
+      "after_sha256": "e75fba0c53a24abe2864cab07efab09bbe6ffc8c61342a28c8039fffdd91d8fd"
+    },
+    {
+      "path": "setup.py",
+      "before_sha256": "8db5f0bced489bcd2b08c0dff8c311a523200829eb652c5fd112f4f5a612c215",
+      "after_sha256": "ee3593c2fee35d009aa526a16d557aa54e74f3ee765c603de5421b236877dcad"
+    }
+  ],
+  "patch_sha256": "36b53368198a1528d48c72d25ee9f35c02c396cae141055fddd5716e8780d878",
+  "ascend_base_commit": "8458ec69de8b59c87128c7018713e9d6d1485d21",
+  "abi_version": 1
+}

@@ -18,9 +18,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
-from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul, SiluAndMulWithClamp
+from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul, SiluAndMulWithClamp, SwigluStepAndMul
 
-from vllm_ascend.ops.activation import AscendSiluAndMulWithClamp
+from vllm_ascend.ops.activation import AscendSiluAndMulWithClamp, AscendSwigluStepAndMul
 
 
 @pytest.fixture
@@ -95,3 +95,21 @@ def test_SiluAndMulWithClamp_forward(
 
     expected_out = dummy_tensor[..., : dummy_tensor.shape[-1] // 2] + 1
     assert torch.allclose(out, expected_out)
+
+
+@pytest.mark.parametrize("limit", [1.0, 7.0, 100.0])
+def test_swiglustep_registered_dispatch(limit, default_vllm_config):
+    x = torch.randn(4, 32)
+    with patch.object(AscendSwigluStepAndMul, "swiglustep_forward", return_value=x) as fused:
+        layer = SwigluStepAndMul(limit=limit)
+        assert isinstance(layer, AscendSwigluStepAndMul)
+        assert layer(x) is x
+        fused.assert_called_once_with(x, limit=limit)
+
+
+def test_swiglustep_native_fallback():
+    x = torch.randn(4, 32)
+    with patch("vllm.triton_utils.HAS_TRITON", False):
+        actual = AscendSwigluStepAndMul.swiglustep_forward(x, limit=2.0)
+    expected = torch.nn.functional.silu(x[:, :16]).clamp(max=2.0) * x[:, 16:].clamp(-2.0, 2.0)
+    torch.testing.assert_close(actual, expected)

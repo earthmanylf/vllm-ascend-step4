@@ -662,7 +662,12 @@ def _fused_indexer_qkz_kv_norm_rope_impl(
     k_norm_weight_bias: float = 0.0,
     subtract_mean_q: bool = False,
     subtract_mean_k: bool = True,
+    row_stride: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # ``row_stride`` lets the caller hand over the projection output in place
+    # (q | k | z | gate rows) instead of concatenating q|k|z first: the kernel
+    # already walks rows with an explicit token stride, so a wider source row
+    # is free. 0 keeps the packed (q+k+2k)*head_dim layout.
     # ``rotary_dim`` follows the module convention: the number of rotated
     # dims at the head of each indexer head (sparse_indexer_rope_dim, e.g.
     # 32). The kernel works in NeoX pairs: real = dims[:rotary_pairs],
@@ -682,7 +687,10 @@ def _fused_indexer_qkz_kv_norm_rope_impl(
     m_k = tokens * num_k_heads
     q_seg_len = num_q_heads * head_dim
     z_seg_len = (num_q_heads + num_k_heads) * head_dim
-    token_stride = (num_q_heads + 2 * num_k_heads) * head_dim
+    packed_width = (num_q_heads + 2 * num_k_heads) * head_dim
+    token_stride = row_stride or packed_width
+    if token_stride < packed_width:
+        raise ValueError("Indexer norm+rope row stride is narrower than the q|k|z row")
 
     grid = lambda meta: (
         min(
@@ -755,6 +763,7 @@ def _fused_indexer_qkz_kv_norm_rope_fake(
     k_norm_weight_bias: float = 0.0,
     subtract_mean_q: bool = False,
     subtract_mean_k: bool = True,
+    row_stride: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = x_cat.shape[0]
     q = torch.empty((tokens, num_q_heads * head_dim), device=x_cat.device, dtype=x_cat.dtype)
@@ -790,6 +799,7 @@ def fused_indexer_qkz_kv_norm_rope(
     k_norm_weight_bias: float = 0.0,
     subtract_mean_q: bool = False,
     subtract_mean_k: bool = True,
+    row_stride: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return torch.ops.vllm.ascend_step5_fused_indexer_norm_rope(
         x_cat,
@@ -809,4 +819,5 @@ def fused_indexer_qkz_kv_norm_rope(
         k_norm_weight_bias=k_norm_weight_bias,
         subtract_mean_q=subtract_mean_q,
         subtract_mean_k=subtract_mean_k,
+        row_stride=row_stride,
     )

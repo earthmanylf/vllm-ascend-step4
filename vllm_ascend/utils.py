@@ -831,6 +831,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         AscendQuickGELU,
         AscendSiluAndMul,
         AscendSiluAndMulWithClamp,
+        AscendSwigluStepAndMul,
     )
     from vllm_ascend.ops.bailing_moe_linear_attn import AscendBailingMoELinearAttention
     from vllm_ascend.ops.conv import AscendConv3dLayer
@@ -868,6 +869,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "QuickGELU": AscendQuickGELU,
         "SiluAndMul": AscendSiluAndMul,
         "SiluAndMulWithClamp": AscendSiluAndMulWithClamp,
+        "SwigluStepAndMul": AscendSwigluStepAndMul,
         "RotaryEmbedding": AscendRotaryEmbedding,
         "Gemma4RotaryEmbedding": AscendGemma4RotaryEmbedding,
         "MRotaryEmbedding": AscendMRotaryEmbedding,
@@ -1916,7 +1918,11 @@ def use_updatable_graph(
 ) -> bool:
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 
-    return attn_backend is not None and issubclass(attn_backend, AscendAttentionBackend)
+    return (
+        attn_backend is not None
+        and not getattr(attn_backend, "uses_device_fa3", False)
+        and issubclass(attn_backend, AscendAttentionBackend)
+    )
 
 
 def _is_glm_model(model_config) -> bool:

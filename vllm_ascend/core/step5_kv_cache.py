@@ -67,6 +67,19 @@ def validate_step5_blnhc_descriptors(config, layout):
     specs = _layer_specs(config.kv_cache_groups)
     if not specs or type(config.num_blocks) is not int or config.num_blocks <= 0:
         raise ValueError("Step5 BLNHC requires layers and positive blocks")
+    # The DSA summary layer replaces its BLNHC-strided 4 KiB pages with a dense
+    # mirror (see models/step5/summary_cache._summary_table). That mirror only
+    # becomes this layer's `kv_cache`, so a freshly allocated block is cleared
+    # through the runner's KVBlockZeroer rather than by this layer. Step5's
+    # bf16 main KV plus uint8 summaries already make the cache mixed-precision,
+    # which is what enables zeroing today; fail loudly if that ever changes,
+    # because a reused block would then serve a previous owner's summaries.
+    if not getattr(config, "needs_kv_cache_zeroing", False):
+        raise ValueError(
+            "Step5 BLNHC requires worker-side KV block zeroing "
+            "(KVCacheConfig.needs_kv_cache_zeroing); the dense summary mirror "
+            "depends on it to clear reused blocks."
+        )
     if any(getattr(group, "host_resident", False) for group in config.kv_cache_groups):
         raise ValueError("Step5 BLNHC does not support host-resident groups")
     regions = {}

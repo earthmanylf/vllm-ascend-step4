@@ -727,6 +727,10 @@ def test_summary_binding_installs_the_cache_used_by_dsa():
         Step5SparseSummaryCacheLayer=object,
         AscendStep5SparseSummaryBackend=object,
         AscendStep5SparseSummaryCache=_load_cache_cls(FakeKernels()),
+        # Only referenced by the BLNHC dense-mirror path; this test binds an
+        # already-dense table, so keep the paged table identity.
+        _summary_table=lambda page, *, blnhc: page,
+        logger=types.SimpleNamespace(info=lambda *a, **k: None),
     )
     exec(compile(ast.Module(body=[layer_node], type_ignores=[]), str(SRC), "exec"), namespace)  # noqa: S102
     layer = namespace[layer_node.name].__new__(namespace[layer_node.name])
@@ -802,7 +806,7 @@ def test_summary_constructor_installs_independent_metadata_layer_name():
     )
     backend = _load_summary_backend_types().AscendStep5SparseSummaryBackend
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    namespace = dict(torch=torch, weakref=weakref, AscendStep5SparseSummaryBackend=backend)
+    namespace = dict(torch=torch, weakref=weakref, os=os, AscendStep5SparseSummaryBackend=backend)
     exec(
         compile(ast.fix_missing_locations(ast.Module(body=[future, base, layer], type_ignores=[])), str(SRC), "exec"),
         namespace,

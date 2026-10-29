@@ -28,6 +28,8 @@ import vllm.envs as envs_vllm
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
+from vllm_ascend import envs
+
 # todo: please remove it when solve cuda hard code in vllm
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
@@ -253,6 +255,14 @@ class NPUPlatform(Platform):
         use_sparse = attn_selector_config.use_sparse
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
+
+        if envs.VLLM_ASCEND_ENABLE_FA3 and backend_key == (False, False, False):
+            if attn_selector_config.use_pcp or attn_selector_config.use_dcp:
+                raise NotImplementedError("Device-tiling FA3 does not support PCP or DCP.")
+            if util.find_spec("flash_attn_npu_3") is None:
+                raise ImportError("Device-tiling FA3 requires flash-attention-npu built with flash_attn_npu_3.")
+            logger.info_once("Using Ascend device-tiling FA3 attention.")
+            return "vllm_ascend.attention.flash_attention_v3.AscendFlashAttentionBackend"
 
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"

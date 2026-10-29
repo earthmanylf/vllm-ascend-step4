@@ -593,14 +593,29 @@ class TestUnifiedApplyActivation(unittest.TestCase):
         self.assertTrue(torch.allclose(out, gate * up))
 
     def test_swiglustep_uses_hardcoded_limit(self):
+        mlp_input = _mlp_compute_input(activation=MoEActivation.SWIGLUSTEP, swiglu_limit=5.0)
         with patch(f"{MOE_MLP}.AscendSwigluStepAndMul.swiglustep_forward", return_value="out") as mock_act:
             out = _unified_apply_activation(
-                _mlp_compute_input(activation=MoEActivation.SWIGLUSTEP, swiglu_limit=5.0),
+                mlp_input,
                 "x",
                 self._quant_method(),
             )
         self.assertEqual(out, "out")
-        mock_act.assert_called_once_with("x", limit=7.0)
+        mock_act.assert_called_once_with("x", limit=7.0, group_list=mlp_input.group_list)
+
+    def test_swiglustep_converts_cumulative_group_list(self):
+        mlp_input = _mlp_compute_input(
+            activation=MoEActivation.SWIGLUSTEP, group_list=torch.tensor([1, 4, 4]), group_list_type=0
+        )
+        with patch(f"{MOE_MLP}.AscendSwigluStepAndMul.swiglustep_forward", return_value="out") as mock_act:
+            _unified_apply_activation(mlp_input, "x", self._quant_method())
+        torch.testing.assert_close(mock_act.call_args.kwargs["group_list"], torch.tensor([1, 3, 0]))
+
+    def test_swiglustep_sparse_group_table_computes_all_rows(self):
+        mlp_input = _mlp_compute_input(activation=MoEActivation.SWIGLUSTEP, group_list_type=2)
+        with patch(f"{MOE_MLP}.AscendSwigluStepAndMul.swiglustep_forward", return_value="out") as mock_act:
+            _unified_apply_activation(mlp_input, "x", self._quant_method())
+        mock_act.assert_called_once_with("x", limit=7.0, group_list=None)
 
     def test_swigluoai_uninterleave_uses_clipped_swiglu(self):
         with patch(f"{MOE_MLP}.DeviceOperator.clipped_swiglu", return_value="out") as mock_act:

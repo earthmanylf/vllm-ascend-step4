@@ -75,6 +75,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Whether to run Step5 routed experts with the native fp8 block kernels
     # (Step5Fp8BlockFusedMoEMethod). Default 0 -> AscendFp8BlockFusedMoEMethod. Valid "0"/"1".
     "VLLM_ASCEND_ENABLE_STEP5_FP8": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_STEP5_FP8", "0"))),
+    # Opt in to the Step4 device-tiling FA3 backend on Model Runner V2.
+    # Default 0; valid "0"/"1"; not sensitive. Requires flash_attn_npu_3 with
+    # explicit num_blocks/max_num_blocks_per_seq scheduler arguments.
+    # The old Step4 name is a compatibility alias, evaluated centrally.
+    "VLLM_ASCEND_ENABLE_FA3": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_FA3", os.getenv("VLLM_STEP4_ENABLE_FA3", "0")))
+    ),
 }
 
 # end-env-vars-definition

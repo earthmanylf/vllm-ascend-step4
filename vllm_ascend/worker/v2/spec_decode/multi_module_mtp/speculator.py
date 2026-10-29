@@ -198,6 +198,19 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
                 common.query_start_loc_cpu = query
 
             offload_kwargs = {"common_metadata_callback": prepare_fia_common_metadata}
+        if any(
+            getattr(group.backend, "uses_device_fa3", False)
+            for groups in getattr(self, "attn_groups", ())
+            for group in groups
+        ):
+            # Upstream does not forward FULL/real-request metadata here.
+            # Use the actual descriptor, not membership in the original
+            # capture-size list (MTP graph token counts may be rounded up).
+            offload_kwargs = dict(offload_kwargs or {})
+            offload_kwargs.update(
+                full_graph_mode=batch_desc.cg_mode == CUDAGraphMode.FULL,
+                num_actual_reqs=num_reqs,
+            )
         with build_attn_metadata_factory(
             self.input_buffers.positions,
             batch_desc.num_tokens,
