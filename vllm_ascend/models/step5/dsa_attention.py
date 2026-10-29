@@ -409,7 +409,18 @@ class AscendStep5DSAMetadataBuilder(AttentionMetadataBuilder[AscendStep5DSAMetad
             raise ValueError("Step5 decode graph requires the existing CPU length mirror")
         lengths = seq_cpu[:padded].tolist()
         capacity = min(table.shape[1] * self.gbsa_block_size, (1 << 31) - 1)
-        if any(length < width or length > capacity for length in lengths[:real]) or any(
+        # The CPU mirror is an optimistic upper bound whenever async spec decode
+        # is active: it assumes every draft of the previous step was accepted,
+        # while the device value also subtracts the re-prefill rewind
+        # max(0, num_rejected - 1). The device value is authoritative and never
+        # larger than this bound, and the gap is bounded by `width - 1` because a
+        # rewind cannot discard more than one query window's drafts. Comparing
+        # the bound straight against `capacity` would therefore reject a batch
+        # whose exact length still fits, so allow exactly that slack. The device
+        # copy below carries the exact value into the graph, so this stays a
+        # guard, not the source of truth.
+        host_slack = width - 1
+        if any(length < width or length > capacity + host_slack for length in lengths[:real]) or any(
             length != 0 for length in lengths[real:]
         ):
             raise ValueError("Invalid real or padded Step5 graph KV lengths")

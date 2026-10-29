@@ -18,6 +18,7 @@
 #
 
 import inspect
+import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
@@ -160,6 +161,18 @@ class NPUModelRunner(GPUModelRunner):
         parallel_config = vllm_config.parallel_config
 
         spec_pp_support = resolve_spec_pp_support(vllm_config)
+        # Post-rejection host counts are only needed when a CPU consumer reads
+        # them. Reading them back blocks on the whole target forward and unloads
+        # the async pipeline; the DeepSeek-V4.1 path already keeps the upstream
+        # optimistic bound instead. Make that choice explicit and reversible.
+        self.sync_spec_seq_lens_cpu = bool(int(os.getenv("VLLM_ASCEND_TARGET_EXACT_SEQ_LENS", "1")))
+        logger.info_once(
+            "Ascend target seq_lens readback (VLLM_ASCEND_TARGET_EXACT_SEQ_LENS=%d). "
+            "0 keeps the upstream optimistic CPU bound and avoids a per-step "
+            "device->host sync; only valid for backends that read KV lengths "
+            "from device tensors.",
+            int(self.sync_spec_seq_lens_cpu),
+        )
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         # These FIA models need post-rejection host counts on every PP stage.
@@ -176,6 +189,21 @@ class NPUModelRunner(GPUModelRunner):
                 "Qwen3_5ForConditionalGeneration",
             )
         )
+        # Opting out of the per-step readback is only proven for single-stage
+        # pipelines: with PP>1 a non-last stage receives rejections without
+        # owning a speculator, and its host lengths would silently drift. Refuse
+        # that combination instead of running it unverified.
+        if (
+            self.use_pp
+            and self.num_speculative_steps > 0
+            and not self.sync_spec_seq_lens_cpu
+            and not self.sync_spec_pp_cpu_counts
+        ):
+            raise NotImplementedError(
+                "VLLM_ASCEND_TARGET_EXACT_SEQ_LENS=0 is not validated for "
+                "pipeline parallelism with speculative decoding and this "
+                "architecture; keep the readback enabled (flag=1) for PP>1."
+            )
         # These draft heads consume target aux states collected across PP ranks.
         if spec_pp_support is not None and spec_pp_support.needs_aux_hidden_states:
             self.use_aux_hidden_state_outputs = True
@@ -1273,7 +1301,9 @@ class NPUModelRunner(GPUModelRunner):
         # exemption to other backends that do not need exact CPU seq_lens.
         # Non-last PP stages receive rejections without owning a speculator.
         if (
-            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
+            self.speculator is not None
+            and not is_deepseek_v41(self.model_config.hf_config)
+            and self.sync_spec_seq_lens_cpu
         ) or self.sync_spec_pp_cpu_counts:
             self._copy_num_computed_tokens_to_cpu()
 
@@ -1309,7 +1339,9 @@ class NPUModelRunner(GPUModelRunner):
         # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
         # so this update also corrects the num_computed_tokens_np used by PCP.
         if (
-            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
+            self.speculator is not None
+            and not is_deepseek_v41(self.model_config.hf_config)
+            and self.sync_spec_seq_lens_cpu
         ) or self.sync_spec_pp_cpu_counts:
             # Blocks CPU submission until D2H completes; may stall the async pipeline.
             self.num_computed_tokens_event.synchronize()
@@ -1323,6 +1355,12 @@ class NPUModelRunner(GPUModelRunner):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
             self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
+        # Pad rows must read 0 on every consumer. Rows past this batch's real
+        # requests would otherwise keep the previous step's lengths, so a
+        # padded-row guard could see a stale non-zero value.
+        num_real = len(req_ids)
+        if 0 < num_real < self.input_buffers.seq_lens_cpu.numel():
+            self.input_buffers.seq_lens_cpu[num_real:].zero_()
 
     def _pad_query_start_loc_for_fia(
         self,
