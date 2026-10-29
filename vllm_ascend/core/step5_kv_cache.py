@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Step5 native K/V views over upstream descriptor-backed shared storage.
+"""Contiguous Step5 K/V views over the upstream shared group backing.
 
-BLNHC retains real layer pages inside global block tiles, including aligned PD
-storage. The legacy compact permutation requires identical unpadded pages.
+The byte permutation from page-interleaved K/V to K-then-V is identical
+for every layer slot. It preserves exclusive block ownership across groups
+only when all layers have identical, unpadded storage geometry.
 """
 
 import torch
@@ -11,14 +12,16 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
-    compute_layer_kv_cache_shape_bytes,
-    compute_layout_strides,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 
 def uses_step5_blnhc(vllm_config):
-    """Select V2 BLNHC, including locally validated homogeneous PD profiles."""
+    """Select local V2 BLNHC; active PD retains the validated compact profile.
+
+    Transport capability is checked by validate_step5_kv_transfer_config,
+    independently of this layout selection.
+    """
     if not getattr(vllm_config, "use_v2_model_runner", False):
         return False
     if getattr(vllm_config.model_config.hf_text_config, "model_type", None) != "step5":
@@ -32,32 +35,12 @@ def uses_step5_blnhc(vllm_config):
         or getattr(getattr(vllm_config, "attention_config", None), "hisparse_config", None) is not None
         or any(
             getattr(parallel, field, 1) != 1
-            for field in ("prefill_context_parallel_size", "decode_context_parallel_size")
+            for field in ("prefill_context_parallel_size", "decode_context_parallel_size", "pipeline_parallel_size")
         )
     ):
-        raise ValueError("Step5 BLNHC currently requires V2 local KV with PCP/DCP=1 and no offload")
-    validate_step5_kv_transfer_config(vllm_config)
-    return True
-
-
-def _validate_step5_blnhc_spec(spec):
-    if type(spec) not in (FullAttentionSpec, SlidingWindowSpec, CircularBufferSpec):
-        raise ValueError("Step5 BLNHC does not support this cache spec")
-    if getattr(spec, "num_head_slots", None) is not None or getattr(spec, "state_content_bytes", None) is not None:
-        raise ValueError("Step5 BLNHC does not support packed head slots or state content")
-    ratio = getattr(spec, "tokens_per_state", 1)
-    if spec.block_size != 128 or getattr(spec, "kv_quant_mode", 0) != 0:
-        raise ValueError("Step5 BLNHC requires unquantized 128-token manager blocks")
-    if getattr(spec, "page_size_padded", None) is not None:
-        raise ValueError("Step5 BLNHC must retain each layer's real page size")
-    if type(spec) is CircularBufferSpec:
-        valid = spec.dtype == torch.bfloat16 and spec.head_size_v == 0 and ratio == 1
-    elif spec.head_size_v == 0:
-        valid = type(spec) is FullAttentionSpec and spec.dtype == torch.uint8 and spec.head_size == 256 and ratio == 8
-    else:
-        valid = spec.dtype == torch.bfloat16 and spec.head_size == spec.head_size_v == 192 and ratio == 1
-    if not valid or spec.num_kv_heads != 1:
-        raise ValueError("Step5 BLNHC cache geometry is unsupported")
+        raise ValueError("Step5 BLNHC currently requires V2 local KV with PP/PCP/DCP=1 and no offload")
+    transfer = vllm_config.kv_transfer_config
+    return transfer is None or not transfer.is_kv_transfer_instance
 
 
 def validate_step5_blnhc_descriptors(config, layout):
@@ -84,7 +67,31 @@ def validate_step5_blnhc_descriptors(config, layout):
             if name not in specs or name in regions:
                 raise ValueError("Step5 BLNHC descriptors contain unknown or duplicate layers")
             spec = specs[name]
-            _validate_step5_blnhc_spec(spec)
+            if type(spec) not in (FullAttentionSpec, SlidingWindowSpec, CircularBufferSpec):
+                raise ValueError("Step5 BLNHC does not support this cache spec")
+            if (
+                getattr(spec, "num_head_slots", None) is not None
+                or getattr(spec, "state_content_bytes", None) is not None
+            ):
+                raise ValueError("Step5 BLNHC does not support packed head slots or state content")
+            ratio = getattr(spec, "tokens_per_state", 1)
+            if spec.block_size != 128 or getattr(spec, "kv_quant_mode", 0) != 0:
+                raise ValueError("Step5 BLNHC requires unquantized 128-token manager blocks")
+            if getattr(spec, "page_size_padded", None) is not None:
+                raise ValueError("Step5 BLNHC must retain each layer's real page size")
+            if type(spec) is CircularBufferSpec:
+                valid = spec.dtype == torch.bfloat16 and spec.head_size_v == 0 and ratio == 1
+            elif spec.head_size_v == 0:
+                valid = (
+                    type(spec) is FullAttentionSpec
+                    and spec.dtype == torch.uint8
+                    and spec.head_size == 256
+                    and ratio == 8
+                )
+            else:
+                valid = spec.dtype == torch.bfloat16 and spec.head_size == spec.head_size_v == 192 and ratio == 1
+            if not valid or spec.num_kv_heads != 1:
+                raise ValueError("Step5 BLNHC cache geometry is unsupported")
             # Check native row alignment independently of the collected spec:
             # a missing backend customization must fail before allocation, not
             # later in GBSA's PA_BBND tiling parser.
@@ -120,40 +127,14 @@ def validate_step5_blnhc_descriptors(config, layout):
     return specs
 
 
-def allocate_step5_pd_blnhc(config, device, layout, kernel_block_sizes):
-    """Canonical upstream views on one aligned PD slab; never replan tiles."""
-    specs = validate_step5_blnhc_descriptors(config, layout)
-    if len(kernel_block_sizes) != len(config.kv_cache_groups) or any(size != 128 for size in kernel_block_sizes):
-        raise ValueError("Step5 BLNHC currently requires 128-token kernel blocks for every group")
-    size = config.kv_cache_tensors[0].size
-    raw = torch.zeros(size + STEP5_PD_BUFFER_ALIGNMENT, dtype=torch.int8, device=device)
-    # Offsets are absolute within the raw storage, including the aligned prefix.
-    base_offset = (-raw.data_ptr()) % STEP5_PD_BUFFER_ALIGNMENT
-    caches = {}
-    for descriptor in config.kv_cache_tensors:
-        for index, name in enumerate(descriptor.layers):
-            spec = specs[name]
-            shape = compute_layer_kv_cache_shape_bytes(spec, config.num_blocks, 128)
-            strides = compute_layout_strides(
-                spec,
-                config.num_blocks,
-                len(descriptor.layers),
-                layout,
-                128,
-                fixed_strides=(descriptor.layer_stride, descriptor.block_stride, None, None, None),
-            )
-            offset = base_offset + descriptor.offset + index * descriptor.layer_stride
-            caches[name] = raw.as_strided(shape, strides[1:], offset).view(spec.dtype)
-    return caches
-
-
 def step5_blnhc_layer_views(caches, specs):
     """Zero-copy native K/V planes inside each upstream BLNHC layer page.
 
     CANN FIA permits gaps only between blocks, not interleaved token rows.
     Reinterpret the content of each main page as dense K then dense V, while
     retaining the planner's block/layer offsets and its shared global-ID tile.
-    Summary and ring pages retain their canonical content, including in PD.
+    Summary and ring pages retain their canonical content. Active PD selects
+    the separate compact slab path rather than transporting these BLNHC pages.
     """
     if set(caches) != set(specs):
         raise ValueError("Step5 BLNHC allocation does not cover every layer")
@@ -210,111 +191,20 @@ def validate_step5_kv_transfer_config(vllm_config) -> None:
             "Step5 KV transfer requires kv_producer or kv_consumer; kv_both is not supported by Mooncake pull."
         )
     parallel = vllm_config.parallel_config
-    pp_producer = (
-        transfer.kv_role == "kv_producer"
-        and getattr(parallel, "pipeline_parallel_size", None) == 4
-        and getattr(parallel, "tensor_parallel_size", None) == 4
-        and getattr(parallel, "data_parallel_size", None) == 1
-        and getattr(parallel, "data_parallel_size_local", None) == 1
-        and getattr(parallel, "enable_expert_parallel", False)
-        and getattr(vllm_config, "use_v2_model_runner", False)
-    )
-    if parallel.pipeline_parallel_size != 1 and not pp_producer:
-        raise ValueError("Step5 KV transfer requires pipeline_parallel_size=1 or the PP4/TP4 producer profile.")
-    for field in ("prefill_context_parallel_size", "decode_context_parallel_size"):
+    for field in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size"):
         if getattr(parallel, field) != 1:
-            raise ValueError(f"Step5 KV transfer requires {field}=1.")
-    spec = vllm_config.speculative_config
-    if spec is not None:
-        if (
-            not getattr(vllm_config, "use_v2_model_runner", False)
-            or getattr(spec, "method", None) != "mtp"
-            or getattr(spec, "num_speculative_tokens", None) != 3
-        ):
-            raise ValueError(
-                "Step5 KV transfer currently supports only V2 eager MTP3 or the explicit graph/async profile."
-            )
-        target_eager = getattr(vllm_config.model_config, "enforce_eager", False)
-        draft_eager = getattr(spec, "enforce_eager", False)
-        if not (target_eager and draft_eager):
-            compilation = getattr(vllm_config, "compilation_config", None)
-            captures = getattr(compilation, "cudagraph_capture_sizes", None)
-            graph_profile = (
-                not target_eager
-                and not draft_eager
-                and getattr(compilation, "mode", None) == 3
-                and getattr(getattr(compilation, "cudagraph_mode", None), "name", None) == "FULL_DECODE_ONLY"
-                and isinstance(captures, list)
-                and bool(captures)
-                and max(captures) == 512
-                and all(type(size) is int and size > 0 and size % 4 == 0 for size in captures)
-                and getattr(parallel, "tensor_parallel_size", None) == 4
-                and (
-                    pp_producer
-                    or (
-                        (
-                            getattr(parallel, "data_parallel_size", None) == 2
-                            or (
-                                transfer.kv_role == "kv_consumer" and getattr(parallel, "data_parallel_size", None) == 4
-                            )
-                        )
-                        and getattr(parallel, "data_parallel_size_local", None) == 2
-                    )
-                )
-                and getattr(parallel, "enable_expert_parallel", False)
-                and getattr(vllm_config.scheduler_config, "async_scheduling", False)
-                and getattr(vllm_config.scheduler_config, "max_num_seqs", None) == (32 if pp_producer else 256)
-            )
-            if not graph_profile:
-                raise ValueError(
-                    "Step5 MTP3 PD requires both eager runners or an explicit supported graph/async topology."
-                )
-        schedule = getattr(spec, "num_speculative_tokens_per_batch_size", None)
-        max_reqs = getattr(vllm_config.scheduler_config, "max_num_seqs", 1)
-        native_producer_schedule = transfer.kv_role == "kv_producer" and schedule is None
-        if not native_producer_schedule and (
-            not isinstance(schedule, list)
-            or len(schedule) != 1
-            or not isinstance(schedule[0], (list, tuple))
-            or len(schedule[0]) != 3
-            or schedule[0][0] != 1
-            or schedule[0][1] < max_reqs
-            or schedule[0][2] != 3
-        ):
-            raise ValueError("Step5 MTP3 PD requires a constant K=3 batch schedule for unpadded first D admission.")
-        draft = getattr(getattr(spec, "draft_model_config", None), "hf_text_config", None)
-        hidden_size = getattr(vllm_config.model_config.hf_text_config, "hidden_size", None)
-        if (
-            getattr(draft, "model_type", None) != "step5_mtp"
-            or getattr(draft, "num_nextn_predict_layers", None) != 3
-            or type(hidden_size) is not int
-            or hidden_size <= 0
-            or getattr(draft, "hidden_size", None) != hidden_size
-        ):
-            raise ValueError("Step5 MTP3 PD requires three matching Step5MTP draft modules.")
-    if vllm_config.cache_config.enable_prefix_caching and not getattr(vllm_config, "use_v2_model_runner", False):
-        raise ValueError("Step5 KV transfer prefix caching requires the V2 BLNHC model runner.")
-    # A multimodal Step5 checkpoint is fine: the vision tower is never part of the
-    # KV transfer path, and rejecting it here used to force a text-only target plus
-    # a separate MTP draft view, which the vendor's single unified checkpoint does
-    # not need (its MTP layers ship in the same shards as the text layers).
+            raise ValueError(f"Step5 KV transfer requires {field}=1 and matching P/D topology.")
+    if vllm_config.speculative_config is not None:
+        raise ValueError("Step5 KV transfer requires speculative decoding disabled (MTP off).")
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError("Step5 KV transfer requires prefix caching disabled.")
+    if vllm_config.model_config.is_multimodal_model:
+        raise ValueError("Step5 KV transfer currently requires a text-only model configuration.")
 
 
 def step5_tailring_alignment_reserve(vllm_config, groups) -> int:
     """One alignment allocation per eligible PD slab, not per layer/group."""
-    transfer = vllm_config.kv_transfer_config
-    if transfer is None or not transfer.is_kv_transfer_instance:
-        return 0
-    if vllm_config.cache_config.get_resolved_kv_cache_layout() is KVCacheLayout.BLNHC:
-        if not uses_step5_blnhc(vllm_config):
-            return 0
-        specs = _layer_specs(groups)
-        if not specs or any(getattr(group, "host_resident", False) for group in groups):
-            raise ValueError("Step5 PD BLNHC requires nonempty device groups")
-        for spec in specs.values():
-            _validate_step5_blnhc_spec(spec)
-        return STEP5_PD_BUFFER_ALIGNMENT
-    if supports_step5_tailring_shared_backing(vllm_config, groups):
+    if vllm_config.kv_transfer_config is not None and supports_step5_tailring_shared_backing(vllm_config, groups):
         return STEP5_PD_BUFFER_ALIGNMENT
     return 0
 

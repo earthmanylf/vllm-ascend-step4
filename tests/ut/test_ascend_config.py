@@ -1848,8 +1848,8 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_upstream_backend_keeps_sp_without_legacy_flashcomm_flag(self, mock_fix):
-        """Upstream backend selection is authoritative without the legacy key."""
+    def test_flashcomm_disabled_forces_sp_off_when_conditions_met(self, mock_fix):
+        """Case 2: flashcomm off + SP conditions met -> SP still forced off."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
             vc = VllmConfig()
@@ -1861,34 +1861,8 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
             init_ascend_config(vc)
 
-            self.assertEqual(vc.parallel_config.all2all_backend, "allgather_reducescatter")
-            self.assertTrue(enable_sp(vc))
-
-    @_clean_up
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_upstream_sp_backend_supports_tp_ep_without_dp(self, mock_fix):
-        vc = VllmConfig()
-        vc.parallel_config.enable_expert_parallel = True
-        vc.parallel_config.tensor_parallel_size = 4
-        vc.parallel_config.data_parallel_size = 1
-        vc.parallel_config.all2all_backend = "allgather_reducescatter"
-        vc.additional_config = {}
-        init_ascend_config(vc)
-        self.assertEqual(vc.parallel_config.all2all_backend, "allgather_reducescatter")
-        self.assertTrue(enable_sp(vc))
-
-    @_clean_up
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_non_sp_backend_is_preserved_without_legacy_flag(self, mock_fix):
-        vc = VllmConfig()
-        vc.parallel_config.enable_expert_parallel = True
-        vc.parallel_config.tensor_parallel_size = 4
-        vc.parallel_config.data_parallel_size = 1
-        vc.parallel_config.all2all_backend = "flashinfer_all2allv"
-        vc.additional_config = {}
-        init_ascend_config(vc)
-        self.assertEqual(vc.parallel_config.all2all_backend, "flashinfer_all2allv")
-        self.assertFalse(enable_sp(vc))
+            self.assertEqual(vc.parallel_config.all2all_backend, "flashinfer_all2allv")
+            self.assertFalse(enable_sp(vc))
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

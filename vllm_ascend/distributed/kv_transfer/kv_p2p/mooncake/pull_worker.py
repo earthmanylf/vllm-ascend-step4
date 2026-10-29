@@ -42,7 +42,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadataGroups,
     ReqMeta,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.mtp_state import MTPSeedState, decode_mtp_seed_params
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     SizedDict,
     ensure_zmq_recv,
@@ -144,9 +143,6 @@ class MooncakePullRecvingThread(threading.Thread):
         self.remote_layer_index_pairs: SizedDict[str, dict[int, list[tuple[int, int]]]] = SizedDict()
         self.request_queue: queue.Queue[tuple[str, dict[str, ReqMeta]]] = queue.Queue()
         self.finished_requests: queue.SimpleQueue[tuple[str, bool]] = queue.SimpleQueue()
-        # A failed legacy native READ is not a quiescence fence. Keep its
-        # metadata and do not publish completion until a real fence exists.
-        self.quarantined_requests: dict[str, ReqMeta] = {}
         self.invalid_block_ids: set[int] = set()
         self.invalid_block_ids_lock = threading.Lock()
         assert self.local_metadata is not None
@@ -185,12 +181,6 @@ class MooncakePullRecvingThread(threading.Thread):
         self.ready_event.set()
         while True:
             remote_engine_id, requests = self.request_queue.get()
-            is_step5 = getattr(self, "is_step5", False)
-            if is_step5:
-                requests = {key: value for key, value in requests.items() if key not in self.quarantined_requests}
-                if not requests:
-                    self.request_queue.task_done()
-                    continue
             failed_request_ids: set[str] = set()
             request_endpoints = {(request.remote_host, request.remote_port) for request in requests.values()}
             try:
@@ -201,12 +191,11 @@ class MooncakePullRecvingThread(threading.Thread):
                     remote_port,
                     requests,
                 )
-                if not is_step5:
-                    for request_id in failed_request_ids:
-                        self._mark_request_failed(requests[request_id])
+                for request_id in failed_request_ids:
+                    self._mark_request_failed(requests[request_id])
             except Exception as exc:
                 failed_request_ids = set(requests)
-                if not is_step5 and self.can_report_invalid_block_ids:
+                if self.can_report_invalid_block_ids:
                     for request_metadata in requests.values():
                         self._mark_request_failed(request_metadata)
                 logger.exception(
@@ -217,17 +206,7 @@ class MooncakePullRecvingThread(threading.Thread):
                     exc,
                 )
             finally:
-                if is_step5 and failed_request_ids:
-                    self.quarantined_requests.update({key: requests[key] for key in failed_request_ids})
-                    logger.error(
-                        "Step5 Mooncake receive completion is unknown for requests %s; retaining all request blocks. "
-                        "No finished/failed receive, invalid-block report, retry, or producer DONE will be published. "
-                        "Capacity remains pinned until native READ quiescence can be established.",
-                        sorted(failed_request_ids),
-                    )
                 for request_id in requests:
-                    if is_step5 and request_id in failed_request_ids:
-                        continue
                     self.finished_requests.put((request_id, request_id in failed_request_ids))
                 self.request_queue.task_done()
 
@@ -266,9 +245,8 @@ class MooncakePullRecvingThread(threading.Thread):
     def _validate_step5_layer(self, local_index: int, remote_index: int, remote: MooncakePPTransferMetadata) -> None:
         if not remote.is_step5 or not self.local_metadata.is_step5:
             raise ValueError("Mooncake Step5 requires Step5 metadata on both peers")
-        # Each peer indexes its own scheduler block-ID table. Validate
-        # group membership below, not equality of peer-local group numbers.
         for field in (
+            "group_indices",
             "layer_block_sizes",
             "block_shapes",
             "block_lens",
@@ -292,7 +270,7 @@ class MooncakePullRecvingThread(threading.Thread):
         remote_members = {
             name for name, group in zip(remote.layer_names, remote.group_indices) if group == remote_group
         }
-        if local_members.intersection(remote.layer_names) != remote_members:
+        if local_members != remote_members:
             raise ValueError("Mooncake Step5 group membership mismatch")
         for descriptor, index in ((self, local_index), (remote, remote_index)):
             if descriptor.layer_block_sizes[index] != spec.block_size:
@@ -305,33 +283,6 @@ class MooncakePullRecvingThread(threading.Thread):
                 descriptor.block_size_scales[index],
                 descriptor.block_dtypes[index],
             )
-
-    def _validate_step5_pp_projection(self, remote: MooncakeTransferMetadataGroups) -> None:
-        """Validate global group identity before checking stage-local views."""
-        if set(remote.metadata_by_pp_rank) != set(range(remote.pp_size)):
-            raise ValueError("Mooncake Step5 metadata has incomplete PP stages")
-        owner_by_layer: dict[str, int] = {}
-        remote_members_by_group: dict[int, set[str]] = {}
-        for pp_rank, stage in remote.metadata_by_pp_rank.items():
-            if len(stage.layer_names) != len(stage.group_indices):
-                raise ValueError("Mooncake Step5 layer/group metadata length mismatch")
-            for name, group in zip(stage.layer_names, stage.group_indices):
-                if name in owner_by_layer:
-                    raise ValueError(f"Mooncake Step5 duplicate PP layer {name!r}")
-                if type(group) is not int or group < 0:
-                    raise ValueError("Mooncake Step5 invalid remote group index")
-                owner_by_layer[name] = pp_rank
-                remote_members_by_group.setdefault(group, set()).add(name)
-        local_members_by_group: dict[int, set[str]] = {}
-        for name, group in zip(self.layer_names, self.group_indices):
-            local_members_by_group.setdefault(group, set()).add(name)
-        remote_group_by_layer = {name: group for group, names in remote_members_by_group.items() for name in names}
-        for names in local_members_by_group.values():
-            if not names.issubset(owner_by_layer):
-                raise ValueError("Mooncake producer metadata is missing layers required by this worker")
-            groups = {remote_group_by_layer[name] for name in names}
-            if len(groups) != 1 or remote_members_by_group[next(iter(groups))] != names:
-                raise ValueError("Mooncake Step5 global group membership mismatch")
 
     def _build_remote_transfer_layout(
         self,
@@ -349,9 +300,8 @@ class MooncakePullRecvingThread(threading.Thread):
         """
         if getattr(self, "is_step5", False):
             self._validate_step5_topology(remote_metadata.pcp_size, remote_metadata.tp_size, remote_metadata.dcp_size)
-            if not remote_metadata.is_step5 or remote_metadata.pp_size not in (1, 4) or remote_metadata.use_kv_pp:
-                raise ValueError("Mooncake Step5 requires PP1/PP4 Step5 producers without KVPP")
-            self._validate_step5_pp_projection(remote_metadata)
+            if not remote_metadata.is_step5 or remote_metadata.pp_size != 1 or remote_metadata.use_kv_pp:
+                raise ValueError("Mooncake Step5 requires same-topology Step5 peers without KVPP")
         if remote_metadata.use_kv_pp and remote_metadata.dcp_size != 1:
             raise ValueError("Mooncake producer cannot enable KV parallel and DCP together")
         groups_by_pp_rank: dict[int, dict[tuple[int, int], list[list[int]]]] = {}
@@ -775,14 +725,6 @@ class MooncakePullRecvingThread(threading.Thread):
                 remote_group_index = remote_metadata.group_indices[remote_layer_index]
                 if getattr(self, "is_step5", False):
                     self._validate_step5_layer(local_layer_index, remote_layer_index, remote_metadata)
-                    if (
-                        type(group_index) is not int
-                        or type(remote_group_index) is not int
-                        or not 0 <= group_index < len(request_metadata.local_block_ids)
-                        or not 0 <= group_index < len(request_metadata.local_full_block_ids)
-                        or not 0 <= remote_group_index < len(request_metadata.remote_block_ids)
-                    ):
-                        raise ValueError("Mooncake Step5 group_indices outside request block-ID tables")
                     local_dcp_size = layer_remote_dcp_size = 1
                 elif isinstance(spec, FullAttentionSpec):
                     local_dcp_size, layer_remote_dcp_size = self._get_full_attention_dcp_sizes(
@@ -1731,8 +1673,6 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
         self._recving_thread: MooncakePullRecvingThread | None = None
-        self.mtp_seed_states: dict[str, MTPSeedState] = {}
-        self._seen_mtp_seeds: dict[str, MTPSeedState] = {}
 
     def register_kv_caches(
         self,
@@ -1771,25 +1711,8 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             if not self._recving_thread.is_alive():
                 raise RuntimeError("Mooncake pull receiving thread failed to start")
 
-    def clear_mtp_seed_requests(self, request_ids: set[str]) -> None:
-        for request_id in request_ids:
-            self.mtp_seed_states.pop(request_id, None)
-            self._seen_mtp_seeds.pop(request_id, None)
-
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         """Start the pull operations described by scheduler metadata."""
-        for request_id, params in getattr(metadata, "mtp_restore_requests", {}).items():
-            states = decode_mtp_seed_params(
-                params, tp_size=self.tp_size, hidden_size=self.vllm_config.model_config.hf_text_config.hidden_size
-            )
-            seed = states[self.tp_rank]
-            existing = self._seen_mtp_seeds.get(request_id)
-            if existing is not None:
-                if existing != seed:
-                    raise ValueError("Conflicting MTP seed for a D request")
-                continue
-            self.mtp_seed_states[request_id] = seed
-            self._seen_mtp_seeds[request_id] = seed
         if not metadata.requests:
             return
         if self.kv_transfer_config.is_kv_consumer:

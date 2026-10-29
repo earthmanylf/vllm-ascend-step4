@@ -65,11 +65,6 @@ def make_sending_thread(
 def make_pull_scheduler() -> MooncakePullConnectorScheduler:
     scheduler = MooncakePullConnectorScheduler.__new__(MooncakePullConnectorScheduler)
     scheduler.need_truncate = False
-    scheduler.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="other")),
-        kv_transfer_config=None,
-        speculative_config=None,
-    )
     scheduler.num_speculative_tokens = 0
     scheduler.pcp_size = 1
     scheduler.dcp_size = 1
@@ -86,35 +81,6 @@ def make_pull_scheduler() -> MooncakePullConnectorScheduler:
     scheduler._sending_thread = None
     scheduler._recving_thread = None
     return scheduler
-
-
-def test_step5_pp4tp4_handshake_preserves_unique_stage_layer_ownership() -> None:
-    metadata = {}
-    for pp in range(4):
-        for tp in range(4):
-            worker = make_transfer_metadata(
-                layer_names=[f"model.layers.{pp * 24}.attn"],
-                base_addrs=[[1000 + pp * 100 + tp * 10]],
-            )
-            metadata[(pp, tp)] = replace(worker, is_step5=True, block_dtypes=[["torch.bfloat16"]])
-    thread = make_sending_thread(metadata, pp_size=4, tp_size=4)
-    decoded = msgspec.msgpack.decode(thread.encoded_metadata, type=MooncakeTransferMetadataGroups)
-    for pp, stage in decoded.metadata_by_pp_rank.items():
-        assert stage.layer_names == [f"model.layers.{pp * 24}.attn"]
-        for tp, worker in stage.metadata_by_pcp_rank[0].metadata_by_tp_rank.items():
-            assert worker.kv_caches_base_addr == [[1000 + pp * 100 + tp * 10]]
-    del metadata[(2, 3)]
-    with pytest.raises(ValueError, match="incomplete TP ranks"):
-        make_sending_thread(metadata, pp_size=4, tp_size=4)
-
-
-def test_step5_handshake_rejects_layer_owned_by_multiple_pp_stages() -> None:
-    metadata = {}
-    for pp in range(2):
-        worker = make_transfer_metadata(layer_names=["model.layers.0.attn"], base_addrs=[[1000 + pp]])
-        metadata[(pp, 0)] = replace(worker, is_step5=True, block_dtypes=[["torch.bfloat16"]])
-    with pytest.raises(ValueError, match="multiple PP stages"):
-        make_sending_thread(metadata, pp_size=2)
 
 
 def test_sending_thread_merges_tp_private_and_pp_common_metadata() -> None:
@@ -703,7 +669,7 @@ def test_set_worker_metadata_is_ignored_on_consumer() -> None:
 @pytest.fixture
 def prefix_connector():
     result = MooncakePullConnector.__new__(MooncakePullConnector)
-    result.connector_scheduler = make_pull_scheduler()
+    result.connector_scheduler = MooncakePullConnectorScheduler.__new__(MooncakePullConnectorScheduler)
     result.connector_scheduler.need_truncate = True
     return result
 

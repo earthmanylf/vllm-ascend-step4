@@ -40,28 +40,12 @@ except (subprocess.CalledProcessError, FileNotFoundError):
     _npu_available = False
 
 if not _npu_available:
-    # vLLM's ``vllm.triton_utils.importing`` disables Triton unless exactly one
-    # non-CPU backend reports an active driver, and a CPU-only host has none.
-    # That turns ``tl`` into a placeholder lacking ``tl.extra.cuda.libdevice``,
-    # which vllm-private's step5 NVIDIA kernels read at import time. Register a
-    # fake active backend so real Triton stays usable, and fake only the
-    # device-properties lookup that would otherwise need a real NPU driver.
-    try:
-        import triton.runtime.driver as _triton_driver
-        from triton.backends import backends as _triton_backends
-    except ImportError:
-        pass
-    else:
-        _triton_backends["npu_fake"] = types.SimpleNamespace(driver=types.SimpleNamespace(is_active=lambda: True))
-        _triton_driver.set_active(MagicMock())
-        _triton_driver.active.utils.get_device_properties.return_value = {
-            "num_aic": 8,
-            "num_vectorcore": 8,
-        }
-        # flash_linear_attention reads ``driver.active.get_current_target().backend``
-        # and only tolerates RuntimeError/AttributeError, so the fake target must
-        # report a real backend name.
-        _triton_driver.active.get_current_target.return_value.backend = "cuda"
+    triton_runtime = MagicMock()
+    triton_runtime.driver.active.utils.get_device_properties.return_value = {
+        "num_aic": 8,
+        "num_vectorcore": 8,
+    }
+    sys.modules["triton.runtime"] = triton_runtime
     torch_npu = types.ModuleType("torch_npu")
     torch_npu.__spec__ = importlib.util.spec_from_loader("torch_npu", loader=None)
     torch_npu.__path__ = []
