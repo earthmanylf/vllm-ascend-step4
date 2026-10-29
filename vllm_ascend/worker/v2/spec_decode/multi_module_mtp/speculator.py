@@ -41,7 +41,9 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
     _exact_draft_seq_lens: bool = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        self._exact_draft_seq_lens = bool(int(os.getenv("VLLM_ASCEND_MTP_EXACT_SEQ_LENS", "0")))
+        self._exact_draft_seq_lens = getattr(
+            getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None
+        ) == "step5" or bool(int(os.getenv("VLLM_ASCEND_MTP_EXACT_SEQ_LENS", "0")))
         parallel_config = vllm_config.parallel_config
         if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
             raise NotImplementedError("Ascend multi-module MTP currently requires PCP=1 and DCP=1")

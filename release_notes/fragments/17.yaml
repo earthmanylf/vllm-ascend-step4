@@ -1,0 +1,15 @@
+pr: 17
+entries:
+  - category: feature
+    text: >-
+      Added Step5 unified-checkpoint PP4/TP4 to DP4/TP4 Mooncake PD support and
+      reproducible four-host scripts using native static MTP3 on both roles.
+      Native failed-READ recovery and full precision acceptance remain open.
+  - category: bugfix
+    text: >-
+      Aligned multi-module MTP handoff with upstream prefill-lookahead backoff,
+      removing the extra batch-size schedule and companion vLLM config exception.
+  - category: config
+    text: >-
+      Step5 MoE sequence parallelism follows upstream expert-parallel backend
+      configuration instead of deprecated FlashComm1 switches.

@@ -148,32 +148,42 @@ class MooncakeBaseConnectorScheduler:
                 transfer_block_ids.append(blocks[:num_prompt_blocks])
         return tuple(transfer_block_ids)
 
+    def _prefill_backoff(self) -> int:
+        """Leave state replay and the drafter's lookahead window to Decode."""
+        return max(
+            1 if self.need_truncate else 0,
+            self.vllm_config.num_prefill_lookahead_tokens - 1,
+        )
+
     def _state_prefill_token_count(self, num_prompt_tokens: int) -> int:
-        """Return the prompt token count transferred for stateful models."""
-        if self.need_truncate and num_prompt_tokens > 1:
-            return num_prompt_tokens - 1
+        """Return remote credit before the trailing tokens Decode recomputes."""
+        backoff = self._prefill_backoff()
+        if backoff and num_prompt_tokens > backoff:
+            return num_prompt_tokens - backoff
         return num_prompt_tokens
 
     def _truncate_request_for_prefill(self, request: "Request") -> None:
-        """Drop the last P-side prompt token for stateful model transfer."""
+        """Keep the trailing replay window off P, once per request."""
+        backoff = self._prefill_backoff()
         params = request.kv_transfer_params
         if (
             params is None
-            or not self.need_truncate
+            or not backoff
             or params.get("_p_side_truncated")
-            or request.num_prompt_tokens <= 1
+            or request.num_prompt_tokens <= backoff
+            or request.get_skip_reading_prefix_cache()
         ):
             return
 
         if request.prompt_token_ids is not None:
-            request.prompt_token_ids.pop()
+            del request.prompt_token_ids[-backoff:]
         elif request.prompt_embeds is not None:
-            request.prompt_embeds = request.prompt_embeds[:-1]
+            request.prompt_embeds = request.prompt_embeds[:-backoff]
         else:
             return
 
-        request._all_token_ids.pop()
-        request.num_prompt_tokens -= 1
+        del request._all_token_ids[-backoff:]
+        request.num_prompt_tokens -= backoff
         request.max_tokens = 1
         params["_p_side_truncated"] = True
 
@@ -181,7 +191,7 @@ class MooncakeBaseConnectorScheduler:
         # Truncate before local prefix-cache lookup so its hit count stays
         # consistent with the prompt length used by the scheduler.
         params = request.kv_transfer_params
-        if params is not None and params.get("do_remote_decode") and self.need_truncate:
+        if params is not None and params.get("do_remote_decode"):
             self._truncate_request_for_prefill(request)
 
     def shutdown(self) -> None:

@@ -34,6 +34,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadata,
     MooncakeTransferMetadataGroups,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.mtp_state import (
+    redact_mtp_seed_params,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     ensure_zmq_recv,
     ensure_zmq_send,
@@ -172,6 +175,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
         expected_pcp_ranks = set(range(self.pcp_size))
         expected_tp_ranks = set(range(self.tp_size))
         merged: dict[int, MooncakePPTransferMetadata] = {}
+        step5_layer_owner: dict[str, int] = {}
         for pp_rank, workers_by_pcp_rank in sorted(workers_by_pp_rank.items()):
             if set(workers_by_pcp_rank) != expected_pcp_ranks:
                 raise ValueError(
@@ -265,6 +269,14 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                             layer_source_by_name[layer_name] = (worker_metadata, local_layer_index)
                             layer_signature_by_name[layer_name] = layer_signature
             layer_names = sorted(layer_source_by_name)
+            if reference.is_step5:
+                for layer_name in layer_names:
+                    if layer_name in step5_layer_owner:
+                        raise ValueError(
+                            f"Mooncake Step5 layer {layer_name!r} is owned by multiple PP stages: "
+                            f"{step5_layer_owner[layer_name]} and {pp_rank}"
+                        )
+                    step5_layer_owner[layer_name] = pp_rank
             layer_block_sizes: list[int] = []
             group_indices: list[int] = []
             block_strides: list[list[int]] = []
@@ -371,7 +383,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
             identity = frames[0]
             payload = [frame for frame in frames[1:] if frame]
             if len(payload) != 1:
-                logger.warning("Invalid Mooncake scheduler control frames: %s", frames)
+                logger.warning("Invalid Mooncake scheduler control frame count: %s", len(frames))
                 continue
 
             try:
@@ -382,7 +394,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                     self._handle_finished_request(str(msg[1]))
                     sock.send_multipart((identity, b"", ACK_MSG))
                 else:
-                    logger.warning("Unexpected Mooncake scheduler control message: %s", msg)
+                    logger.warning("Unexpected Mooncake scheduler control message kind: %s", msg[0] if msg else None)
             except Exception:
                 logger.exception("Failed to handle Mooncake scheduler control message")
 
@@ -614,12 +626,21 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         logger.debug(
             "MooncakeConnector get_num_new_matched_tokens: num_computed_tokens=%s, kv_transfer_params=%s",
             num_computed_tokens,
-            params,
+            redact_mtp_seed_params(params),
         )
 
         if params is not None and params.get("do_remote_prefill"):
-            token_ids = request.prompt_token_ids or []
-            actual = self._state_prefill_token_count(len(token_ids))
+            is_step5 = getattr(self.vllm_config.model_config.hf_text_config, "model_type", None) == "step5"
+            if is_step5 and getattr(getattr(self.vllm_config, "cache_config", None), "enable_prefix_caching", False):
+                # A fresh private ring has no rows preceding the local hit.
+                # Full-page hits end on a closed summary-region boundary.
+                if (
+                    type(num_computed_tokens) is not int
+                    or num_computed_tokens < 0
+                    or num_computed_tokens % self.block_size
+                ):
+                    raise ValueError("Step5 prefix cache requires nonnegative block-aligned local computed tokens")
+            actual = self._state_prefill_token_count(request.num_prompt_tokens)
             if (
                 getattr(self.vllm_config.model_config.hf_text_config, "model_type", None) == "step5"
                 and "remote_num_prompt_tokens" in params
@@ -647,7 +668,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         logger.debug(
             "MooncakeConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
             num_external_tokens,
-            params,
+            redact_mtp_seed_params(params),
         )
 
         if params is not None and (params.get("do_remote_prefill", False) or params.get("do_remote_decode", False)):
@@ -682,7 +703,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                         raise RuntimeError("Producer Mooncake scheduler cannot acknowledge a receive request")
                     self._recving_thread.add_request(*remote)
             else:
-                logger.warning("Got invalid KVTransferParams. params=%s.", params)
+                logger.warning("Got invalid KVTransferParams. params=%s.", redact_mtp_seed_params(params))
         else:
             assert num_external_tokens == 0
 
@@ -721,7 +742,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         logger.debug(
             "MooncakeConnector request_finished: request_status=%s, kv_transfer_params=%s",
             request.status,
-            params,
+            redact_mtp_seed_params(params),
         )
 
         if (
@@ -731,8 +752,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         ):
             return False, None
 
-        prompt_token_ids = request.prompt_token_ids or []
-        prompt_len = len(prompt_token_ids)
+        prompt_len = request.num_prompt_tokens
         computed_block_ids = self._get_transfer_block_ids(block_ids, prompt_len)
         num_computed_blocks = sum(len(group_block_ids) for group_block_ids in computed_block_ids)
         delay_free_blocks = num_computed_blocks > 0
@@ -760,7 +780,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             "remote_request_id": request.request_id,
             "remote_host": self.side_channel_host,
             "remote_port": self.side_channel_port,
-            "last_token_id": request.output_token_ids[-1],
+            "last_token_id": request.output_token_ids[-1] if request.output_token_ids else None,
         }
 
     def update_connector_output(
