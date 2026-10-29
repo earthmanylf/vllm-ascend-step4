@@ -10,13 +10,6 @@ expression is rewritten to REPO_ROOT below, so this file is depth
 independent.
 """
 
-
-
-from pathlib import Path
-
-# Repo root of vllm-ascend-private.
-REPO_ROOT = Path(__file__).resolve().parents[3]
-
 import ast
 import copy
 import itertools
@@ -27,11 +20,14 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
 import numpy as np
 import pytest
 import torch
+
 from vllm_ascend.worker.v2 import input_batch as module
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
 MODEL_DIR = REPO_ROOT / "vllm_ascend/models/step5"
 CONFIG_FILE = REPO_ROOT / "vllm_ascend/quantization/configs/fp8_config.py"
 
@@ -39,6 +35,7 @@ CONFIG_FILE = REPO_ROOT / "vllm_ascend/quantization/configs/fp8_config.py"
 # ========================================================================
 # from tests/ut/models/test_step5_execution_contract.py
 # ========================================================================
+
 
 def load_methods(filename, class_name, method_names, namespace, base=object):
     tree = ast.parse((MODEL_DIR / filename).read_text())
@@ -396,9 +393,10 @@ class TestStep5MoEConstructor(unittest.TestCase):
             parallel_config=types.SimpleNamespace(
                 enable_eplb=False,
                 enable_expert_parallel=True,
+                use_sequence_parallel_moe=enable_sp,
                 eplb_config=types.SimpleNamespace(num_redundant_experts=0),
             ),
-            additional_config={"enable_flashcomm1": enable_sp},
+            additional_config={},
         )
         with patch.dict(sys.modules, {factory_module.__name__: factory_module}):
             layer = cls(vllm_config=vllm_config, prefix=f"layers.{layer_idx}.moe")
@@ -562,6 +560,7 @@ class TestStep5VocabularyContract(unittest.TestCase):
             {
                 "nn": types.SimpleNamespace(Module=object),
                 "AscendStep5Model": lambda **kwargs: target_model,
+                "validate_step5_kv_transfer_config": lambda config: None,
                 "get_pp_group": lambda: types.SimpleNamespace(is_last_rank=True),
                 "ParallelLMHead": lambda *args, **kwargs: object(),
                 "LogitsProcessor": build_logits,
@@ -597,6 +596,7 @@ if __name__ == "__main__":
 # ========================================================================
 # from tests/ut/models/test_step5_fp8_config_contract.py
 # ========================================================================
+
 
 class TestStep5Fp8Config(unittest.TestCase):
     def setUp(self):
@@ -684,6 +684,7 @@ if __name__ == "__main__":
 # ========================================================================
 # from tests/ut/worker/v2/test_step5_dummy_input_contract.py
 # ========================================================================
+
 
 @pytest.mark.parametrize("is_padding", [False, True])
 @pytest.mark.parametrize("physical_tokens", [5, 8])
