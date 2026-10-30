@@ -1,10 +1,8 @@
 *
 !Dockerfile
 !Dockerfile.fast
-!Dockerfile.official-v030-cann92
 !cann92-release/
 !cann92-release/cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz
-!vllm.tar.gz
 !vllm-ascend.tar.gz
 !ascend-catlass.tar.gz
 !custom-assets.tar.gz
@@ -17,3 +15,5 @@
 !probe_environment.py
 !install_ops.py
 !patch_flash_hcc.py
+!third-party/
+!third-party/prebuilt/

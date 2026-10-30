@@ -7,7 +7,21 @@ REPO="$(cd "$CI_DIR/.." && pwd -P)"
 . "$CI_DIR/scripts/lib.sh"
 INPUT_ROOT="${CI_UPGRADE_INPUTS_DIR:-$CI_DIR/cache/tailring-cann9.2.0-143f3649d8}"
 CONTEXT="${CONTEXT_DIR:-}"
-IMAGE="${IMAGE_REF:-step5-fp8-a5:ci-tailring-cann9.2.0-143f3649d8}"
+IMAGE="${IMAGE_REF:-}"            # derived from the release scheme when empty
+REGISTRY="${CI_IMAGE_REGISTRY:-UNIHUB}"
+# vllm comes from git. Default to the commit the working base image reports, so a
+# native build matches the runtime it replaces; --vllm-commit/--vllm-tag override.
+VLLM_REPO="${VLLM_REPO:-https://gitlab.basemind.com/sys/stepcast/vllm.git}"
+VLLM_TAG="${VLLM_TAG:-step5-preview-tailring-npu}"
+VLLM_COMMIT="${VLLM_COMMIT:-}"
+BASE_IMAGE_OVERRIDE="${BASE_IMAGE_OVERRIDE:-}"
+GITLAB_ACCESS_TOKEN="${GITLAB_ACCESS_TOKEN:-${CI_GITLAB_TOKEN:-}}"
+VLLM_BASE_VERSION="${VLLM_BASE_VERSION:-$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("vllm_base_version",""))' "$(dirname "${BASH_SOURCE[0]}")/../pins/official-v030-cann92.json")}"
+[[ -n "$VLLM_BASE_VERSION" ]] || die "pin has no vllm_base_version" 
+# Reuse CANN/toolchain/assets already present in the base image instead of
+# staging a 4.8 GB payload and three archives.
+REUSE_BASE_ASSETS="${REUSE_BASE_ASSETS:-0}"
+WITH_UNION_OPS="${WITH_UNION_OPS:-0}"
 DOCKER="${CI_DOCKER_BIN:-docker}"
 BACKEND="${BACKEND:-docker}"
 COMMIT="${COMMIT:-HEAD}"
@@ -41,6 +55,14 @@ while [[ $# -gt 0 ]]; do
     --inputs-dir) need_value "$@"; INPUT_ROOT="$2"; shift 2 ;;
     --context-dir) need_value "$@"; CONTEXT="$2"; shift 2 ;;
     --image) need_value "$@"; IMAGE="$2"; shift 2 ;;
+    --registry) need_value "$@"; REGISTRY="$2"; shift 2 ;;
+    --reuse-base-assets) REUSE_BASE_ASSETS=1; shift ;;
+    --with-union-ops) WITH_UNION_OPS=1; shift ;;
+    --base-image) need_value "$@"; BASE_IMAGE_OVERRIDE="$2"; shift 2 ;;
+    --vllm-commit) need_value "$@"; VLLM_COMMIT="$2"; shift 2 ;;
+    --vllm-tag) need_value "$@"; VLLM_TAG="$2"; shift 2 ;;
+    --vllm-repo) need_value "$@"; VLLM_REPO="$2"; shift 2 ;;
+    --vllm-token) need_value "$@"; GITLAB_ACCESS_TOKEN="$2"; shift 2 ;;
     --commit) need_value "$@"; COMMIT="$2"; shift 2 ;;
     --receipt) need_value "$@"; RECEIPT="$2"; shift 2 ;;
     --backend) need_value "$@"; BACKEND="$2"; shift 2 ;;
@@ -92,6 +114,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 python3 "$CI_DIR/scripts/prepare-official-v030-cann92.py" \
   --ci-dir "$CI_DIR" --inputs-dir "$INPUT_ROOT" --output "$CONTEXT" \
+  $([[ "$REUSE_BASE_ASSETS" == "1" ]] && echo --reuse-base-assets) \
+  $([[ "$WITH_UNION_OPS" == "1" ]] && echo --with-union-ops) \
   --source-ref "$COMMIT"
 CONTEXT="$(cd "$CONTEXT" && pwd -P)"
 if [[ "$DRY_RUN" == 1 ]]; then
@@ -99,6 +123,17 @@ if [[ "$DRY_RUN" == 1 ]]; then
   exit 0
 fi
 need_cmd "$DOCKER"
+# Release-style tag, matching the released stepfun scheme; derived from the
+# prepared context so the tag cannot drift from what is compiled.
+if [[ -z "$IMAGE" ]]; then
+  _ascend_commit="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["commit"])' "$CONTEXT/source-version.json")"
+  IMAGE="$(python3 "$CI_DIR/scripts/image_name.py" \
+    --registry "$REGISTRY" \
+    --version-file "$CONTEXT/source-version.json" \
+    --vllm-commit "$(json_get "$CI_DIR/pins/official-v030-cann92.json" source_commits.vllm)" \
+    --ascend-commit "$_ascend_commit")"
+fi
+log "Image: $IMAGE"
 # Version and commit travel with the context; the Dockerfile takes them as args
 # because the archive has no .git for setuptools_scm to read.
 VER_JSON="$CONTEXT/source-version.json"
@@ -109,11 +144,24 @@ VLLM_ASCEND_BASE="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));p
 VLLM_ASCEND_HOW="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["derivation"])' "$VER_JSON")"
 log "vllm-ascend: $VLLM_ASCEND_VERSION ($VLLM_ASCEND_COMMIT)"
 log "  series $VLLM_ASCEND_BASE, version derived via $VLLM_ASCEND_HOW"
-BASE="quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler"
+if [[ -n "$BASE_IMAGE_OVERRIDE" ]]; then
+  BASE="$BASE_IMAGE_OVERRIDE"
+  if [[ "$REUSE_BASE_ASSETS" == "1" ]]; then
+    log "Base: $BASE (local image; assets reused, digest pin skipped)"
+  else
+    log "Base: $BASE"
+  fi
+else
+  BASE="quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler"
+fi
 ACTUAL="$("$DOCKER" image inspect "$BASE" --format '{{.Id}}')"
 LOCKED="$(json_get "$CI_DIR/pins/official-v030-cann92.json" base_config_digest)"
-[[ "$ACTUAL" == "$LOCKED" ]] || die "Official rc1 base config mismatch: $ACTUAL != $LOCKED"
+if [[ -z "$BASE_IMAGE_OVERRIDE" ]]; then
+  [[ "$ACTUAL" == "$LOCKED" ]] || die "Official rc1 base config mismatch: $ACTUAL != $LOCKED"
+fi
 # Retain session network/Python/DNS behavior. No old native wheels or implicit base pull.
+VLLM_VERSION="${VLLM_VERSION:-$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("vllm_version",""))' "$CONTEXT/source-version.json")}"
+[[ -n "$VLLM_VERSION" ]] || die "prepared context has no vllm_version"
 DOCKER_BUILDKIT=0 "$DOCKER" build --network host \
   --add-host pypi.org:151.101.192.223 \
   --add-host files.pythonhosted.org:151.101.192.223 \
@@ -121,6 +169,15 @@ DOCKER_BUILDKIT=0 "$DOCKER" build --network host \
   --build-arg "BASE_IMAGE=$BASE" \
   --build-arg "VLLM_ASCEND_VERSION=$VLLM_ASCEND_VERSION" \
   --build-arg "VLLM_ASCEND_COMMIT=$VLLM_ASCEND_COMMIT" \
+  --build-arg "REUSE_BASE_ASSETS=$REUSE_BASE_ASSETS" \
+  --build-arg "WITH_UNION_OPS=$WITH_UNION_OPS" \
+  --build-arg "VLLM_SOURCE=git" \
+  --build-arg "VLLM_REPO=$VLLM_REPO" \
+  --build-arg "VLLM_TAG=$VLLM_TAG" \
+  --build-arg "VLLM_COMMIT=$VLLM_COMMIT" \
+  --build-arg "VLLM_VERSION=$VLLM_VERSION" \
+  --build-arg "VLLM_BASE_VERSION=$VLLM_BASE_VERSION" \
+  --build-arg "GITLAB_ACCESS_TOKEN=$GITLAB_ACCESS_TOKEN" \
   -f "$CONTEXT/Dockerfile" -t "$IMAGE" "$CONTEXT" 2>&1 | tee "$CONTEXT/build.log"
 "$DOCKER" image inspect "$IMAGE" > "$CONTEXT/built-image-inspect.json"
 # Image-only probe: no host NPU, weights, source overlays, or existing services.

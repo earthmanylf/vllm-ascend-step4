@@ -7,15 +7,15 @@
   "cann_arm64_manifest": "sha256:811ca9bb37475ba1a8db6cd1f52731651c13f5860a4cfb58773a32e603e02f57",
   "cann_image": "quay.io/ascend/cann:9.2.0-950-openeuler24.03-py3.12-devel",
   "source_commits": {
-    "vllm": "ca5e43ddcd5b04c91e3de451702eecc1632faea8",
+    "vllm": "b7042c5887ba8da9c1c0fa0b75d5579893ec5059",
     "vllm-ascend": "143f3649d8181edae635091c5fe809eb51ff992c"
   },
   "verified_session_image": "quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-317c7fb99e",
   "verified_session_config_digest": "sha256:0a16c96cc8be9bacdd5028d35bed3623297b5313870d87229984c08062033483",
   "successful_recovery_cache_config": "sha256:1046b891679b3590163b7a25fbeabbd81fb29ce6b8ef7c862206034d80f152fd",
-  "recipe_sha256": "935aded124f57c6ef3012a5da019a387ad6c9161174a1842b7be89c73d2cbe1a",
+  "recipe_sha256": "a1ec32b119a20294fa2024f22a0003e957cfe68f73e0fa2fb50d1c06433930f7",
   "runtime_sha256": {
-    "cann92-env.sh": "82882c7e0bb3ea64c94bc8326306ec477775d9d96c89ad3d6e13838c6ef71bf2",
+    "cann92-env.sh": "ad1df9792d4275cb39b9b863e6ddd0d4dacf434406174d6a5ac2f9ac59664851",
     "cann92-build-env.sh": "a4fe72808556136f909d91451167489c758e916f742a5e562b9532feeb2d809d",
     "cann92-entrypoint.sh": "329e544409c682071d4192a9420570598be7c59a57b27d08389503a83f713977",
     "normalize-cann92.py": "ad5d36ef6eeeac3e3bda0256f4de703b5140e9bb14825dec18b50f39a850d088",
@@ -28,7 +28,9 @@
     {
       "file": "vllm.tar.gz",
       "bytes": 45954486,
-      "sha256": "38fd39ac79baf26b1dafe60e7bb6e259c8e56f6ebb3569be49a66c08c80ddd4a"
+      "sha256": "38fd39ac79baf26b1dafe60e7bb6e259c8e56f6ebb3569be49a66c08c80ddd4a",
+      "generated_from": "git clone (VLLM_REPO/VLLM_TAG/VLLM_COMMIT build args)",
+      "role": "no longer shipped; cloned from git by the Dockerfile"
     },
     {
       "file": "vllm-ascend.tar.gz",
@@ -71,7 +73,8 @@
   ],
   "session_recipe_sha256": "54e547b4953a582d000d0880873396425f54b974e5113efd2d5446aff7c9ba0c",
   "recipe_changes_from_session": [
-    "Version-readable CANN payload filename and source-image comment only; payload SHA256 and build steps unchanged."
+    "Version-readable CANN payload filename and source-image comment only; payload SHA256 and build steps unchanged.",
+    "Current CI recipe and runtime hashes are refreshed after source/version/install changes; previous hashes are preserved separately."
   ],
   "cache_profile": "tailring-cann9.2.0-143f3649d8",
   "historical_source_commits": {
@@ -115,7 +118,7 @@
     }
   },
   "package_versions": {
-    "vllm": "0.29.1rc1.dev2194+gca5e43ddcd.empty",
+    "vllm": "0.30.0rc2+gb7042c588.empty",
     "vllm-ascend": "0.19.1rc2.dev2977+g143f3649d8"
   },
   "uv": {
@@ -156,5 +159,25 @@
   "source_ref": "HEAD",
   "official_build_source_policy": "vllm-ascend.tar.gz is exported from the ref named by --commit (default HEAD) and its version is derived from git describe at build time; source_commits/package_versions below describe the delivered source-rebase image and do not constrain this build. See context/source-version.json.",
   "vllm_ascend_base_version": "0.30.0rc1",
-  "vllm_ascend_version_policy": "version = setuptools_scm derivation when `git describe` yields a tag in the same series, else bumped base + commit. The series comes from vllm_ascend_base_version, never from a stale local tag: this fork still carries v0.17.0rc1 while the tree tracks the official v0.30.0rc1 line."
+  "vllm_ascend_version_policy": "version = setuptools_scm derivation when `git describe` yields a tag in the same series, else bumped base + commit. The series comes from vllm_ascend_base_version, never from a stale local tag: this fork still carries v0.17.0rc1 while the tree tracks the official v0.30.0rc1 line.",
+  "vllm_source": {
+    "mode": "git",
+    "repo": "https://gitlab.basemind.com/sys/stepcast/vllm.git",
+    "tag": "step5-preview-tailring-npu",
+    "commit": "b7042c5887ba8da9c1c0fa0b75d5579893ec5059",
+    "note": "cloned at build time; the commit above is what the working base image runs and what the native recipe defaults to"
+  },
+  "reuse_base_assets_supported": true,
+  "union_ops": {
+    "supported": true,
+    "staged_from": "ci/third-party/prebuilt/",
+    "vendors": [
+      "union_test_transformer",
+      "custom_nn_nn"
+    ],
+    "needs": "union GBSA + UnionSparseMeta; releases reject maskType=3"
+  },
+  "vllm_base_version": "0.30.0rc1",
+  "vllm_version_policy": "Anchored on vllm_base_version, exactly like vllm_ascend_version_policy: the stepcast vllm fork tags stop at v0.26.1rc0, so an unanchored setuptools_scm derivation puts a 0.30 image in the 0.26 line. Same series as the tag in `git describe` -> setuptools_scm derivation; otherwise bumped base + commit. Overridable per build with --vllm-base-version.",
+  "previous_recipe_sha256": "aba85f6975764b4d384de94d69ddcec4aa50a614e52bf7e4e8f12f503482ece5"
 }

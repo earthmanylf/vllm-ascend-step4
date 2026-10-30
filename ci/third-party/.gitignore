@@ -1,0 +1,19 @@
+# Third-party sources are provisioned by fetch.py, never committed: the two op
+# repos are 300 MB+ each, their build-time dependencies another 250 MB, and the
+# CANN payload is 4.8 GB. manifest.json pins them; fetch.py verifies them.
+ops-transformer/
+ops-nn/
+cann-cmake/
+opbase/
+ops-tensor/
+catlass/
+ops-test-kit/
+cann/
+assets/
+.stage/
+
+# Compiled output of build-union-ops.sh, staged into the build by
+# ci/build.sh --with-union-ops.
+prebuilt/
+
+!README.md

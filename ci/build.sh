@@ -25,6 +25,14 @@ CI_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DOCKER="${CI_DOCKER_BIN:-docker}"
 MODE=overlay
 IMAGE=""
+REGISTRY="${CI_IMAGE_REGISTRY:-UNIHUB}"
+PUSH="${CI_PUSH:-0}"
+RELEASE=""
+REUSE_BASE_ASSETS="${REUSE_BASE_ASSETS:-0}"
+WITH_UNION_OPS="${WITH_UNION_OPS:-0}"
+VLLM_COMMIT="${VLLM_COMMIT:-}"
+VLLM_TAG="${VLLM_TAG:-}"
+GITLAB_ACCESS_TOKEN="${GITLAB_ACCESS_TOKEN:-${CI_GITLAB_TOKEN:-}}"
 BASE_IMAGE="${CI_BASE_IMAGE:-}"
 CHECK_ONLY=0
 DRY_RUN=0
@@ -53,11 +61,28 @@ Modes:
     Native recipe: rebuilds the extension and custom ops from source. Needs an
     aarch64 host, the 4.8 GB CANN payload and the LFS-hydrated archives.
 
+Image naming: <registry>/stepcast:<release>-<vllm>-<ascend>-<date>-<time>
+  e.g. hub.i.basemind.com/stepcast/stepcast:
+       0.30.0rc2-b7042c5887ba-500440ee3b52-20261029-093000
+  The release comes from the derived version, so the tag cannot drift from what
+  was compiled.
+
 Options:
-  --image REF         Tag to produce.
+  --image REF         Override the generated tag.
+  --registry NAME     Registry shortcut (UNIHUB, SH-ALI, SH-VOLCANO-MLP,
+                      SH-VOLCANO-SYS, BJ-BAIDU) or a full registry path.
+                      Default UNIHUB -> hub.i.basemind.com/stepcast.
+  --push              Push after building. Without it the image stays local.
+  --release X.Y.Z     Release stamp for the tag (default: derived).
   --base-image REF    Base image for the overlay (default: newest local image
                       that carries a step5 source label).
   --source-ref REF    git ref to package (default: HEAD).
+  --reuse-base-assets Native only: the base image already has CANN 9.2.0 and the
+                      vendored assets, so skip the 4.8 GB payload and the three
+                      archives. Makes an offline native build possible.
+  --vllm-commit SHA   Native only: vllm commit to clone (default: --vllm-tag tip).
+  --with-union-ops    Native only: install union-mode custom ops from
+                      ci/third-party/prebuilt/ (see ci/third-party/README.md).
   --keep              Keep the generated context.
 HELP
 }
@@ -71,12 +96,28 @@ while [[ $# -gt 0 ]]; do
     --check-only) CHECK_ONLY=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --keep) KEEP=1; shift ;;
+    --registry) REGISTRY="${2:?--registry needs a value}"; shift 2 ;;
+    --reuse-base-assets) REUSE_BASE_ASSETS=1; shift ;;
+    --with-union-ops) WITH_UNION_OPS=1; shift ;;
+    --vllm-commit) VLLM_COMMIT="${2:?}"; shift 2 ;;
+    --vllm-tag) VLLM_TAG="${2:?}"; shift 2 ;;
+    --push) PUSH=1; shift ;;
+    --release) RELEASE="${2:?--release needs a value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    --fast) MODE=overlay; shift ;;
-    --backend|--inputs-dir|--context-dir|--receipt|--commit)
-      # Native-only flags: they mean nothing to the overlay build, so keep them
-      # and let the --full branch decide, but refuse them in overlay mode below.
-      EXTRA+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+    --backend)
+      # Accepted for compatibility with the previous entry point, but validated
+      # here: only the docker backend exists, and the overlay path used to
+      # swallow the flag entirely, so `--backend buildctl` silently built anyway.
+      [[ "${2:-}" == docker ]] || {
+        echo "--backend only supports 'docker', got '${2:-<none>}'" >&2; exit 2; }
+      EXTRA+=("$1" "$2"); shift 2 ;;
+    --fast|--source-rebase|--inputs-dir|--context-dir|--receipt)
+      # Same compatibility, value-taking flags pass through to the native recipe.
+      if [[ "$1" == --inputs-dir || "$1" == --context-dir || "$1" == --receipt ]]; then
+        EXTRA+=("$1" "${2:?$1 needs a value}"); shift 2
+      else
+        EXTRA+=("$1"); shift
+      fi ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
@@ -113,21 +154,33 @@ pick_base_image() {
 
 if [[ "$MODE" == full ]]; then
   echo "==> Native rebuild (aarch64 + CANN payload + LFS archives required)"
-  exec bash "$CI_DIR/scripts/build-official-v030-cann92.sh" \
-    --commit "$SOURCE_REF" ${IMAGE:+--image "$IMAGE"} "${EXTRA[@]+"${EXTRA[@]}"}"
-fi
-
-if ((${#EXTRA[@]})); then
-  echo "Native-only options are not valid for the overlay build: ${EXTRA[*]}" >&2
-  echo "Use --full if you need them." >&2
-  exit 2
+  # The native recipe derives its own release tag from the context it prepares,
+  # so an explicit --image is only needed to override it.
+  NATIVE_ARGS=(--commit "$SOURCE_REF" --registry "$REGISTRY")
+  [[ -n "$IMAGE" ]] && NATIVE_ARGS+=(--image "$IMAGE")
+  [[ -n "$BASE_IMAGE" ]] && NATIVE_ARGS+=(--base-image "$BASE_IMAGE")
+  [[ -n "${VLLM_COMMIT:-}" ]] && NATIVE_ARGS+=(--vllm-commit "$VLLM_COMMIT")
+  [[ -n "${VLLM_TAG:-}" ]] && NATIVE_ARGS+=(--vllm-tag "$VLLM_TAG")
+  [[ -n "${GITLAB_ACCESS_TOKEN:-}" ]] && NATIVE_ARGS+=(--vllm-token "$GITLAB_ACCESS_TOKEN")
+  [[ "${REUSE_BASE_ASSETS:-0}" == "1" ]] && NATIVE_ARGS+=(--reuse-base-assets)
+  [[ "${WITH_UNION_OPS:-0}" == "1" ]] && NATIVE_ARGS+=(--with-union-ops)
+  bash "$CI_DIR/scripts/build-official-v030-cann92.sh" \
+    "${NATIVE_ARGS[@]}" "${EXTRA[@]+"${EXTRA[@]}"}"
+  if ((PUSH)); then
+    # build-official-v030-cann92.sh records the tag it produced in its receipt.
+    RECEIPT="${RECEIPT_FILE:-$CI_DIR/ci-build-receipt-official-v030-cann92.json}"
+    BUILT="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["image_ref"])' "$RECEIPT")"
+    echo "==> pushing to $REGISTRY"
+    "$DOCKER" push "$BUILT"
+    echo "==> pushed $BUILT"
+  fi
+  exit
 fi
 
 [[ -n "$BASE_IMAGE" ]] || BASE_IMAGE="$(pick_base_image)"
-[[ -n "$IMAGE" ]] || IMAGE="step5-ascend950:overlay-$(git -C "$REPO" rev-parse --short=10 "$SOURCE_REF")"
 echo "==> python-overlay"
 echo "    base : $BASE_IMAGE"
-echo "    image: $IMAGE"
+echo "    image: ${IMAGE:-<derived after context>}"
 echo "    src  : $SOURCE_REF"
 
 PREPARE=(python3 "$CI_DIR/scripts/prepare-python-overlay.py"
@@ -154,6 +207,22 @@ if ((DRY_RUN)); then
   exit 0
 fi
 
+# Release-style tag, as the released stepfun scheme does:
+#   <registry>/stepcast:<release>-<vllm>-<ascend>-<date>-<time>
+# The release comes from the derived version, so the tag cannot drift from what
+# was actually compiled.
+if [[ -z "$IMAGE" ]]; then
+  VLLM_COMMIT="$("$DOCKER" image inspect "$BASE_IMAGE" --format \
+    '{{index .Config.Labels "step5.vllm.commit"}}' 2>/dev/null || true)"
+  [[ -n "$VLLM_COMMIT" && "$VLLM_COMMIT" != "<no value>" ]] || VLLM_COMMIT="unknown"
+  NAME_ARGS=(--registry "$REGISTRY"
+             --vllm-commit "$VLLM_COMMIT"
+             --ascend-commit "$(git -C "$REPO" rev-parse "$SOURCE_REF")"
+             --version-file "$CONTEXT/source-version.json")
+  [[ -n "$RELEASE" ]] && NAME_ARGS+=(--release "$RELEASE")
+  IMAGE="$(python3 "$CI_DIR/scripts/image_name.py" "${NAME_ARGS[@]}")"
+fi
+
 VERSION="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' "$CONTEXT/source-version.json")"
 COMMIT="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source_commit"])' "$CONTEXT/source-version.json")"
 BASE_VERSION="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["base_version"])' "$CONTEXT/source-version.json")"
@@ -168,5 +237,11 @@ DOCKER_BUILDKIT=0 "$DOCKER" build --network host \
 
 echo
 echo "==> built $IMAGE"
+if ((PUSH)); then
+  echo "==> pushing to $REGISTRY"
+  "$DOCKER" push "$IMAGE"
+  echo "==> pushed $IMAGE"
+fi
+echo
 "$DOCKER" image inspect "$IMAGE" --format \
   '{{index .Config.Labels "step5.vllm-ascend.version"}} @ {{index .Config.Labels "step5.vllm-ascend.commit"}}'
