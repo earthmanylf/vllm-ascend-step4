@@ -107,6 +107,7 @@ from vllm_ascend.models.step5.fused_qknorm_rope import (
     fused_indexer_qkz_norm_rope,
     fused_qknorm_rope,
 )
+from vllm_ascend.models.step5.gated_scale import gated_scale
 from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCacheLayer
 from vllm_ascend.quantization.configs.fp8_config import AscendFp8Config, Step5Fp8BlockConfig
 
@@ -228,6 +229,9 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         self.rope_theta = rope_theta
         self.zero_centered = zero_centered
         self.use_head_wise_attn_gate = use_head_wise_attn_gate
+        self.use_fused_gate_scale = (
+            os.environ.get("VLLM_STEP4_FUSE_GATE_SCALE", "1") == "1"
+        )
         self.use_rope = bool(
             _per_layer_value(
                 use_rope_layers, self.layer_idx, name="use_rope_layers", default=True
@@ -660,10 +664,13 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         )
         attn_output = output.view(num_tokens, self.num_heads * self.head_dim)
         if gate is not None:
-            attn_output = (
-                attn_output.view(num_tokens, self.num_heads, self.head_dim)
-                * gate.unsqueeze(-1).sigmoid()
-            ).view(num_tokens, -1)
+            if self.use_fused_gate_scale:
+                attn_output = gated_scale(attn_output, gate)
+            else:
+                attn_output = (
+                    attn_output.view(num_tokens, self.num_heads, self.head_dim)
+                    * gate.unsqueeze(-1).sigmoid()
+                ).view(num_tokens, -1)
         if reduce_scatter_output:
             # Sequence-parallel o_proj: reduce-scatter needs rows divisible
             # by TP; pad the tail rows (they ride along as zeros and are
@@ -903,6 +910,9 @@ class AscendStep5Attention(Step5Attention):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.use_fused_gate_scale = (
+            os.environ.get("VLLM_STEP4_FUSE_GATE_SCALE", "1") == "1"
+        )
         self.use_fused_qknorm_rope = (
             os.environ.get("VLLM_STEP4_FUSE_QK_NORM_ROPE", "1") == "1"
             and getattr(self, "use_rope", False)
@@ -933,7 +943,6 @@ class AscendStep5Attention(Step5Attention):
                 [self.q_size + 2 * self.kv_size, self.num_heads], dim=-1
             )
             qkv = qkv.contiguous()
-            extra_dims = extra_dims.contiguous()
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             qkzg = None
@@ -984,21 +993,21 @@ class AscendStep5Attention(Step5Attention):
             extra_dims, _ = self.g_proj(hidden_states)
 
         if extra_dims is not None:
-            attn_output = torch.ops.vllm.step5_materialize_gate_input(
-                attn_output
-            )
-            extra_dims = torch.ops.vllm.step5_materialize_gate_input(
-                extra_dims
-            )
-
-        if self.use_head_wise_attn_gate:
-            output = (
-                attn_output.view(
-                    *attn_output.shape[:-1], self.num_heads, self.head_dim
+            if self.use_fused_gate_scale:
+                attn_output = gated_scale(attn_output, extra_dims)
+            else:
+                attn_output = torch.ops.vllm.step5_materialize_gate_input(
+                    attn_output
                 )
-                * extra_dims.unsqueeze(-1).sigmoid()
-            )
-            attn_output = output.view(*attn_output.shape)
+                extra_dims = torch.ops.vllm.step5_materialize_gate_input(
+                    extra_dims
+                )
+                attn_output = (
+                    attn_output.view(
+                        *attn_output.shape[:-1], self.num_heads, self.head_dim
+                    )
+                    * extra_dims.unsqueeze(-1).sigmoid()
+                ).view(*attn_output.shape)
         if reduce_scatter_output:
             # Sequence-parallel o_proj: pad rows to a TP multiple before the
             # reduce-scatter (same contract as the DSA layer above).
