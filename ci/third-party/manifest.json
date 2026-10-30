@@ -1,0 +1,81 @@
+{
+  "schema_version": 2,
+  "comment": "Everything the union op packages are built from, pinned. Heavy trees are NOT committed; fetch.py provisions them into this directory and verifies every ref.",
+  "entries": [
+    {
+      "name": "ops-transformer",
+      "kind": "git",
+      "repo": "https://gitcode.com/HuangKun8682/ops-transformer_inedex_topk.git",
+      "branch": "stepx_union",
+      "refs": ["11661d45"],
+      "purpose": "union-mode GBSA kernel (generic_block_sparse_attention, maskType=3)",
+      "provides": ["union_test_transformer"],
+      "artifact": "build_out/cann-ops-transformer-union_test_linux-aarch64.run",
+      "staging_fallback": "build/_CPack_Packages/Linux/External/cann-ops-transformer-union_test_linux-aarch64.run/packages/vendors/union_test_transformer",
+      "note": "must be the union fork: upstream/stepx refuses maskType!=1"
+    },
+    {
+      "name": "ops-nn",
+      "kind": "git",
+      "repo": "https://gitcode.com/bartonfang/ops-nn.git",
+      "branch": "feature/union-sparse-meta-a5",
+      "refs": ["1c7fe8f1"],
+      "purpose": "UnionSparseMeta pre-processing op (NPU union + mask) and its torch-extension wheel",
+      "provides": ["custom_nn_nn", "cann-ops-nn-custom-nn"],
+      "artifact": "build_out/cann-ops-nn-custom_nn_linux-aarch64.run",
+      "wheel": "build_out/cann_ops_nn_custom_nn-1.0.0-py3-none-any.whl",
+      "note": "PR cann/ops-nn#12461; build.sh has no --incremental"
+    },
+    {
+      "name": "cann-cmake",
+      "kind": "git",
+      "repo": "https://gitcode.com/cann/cmake.git",
+      "refs": ["master-058", "master-046"],
+      "purpose": "build glue both op repos FetchContent from gitcode when the third-party path has no cann-cmake/; having it there is their offline entry point",
+      "used_by": {"ops-transformer": "master-058", "ops-nn": "master-046"}
+    },
+    {
+      "name": "opbase",
+      "kind": "git",
+      "repo": "https://gitcode.com/cann/opbase.git",
+      "refs": ["0a83b915a6f6be49a03b907713d6f000b3dea1ea", "40cc7bedb324a9358aa247a75f5ff898dd46f18c"],
+      "purpose": "op host/base framework; each op repo checks its own pin out in place",
+      "used_by": {"ops-transformer": "0a83b915a6f6be49a03b907713d6f000b3dea1ea", "ops-nn": "40cc7bedb324a9358aa247a75f5ff898dd46f18c"}
+    },
+    {
+      "name": "ops-tensor",
+      "kind": "git",
+      "repo": "https://gitcode.com/cann/ops-tensor.git",
+      "refs": ["99cc37f124b1b2521f96cb1b03dd143a41ddfa3a", "6d0ca6e16abfe355586cd7213845cdc1b180e38f"],
+      "submodules": true,
+      "purpose": "tensor_api headers; carries include/tensor_api as a submodule",
+      "used_by": {"ops-transformer": "99cc37f124b1b2521f96cb1b03dd143a41ddfa3a", "ops-nn": "6d0ca6e16abfe355586cd7213845cdc1b180e38f"},
+      "note": "the submodule commit differs per pin; fetch.py initialises it for every ref"
+    },
+    {
+      "name": "catlass",
+      "kind": "git",
+      "repo": "https://gitcode.com/cann/catlass.git",
+      "refs": ["769cd40a8716b28650b6bebb08db4834eea4462f"],
+      "purpose": "tile-level GEMM templates the GBSA kernel includes (v2.0.0)"
+    },
+    {
+      "name": "ops-test-kit",
+      "kind": "git",
+      "repo": "https://gitcode.com/cann/ops-test-kit.git",
+      "refs": ["master"],
+      "purpose": "UT kit the op repos fetch",
+      "note": "upstream pins branch master rather than a commit; recorded as master on purpose"
+    },
+    {
+      "name": "cann",
+      "kind": "payload",
+      "file": "cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz",
+      "source_image": "quay.io/ascend/cann:9.2.0-950-openeuler24.03-py3.12-devel",
+      "sha256": "6068329c27a345701d5cb7c1f76b7264f2c3320df9cfe2f8673ff37186f45c8f",
+      "bytes": 4806522202,
+      "purpose": "CANN 9.2.0 toolchain, only for a from-scratch image build",
+      "note": "not needed with --reuse-base-assets, and not needed to build the op packages on a host that already has CANN"
+    }
+  ]
+}

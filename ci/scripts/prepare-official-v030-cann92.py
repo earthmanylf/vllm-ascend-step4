@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -34,8 +35,22 @@ def need(ok, message):
         raise ValueError(message)
 
 
-# Name of the one input that is built from the working tree rather than locked.
+# Inputs produced at build time instead of being pinned as archives: vllm-ascend
+# is exported from the current ref, and vllm is cloned from git by the Dockerfile.
+# Their rows stay in the pin only to record the last snapshot.
 SOURCE_INPUT = 'vllm-ascend.tar.gz'
+GENERATED_INPUTS = ('vllm-ascend.tar.gz', 'vllm.tar.gz')
+# Inputs the base image can provide instead. Only consulted with
+# --reuse-base-assets; otherwise they are required as before.
+REUSABLE_INPUTS = (
+    'cann92-release/cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz',
+    'ascend-catlass.tar.gz',
+    'custom-assets.tar.gz',
+    'ops-git-metadata.tar.gz',
+    # The native recipe installs with `python3 -m pip`; the uv wheel was only
+    # ever used by the retired source-rebase flow. It is not needed here.
+    'uv-0.9.5-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl',
+)
 
 def archive_ref(repo, ref, out):
     """Export `ref` as a tar, the way the session build did.
@@ -80,6 +95,19 @@ def main():
     parser.add_argument('--check-only', action='store_true')
     parser.add_argument('--source-ref', default='HEAD',
                         help='git ref for vllm-ascend.tar.gz (default: HEAD)')
+    parser.add_argument('--with-union-ops', action='store_true',
+                        help='require the union vendor trees and wheel under '
+                             'ci/third-party/prebuilt/ and stage them into the context')
+    parser.add_argument('--reuse-base-assets', action='store_true',
+                        help='the base image already carries CANN 9.2.0, the vendored '
+                             'third-party sources and the compiled custom ops; stage '
+                             'empty archives so those steps are skipped instead of '
+                             'requiring the 4.8 GB payload and three LFS inputs')
+    parser.add_argument('--vllm-base-version', default=None,
+                        help='vllm series to anchor the image version on '
+                             '(default: pin.vllm_base_version)')
+    parser.add_argument('--vllm-commit', default=None,
+                        help='vllm commit the build clones (default: pin.vllm_source.commit)')
     parser.add_argument('--base-version', default=None,
                         help='vllm-ascend series to anchor the version on '
                              '(default: vllm_ascend_base_version from the pin)')
@@ -99,9 +127,10 @@ def main():
     lfs_pointers = []
     checked = []
     for row in lock['inputs']:
-        if row['file'] == SOURCE_INPUT:
-            # Generated from git at build time; its pin only records the last
-            # snapshot and must not gate the build.
+        if row['file'] in GENERATED_INPUTS:
+            continue
+        if args.reuse_base_assets and row['file'] in REUSABLE_INPUTS:
+            # Supplied by the base image; stage a placeholder instead.
             continue
         path = inputs / row['file']
         if not path.is_file():
@@ -124,6 +153,7 @@ def main():
               'source_ref': args.source_ref, 'source_commit': '',
               'inputs_dir': str(inputs), 'verified_inputs': checked, 'missing_inputs': missing,
               'unhydrated_lfs_inputs': lfs_pointers,
+              'reuse_base_assets': args.reuse_base_assets,
               'all_inputs_available': not missing, 'device_or_build_validation': 'not run'}
     if args.check_only:
         print(json.dumps(report, indent=2))
@@ -159,7 +189,18 @@ def main():
          f'Insufficient context disk space; need {total + 64 * 1024 * 1024} bytes')
     out.mkdir()
     for row in lock['inputs']:
-        if row['file'] == SOURCE_INPUT:
+        if row['file'] in GENERATED_INPUTS:
+            continue
+        if args.reuse_base_assets and row['file'] in REUSABLE_INPUTS:
+            destination = out / row['file']
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.suffix == '.gz':
+                # A valid but empty tar: ADD extracts nothing, so the base
+                # image's own copy of that directory is left untouched.
+                with tarfile.open(destination, 'w:gz'):
+                    pass
+            else:
+                destination.write_bytes(b'')
             continue
         destination = out / row['file']
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +217,19 @@ def main():
     version, derivation = version_for(describe, base_version, commit)
     need(release_line(version) == release_line(base_version),
          f'Derived version {version} left the {base_version} series')
+    # vllm carries its own version into the image. Its fork's tags stop at
+    # v0.26.1rc0, so an unanchored derivation labels this 0.30 image as 0.26.x;
+    # anchor on the pinned series the same way vllm-ascend does. The commit is
+    # the one the build clones, so the label always names what is inside.
+    vllm_base_version = args.vllm_base_version or lock.get('vllm_base_version')
+    need(bool(vllm_base_version), 'No vllm_base_version in the pin; pass --vllm-base-version')
+    vllm_commit = args.vllm_commit or (lock.get('vllm_source') or {}).get('commit') or ''
+    need(bool(vllm_commit), 'No vllm commit in the pin; pass --vllm-commit')
+    vllm_version, vllm_derivation = version_for('', vllm_base_version, vllm_commit)
+    need(release_line(vllm_version) == release_line(vllm_base_version),
+         f'Derived vllm version {vllm_version} left the {vllm_base_version} series')
+    report['vllm_version'] = vllm_version
+    report['vllm_version_derivation'] = vllm_derivation
     (out / 'source-version.json').write_text(json.dumps({
         'ref': args.source_ref,
         'commit': commit,
@@ -186,6 +240,9 @@ def main():
         'dirty': describe.endswith('-dirty'),
         'input_sha256': digest(source_tar),
         'input_bytes': source_tar.stat().st_size,
+        'vllm_version': vllm_version,
+        'vllm_base_version': vllm_base_version,
+        'vllm_commit': vllm_commit,
     }, indent=2) + '\n')
     need(not describe.endswith('-dirty'),
          f'Ref {args.source_ref} resolved to a dirty tree ({describe})')
@@ -193,6 +250,20 @@ def main():
                    'source_version': version, 'source_version_base': base_version,
                    'source_version_derivation': derivation,
                    'generated_inputs': {SOURCE_INPUT: digest(source_tar)}})
+    if args.with_union_ops:
+        prebuilt = ci / 'third-party' / 'prebuilt'
+        need(prebuilt.is_dir(), '--with-union-ops needs ci/third-party/prebuilt')
+        # A vendor tree is only usable if op_api/lib survived the flattening;
+        # a nested vendors/<name>/vendors/<name> would install nothing.
+        for vendor in ('union_test_transformer', 'custom_nn_nn'):
+            need((prebuilt / vendor / 'op_api' / 'lib').is_dir(),
+                 f'{vendor} must be flattened: expected '
+                 f'{prebuilt / vendor / "op_api" / "lib"}')
+        shutil.copytree(prebuilt, out / 'third-party' / 'prebuilt')
+        staged = sorted(p.name for p in (out / 'third-party' / 'prebuilt').iterdir())
+        report['union_ops_staged'] = staged
+        print('union ops staged: ' + ', '.join(staged))
+
     shutil.copyfile(recipe, out / 'Dockerfile')
     shutil.copyfile(ci / 'docker/Dockerfile.dockerignore', out / '.dockerignore')
     for name, expected in lock['runtime_sha256'].items():

@@ -25,3 +25,22 @@ if [[ -d "$vendor" ]]; then
     export ASCEND_CUSTOM_OPP_PATH="$vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
     export LD_LIBRARY_PATH="$vendor/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
+
+# Union mode installs two more vendor packages (union GBSA + UnionSparseMeta).
+# They are opt-in because they do not merely add ops: all four aclnn entry
+# points union GBSA exports -- aclnnGenericBlockSparseAttention and its
+# metadata call, plus their GetWorkspaceSize -- also exist in
+# step5_ops_transformer, and dlopen("libcust_opapi.so") resolves to the first
+# match on this path. Exporting them by default therefore *replaces* the
+# production GBSA kernel with the union fork, which measured 12-33% slower
+# decode at 128K in the bs1..bs144 sweep. Set VLLM_ASCEND_UNION_OPS=1 to opt in;
+# union GBSA must then stay in front of step5_ops, or it would never load.
+if [[ "${VLLM_ASCEND_UNION_OPS:-0}" == "1" ]]; then
+    for v in custom_nn_nn union_test_transformer; do
+        d="$ASCEND_OPP_PATH/vendors/$v"
+        if [[ -d "$d/op_api/lib" ]]; then
+            export ASCEND_CUSTOM_OPP_PATH="$d${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+            export LD_LIBRARY_PATH="$d/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        fi
+    done
+fi

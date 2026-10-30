@@ -44,6 +44,12 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz", recipe)
         self.assertNotIn("ascend-payload.tar.gz", recipe)
 
+    def test_prepared_vllm_version_is_a_consumed_build_argument(self):
+        recipe = (CI / "docker/Dockerfile").read_text()
+        build = (CI / "scripts/build-official-v030-cann92.sh").read_text()
+        self.assertIn("ARG VLLM_VERSION=", recipe)
+        self.assertIn('--build-arg "VLLM_VERSION=$VLLM_VERSION"', build)
+
     def test_shared_cache_tracking_rules(self):
         self.assertNotIn("\n/cache/\n", (CI / ".gitignore").read_text())
         self.assertIn("/cache/**/*.tar.gz filter=lfs", (CI / ".gitattributes").read_text())
@@ -97,6 +103,8 @@ class ContextTests(unittest.TestCase):
             "recipe_sha256": sha(self.ci / "docker/Dockerfile"),
             "cache_profile": "test-profile",
             "vllm_ascend_base_version": "0.30.0rc1",
+            "vllm_base_version": "0.30.0rc1",
+            "vllm_source": {"commit": "a" * 40},
             "runtime_sha256": {"helper.py": sha(helper)},
             "inputs": [{"file": "a.tar.gz", "bytes": archive.stat().st_size, "sha256": sha(archive)}],
         }
@@ -123,6 +131,11 @@ class ContextTests(unittest.TestCase):
         self.run_main("--output", str(self.out))
         report = json.loads((self.out / "context-manifest.json").read_text())
         self.assertTrue(report["all_inputs_available"])
+        version_info = json.loads((self.out / "source-version.json").read_text())
+        self.assertEqual(version_info["vllm_base_version"], self.lock["vllm_base_version"])
+        self.assertEqual(version_info["vllm_commit"], self.lock["vllm_source"]["commit"])
+        self.assertTrue(version_info["vllm_version"].startswith("0.30.0"))
+        self.assertIn(self.lock["vllm_source"]["commit"], version_info["vllm_version"])
         self.assertEqual(sha(self.out / "a.tar.gz"), self.lock["inputs"][0]["sha256"])
         (self.inputs / "a.tar.gz").write_bytes(b"changed after snapshot")
         self.assertEqual(sha(self.out / "a.tar.gz"), self.lock["inputs"][0]["sha256"])
