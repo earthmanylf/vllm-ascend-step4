@@ -27,17 +27,15 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
+from vllm.logger import logger
 from vllm.models.step5.nvidia.sparse_summary_cache import (
     Step5SparseSummaryBackend,
     Step5SparseSummaryCacheLayer,
     Step5SparseSummaryMetadataBuilder,
 )
-from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata, CommonAttentionMetadata
 
 from vllm_ascend.core.step5_kv_cache import uses_step5_blnhc
-
-logger = init_logger(__name__)
 
 
 @dataclass

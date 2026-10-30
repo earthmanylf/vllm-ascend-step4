@@ -1213,6 +1213,25 @@
 #    Future Plan:
 #       Remove this patch once upstream SP completes refactor.
 #
+# ** File: worker/patch_step5_rms_norm.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.models.step5.nvidia.layernorm.Step5RMSNorm.forward`
+#    Why:
+#       Direct Step5RMSNorm calls lack an Ascend CustomOp extension point; the
+#       already-fused model loop does not cover them. Public vLLM builds may
+#       omit this private Step5 module, in which case registration is skipped.
+#    How:
+#       Replace only forward on NPU with CANN RMSNorm using FP32 inputs and
+#       scale math, including zero-centered weights. Preserve residual promotion,
+#       rounding and fresh allocation, output-buffer ownership and output dtype;
+#       delegate CPU and unsupported inputs to the original implementation.
+#       FP32 casts have a cost; this is not a blanket performance claim.
+#    Related PR (if no, explain why):
+#       No upstream PR yet; compatibility adapter for the private Step5 module.
+#    Future Plan:
+#       Remove this patch and its worker import once supported upstream Step5
+#       exposes a backend-dispatched RMSNorm hook with equivalent semantics.
+#
 # ** 21. File: worker/patch_triton.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.layers.mamba.ops`, `vllm.model_executor.layers.fla.ops`,

@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import copy
 import os
-import re
 from typing import Any
 
+import regex as re
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
@@ -35,7 +35,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
@@ -109,8 +109,6 @@ from vllm_ascend.models.step5.fused_qknorm_rope import (
 )
 from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCacheLayer
 from vllm_ascend.quantization.configs.fp8_config import AscendFp8Config, Step5Fp8BlockConfig
-
-logger = init_logger(__name__)
 
 
 def validate_step5_kv_transfer_config(vllm_config: VllmConfig) -> None:
@@ -1117,11 +1115,7 @@ class AscendStep5Attention(Step5Attention):
             # materialised, because its consumer is an elementwise sigmoid.
             gate_slice = slice(self.q_size + 2 * self.kv_size, None)
             extra_dims = qkvg[:, gate_slice].contiguous()
-            qkv = (
-                qkvg
-                if self.use_fused_qknorm_rope
-                else qkvg[:, : self.q_size + 2 * self.kv_size].contiguous()
-            )
+            qkv = qkvg if self.use_fused_qknorm_rope else qkvg[:, : self.q_size + 2 * self.kv_size].contiguous()
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             qkzg = None
