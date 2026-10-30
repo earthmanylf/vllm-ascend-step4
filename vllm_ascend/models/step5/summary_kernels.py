@@ -236,24 +236,34 @@ def update_verify(key, z, slots, query_start_loc, seq_lens, ring_base, mean, rin
 def _build_prefill_groups(
     Slots,
     Positions,
-    Owners,
     QueryStart,
     Metadata,
+    REQUESTS: tl.constexpr,
     POSITION_STRIDE: tl.constexpr,
 ):
-    # One program per token row. A group is the run of one request's rows in
-    # an eight-token region; its first row writes the metadata, others -1.
-    row = tl.program_id(0)
-    output = Metadata + row.to(tl.int64) * 10
-    owner = tl.load(Owners + row)
-    start = tl.load(QueryStart + owner)
-    end = tl.load(QueryStart + owner + 1)
-    position = tl.load(Positions + row * POSITION_STRIDE)
-    head = (row == start) | (position % 8 == 0)
+    # Request r owns [qsl[r] // 8 + 2*r, qsl[r+1] // 8 + 2*(r+1)).
+    # These strictly increasing bounds reserve enough groups for any starting
+    # offset, without a requests * max_chunk grid on highly ragged batches.
+    group = tl.program_id(0)
+    output = Metadata + group.to(tl.int64) * 10
+    lower = 0
+    # Avoid a zero-trip loop in the single-request Triton-Ascend specialization.
+    if REQUESTS > 1:
+        upper = REQUESTS
+        while lower + 1 < upper:
+            middle = (lower + upper) // 2
+            boundary = tl.load(QueryStart + middle) // 8 + 2 * middle
+            before = group < boundary
+            upper = tl.where(before, middle, upper)
+            lower = tl.where(before, lower, middle)
+    start = tl.load(QueryStart + lower)
+    end = tl.load(QueryStart + lower + 1)
+    local_group = group - (start // 8 + 2 * lower)
+    position = tl.load(Positions + start * POSITION_STRIDE, start < end, other=0)
     offset = tl.arange(0, 8)
-    step = offset - position % 8
-    rows = row + step
-    in_group = head & (step >= 0) & (rows < end)
+    step = local_group * 8 + offset - position % 8
+    rows = start + step
+    in_group = (rows >= start) & (rows < end)
     slot = tl.load(Slots + rows, in_group, other=-1)
     valid = in_group & (slot >= 0)
     first = tl.min(tl.where(valid, offset, 8), 0)
@@ -263,21 +273,25 @@ def _build_prefill_groups(
     tl.store(output + 2 + offset, tl.where(valid, rows, -1).to(tl.int64))
 
 
-def build_prefill_groups(slots, positions, owners, query_start_loc) -> torch.Tensor:
-    """Summary update metadata on device, without host slots or a sync.
+def build_prefill_groups(slots, positions, query_start_loc) -> torch.Tensor:
+    """Bounded request-region metadata, without dynamic shapes or host sync.
 
-    Returns ``[rows, 10]`` metadata ``[region, first offset, rows[8]]``;
-    non-head rows have region -1.
+    Returns ``[groups, 10]`` entries ``[region, first offset, rows[8]]``.
+    Each request reserves at most two extra groups for alignment/partial
+    tails; unused groups have region -1. The bound is O(tokens/8 + requests),
+    including ragged batches, rather than O(requests * longest chunk).
     """
     rows = slots.shape[0]
-    metadata = torch.empty((rows, 10), dtype=torch.int64, device=slots.device)
-    if rows:
-        _build_prefill_groups[(rows,)](
+    requests = query_start_loc.shape[0] - 1
+    groups = rows // 8 + 2 * requests if rows else 0
+    metadata = torch.empty((groups, 10), dtype=torch.int64, device=slots.device)
+    if groups:
+        _build_prefill_groups[(groups,)](
             slots,
             positions,
-            owners,
             query_start_loc,
             metadata,
+            requests,
             positions.stride(0),
         )
     return metadata

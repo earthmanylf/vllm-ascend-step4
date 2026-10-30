@@ -18,7 +18,6 @@ from typing import ClassVar
 import torch
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -42,8 +41,6 @@ from vllm_ascend.models.step5.generic_block_sparse_attention import (
 from vllm_ascend.models.step5.indexer_region_score import indexer_score_topk
 from vllm_ascend.models.step5.summary_cache import AscendStep5SparseSummaryCache, AscendStep5SparseSummaryMetadata
 from vllm_ascend.models.step5.summary_kernels import build_prefill_groups
-
-logger = init_logger(__name__)
 
 
 class AscendStep5DSABackend(AttentionBackend):
@@ -738,12 +735,9 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
             # Local QSL matches local key/z rows. Grouping is device-only and
             # uses true positions, including chunked partial-region tails.
             query_start = md.prefill.query_start_loc
-            rows = num_tokens - decode_rows
-            owners = self._summary_owners(query_start, rows)
             metadata = build_prefill_groups(
                 slots[decode_rows:],
                 positions[decode_rows:num_tokens],
-                owners,
                 query_start,
             )
             summary_cache.update_prefill(
@@ -754,11 +748,6 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
                 ring,
                 token_offset=decode_rows,
             )
-
-    @staticmethod
-    def _summary_owners(query_start: torch.Tensor, num_tokens: int) -> torch.Tensor:
-        rows = torch.arange(num_tokens, device=query_start.device, dtype=query_start.dtype)
-        return (torch.searchsorted(query_start, rows, right=True) - 1).to(torch.int32)
 
     # -- sparse attention ------------------------------------------------------
 

@@ -211,7 +211,7 @@ def _load_dsa_method(name, namespace):
 
 @pytest.mark.parametrize("spec_tokens", [0, 3])
 def test_mixed_batch_uses_decode_then_prefill_with_matching_ring_offset(spec_tokens):
-    def groups(slots, positions, owners, qsl):
+    def groups(slots, positions, qsl):
         assert slots.tolist() == [40, 41, 42]
         assert positions.tolist() == [5, 6, 7]
         return torch.zeros((1, 10), dtype=torch.int64)
@@ -226,7 +226,6 @@ def test_mixed_batch_uses_decode_then_prefill_with_matching_ring_offset(spec_tok
     impl = types.SimpleNamespace(
         num_speculative_tokens=spec_tokens,
         csa_ring=FakeRing(4),
-        _summary_owners=lambda qsl, rows: torch.zeros(rows, dtype=torch.int32),
     )
     md = types.SimpleNamespace(
         graph_decode=None,
@@ -420,17 +419,126 @@ class CpuGroupKernel:
             valid = [i for i in indices if slots[i] >= 0]
             if valid:
                 metadata[row, 0] = int(slots[valid[-1]]) // 8
-                metadata[row, 1] = first
-                metadata[row, 2 + first : 2 + first + len(valid)] = torch.tensor(valid)
+                metadata[row, 1] = first + valid[0] - row
+                for index in valid:
+                    metadata[row, 2 + first + index - row] = index
+
+
+class CpuPointer:
+    def __init__(self, tensor, offset=0):
+        self.tensor = tensor.reshape(-1)
+        self.offset = offset
+
+    def __add__(self, offset):
+        return CpuPointer(self.tensor, self.offset + offset)
+
+
+class CpuRegionGroupKernel:
+    """Execute the actual metadata kernel with CPU pointer/load/store semantics."""
+
+    def __getitem__(self, grid):
+        source = REPO_ROOT / "vllm_ascend/models/step5/summary_kernels.py"
+        tree = ast.parse(source.read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_build_prefill_groups")
+        node.decorator_list = []
+        for arg in node.args.args:
+            arg.annotation = None
+
+        def load(pointer, mask=True, other=0):
+            index = torch.as_tensor(pointer.offset, dtype=torch.int64)
+            mask = torch.broadcast_to(torch.as_tensor(mask), index.shape)
+            result = torch.full(index.shape, other, dtype=pointer.tensor.dtype)
+            result[mask] = pointer.tensor[index[mask]]
+            return result
+
+        def store(pointer, value):
+            pointer.tensor[pointer.offset] = value
+
+        tl = types.SimpleNamespace(
+            int64=torch.int64,
+            arange=torch.arange,
+            load=load,
+            store=store,
+            where=lambda c, x, y: torch.where(torch.as_tensor(c), x, y),
+            min=lambda x, axis: x.min(dim=axis).values,
+            max=lambda x, axis: x.max(dim=axis).values,
+        )
+        namespace = dict(tl=tl)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)  # noqa: S102
+
+        def run(slots, positions, qsl, metadata, requests, stride):
+            for group in range(grid[0]):
+                tl.program_id = lambda axis, group=group: torch.tensor(group)
+                namespace[node.name](
+                    CpuPointer(slots), CpuPointer(positions), CpuPointer(qsl), CpuPointer(metadata), requests, stride
+                )
+
+        return run
 
 
 def _load_cpu_groups():
     source = REPO_ROOT / "vllm_ascend/models/step5/summary_kernels.py"
     tree = ast.parse(source.read_text())
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_prefill_groups")
-    namespace = dict(torch=torch, _build_prefill_groups=CpuGroupKernel())
+    namespace = dict(torch=torch, _build_prefill_groups=CpuRegionGroupKernel())
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)  # noqa: S102
     return namespace[node.name]
+
+
+@pytest.mark.parametrize("offset", range(8))
+@pytest.mark.parametrize("lengths", [[0], [1], [7, 8, 9], [0, 3, 0, 65, 1], [4097, 1, 0, 2]])
+def test_prefill_groups_bounded_metadata_matches_token_row_reference(offset, lengths):
+    builder = _load_cpu_groups()
+    # The new interface removes token owners entirely.
+    assert builder.__code__.co_argcount == 3
+    qsl = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
+    positions = torch.cat([torch.arange(offset, offset + n) for n in lengths])
+    slots = torch.cat([r * 8192 + torch.arange(offset, offset + n) for r, n in enumerate(lengths)])
+    if slots.numel() > 12:
+        slots[2] = -1
+        slots[-1] = -1
+    owners = torch.repeat_interleave(torch.arange(len(lengths)), torch.tensor(lengths))
+    reference = torch.empty((slots.numel(), 10), dtype=torch.int64)
+    CpuGroupKernel.run(slots, positions, owners, qsl, reference, 1)
+    actual = builder(slots, positions, qsl)
+    assert actual.shape == ((slots.numel() // 8 + 2 * len(lengths)) if slots.numel() else 0, 10)
+    # Invalid metadata rows are masked, not part of the logical group set.
+    expected = reference[reference[:, 0] >= 0]
+    assert torch.equal(actual[actual[:, 0] >= 0], expected)
+
+
+def test_prefill_groups_masks_all_invalid_slots_and_empty_requests():
+    groups = _load_cpu_groups()(torch.full((17,), -1), torch.arange(17) + 7, torch.tensor([0, 0, 17, 17]))
+    assert torch.all(groups[:, 0] == -1)
+    assert torch.all(groups[:, 2:] == -1)
+
+
+def test_prefill_update_launches_bounded_groups_before_token_ring_writes():
+    source = REPO_ROOT / "vllm_ascend/models/step5/summary_kernels.py"
+    tree = ast.parse(source.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "update_prefill")
+    calls = []
+
+    class Launch:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: calls.append((self.name, grid))
+
+    namespace = dict(
+        _update_prefill=Launch("read"), _write_ring=Launch("write"), summary_layout=lambda mean: (4096, 128)
+    )
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)  # noqa: S102
+    key = torch.empty((129, 1, 256))
+    namespace[node.name](key, key, torch.empty((18, 10)), torch.arange(129), None, torch.arange(129), None, None, 16)
+    assert calls == [("read", (18,)), ("write", (129,))]
+
+
+def test_prefill_groups_empty_batch_has_no_launch():
+    builder = _load_cpu_groups()
+    assert builder.__code__.co_argcount == 3
+    assert builder(torch.empty(0), torch.empty(0), torch.tensor([0])).shape == (0, 10)
 
 
 class CpuRingKernels:
@@ -485,8 +593,7 @@ class CpuRingKernels:
 def _cpu_summary_impl(ring):
     namespace = dict(torch=torch, build_prefill_groups=_load_cpu_groups())
     update = _load_dsa_method("_maybe_update_summary_cache", namespace)
-    owners = _load_dsa_method("_summary_owners", dict(torch=torch))
-    impl = types.SimpleNamespace(csa_ring=ring, num_speculative_tokens=3, _summary_owners=owners)
+    impl = types.SimpleNamespace(csa_ring=ring, num_speculative_tokens=3)
     impl._maybe_update_summary_cache = types.MethodType(update, impl)
     return impl
 
@@ -795,7 +902,6 @@ def _load_summary_backend_types():
 
 
 def test_summary_constructor_installs_independent_metadata_layer_name():
-
     upstream = Path(os.environ["VLLM_SOURCE_ROOT"]) / "vllm/models/step5/nvidia/sparse_summary_cache.py"
     tree = ast.parse(upstream.read_text())
     base = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Step5SparseSummaryCacheLayer")

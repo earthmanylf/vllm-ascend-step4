@@ -1,0 +1,15 @@
+pr: 20
+entries:
+  - category: performance
+    text: >-
+      Reduced Step5 TailRing prefill grouping and summary update grids with
+      bounded request-region metadata, without dynamic unique shapes or host
+      synchronization, and removed redundant token-owner construction.
+  - category: performance
+    text: >-
+      Added NPU kernels for direct Step5 RMSNorm calls while preserving
+      output dtype, residual promotion, output-buffer and CPU fallback behavior.
+  - category: bugfix
+    text: >-
+      Avoided a zero-trip binary-search loop in the single-request Ascend Triton
+      specialization and added a device compilation regression test.

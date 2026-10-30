@@ -27,7 +27,7 @@ from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
@@ -47,8 +47,6 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, WeightLayout
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, maybe_trans_nz
 from vllm_ascend.weight_switch import WeightSwitchGatherSpec, WeightSwitchMixin
-
-logger = init_logger(__name__)
 
 # Below this row count the fused mm + reduce-scatter kernel does not pay for
 # its setup, so the two-step GEMM + reduce-scatter is used instead.
