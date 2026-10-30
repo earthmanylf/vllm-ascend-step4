@@ -30,6 +30,23 @@ from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
 )
 
 
+def _needs_exact_draft_seq_lens(vllm_config: VllmConfig) -> bool:
+    """Keep exact host lengths for Step5 PD/FIA, not validated FA3 decode.
+
+    The non-PD Step5 FA3 path consumes device lengths and can use the host
+    upper bound. Forcing a D2H there overrides the deployment's explicit
+    MTP_EXACT_SEQ_LENS=0 and drains the target forward every decode step.
+    PD handoff and non-FA3 backends retain their existing exact-length guard.
+    """
+    requested = bool(int(os.getenv("VLLM_ASCEND_MTP_EXACT_SEQ_LENS", "0")))
+    text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    if getattr(text_config, "model_type", None) == "step5":
+        fa3 = bool(int(os.getenv("VLLM_STEP4_ENABLE_FA3", os.getenv("VLLM_ASCEND_ENABLE_FA3", "0"))))
+        if getattr(vllm_config, "kv_transfer_config", None) is not None or not fa3:
+            return True
+    return requested
+
+
 class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPSpeculator):
     """Run upstream's multi-head MTP algorithm in one Ascend draft graph."""
 
@@ -41,9 +58,7 @@ class AscendMultiModuleMTPSpeculator(AscendDraftSpeculatorMixin, MultiModuleMTPS
     _exact_draft_seq_lens: bool = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        self._exact_draft_seq_lens = getattr(
-            getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None
-        ) == "step5" or bool(int(os.getenv("VLLM_ASCEND_MTP_EXACT_SEQ_LENS", "0")))
+        self._exact_draft_seq_lens = _needs_exact_draft_seq_lens(vllm_config)
         parallel_config = vllm_config.parallel_config
         if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
             raise NotImplementedError("Ascend multi-module MTP currently requires PCP=1 and DCP=1")
