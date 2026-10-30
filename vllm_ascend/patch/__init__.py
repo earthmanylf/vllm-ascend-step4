@@ -555,6 +555,31 @@
 #       models without a custom `hf_config_override`, or exposes a plugin hook
 #       for MTP model_type/architecture remapping.
 #
+# ** 18a. File: platform/patch_step5_envs.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `os.environ["VLLM_STEP5_ENABLE_QKVG_PROJ"]`
+#    Why:
+#       vLLM gates the Step5 fused QKV+gate projection (qkvg_proj, which
+#       packs the head-wise attention gate GEMM into the qkv GEMM) behind
+#       VLLM_STEP5_ENABLE_QKVG_PROJ with a default of off. Without it every
+#       Step5 sliding-window layer runs a standalone g_proj GEMM after
+#       attention (one extra small GEMM launch per layer).
+#    How：
+#       `os.environ.setdefault("VLLM_STEP5_ENABLE_QKVG_PROJ", "1")` at
+#       platform-patch time. The patch is applied through the plugin hooks'
+#       global patch path, which both the v1 engine core (load_general_plugins
+#       before enable_envs_cache) and every multiproc worker (worker
+#       construction before the executor's enable_envs_cache) execute before
+#       vllm envs are frozen, so the default lands in every process that
+#       later reads it. An explicitly exported VLLM_STEP5_ENABLE_QKVG_PROJ
+#       always wins.
+#    Related PR (if no, explain why):
+#       No, an Ascend deployment default for an upstream switch whose fused
+#       path is not yet validated on NPU.
+#    Future Plan:
+#       Remove this patch once the fused path is validated on Ascend and the
+#       default is flipped upstream, or the switch becomes unnecessary.
+#
 # ** 19. File: platform/patch_structured_output.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.sampling_params.SamplingParams._validate_structured_outputs`
