@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "session_id": "session-b5f168ee-ca7a-4022-a461-46e1867b75cb",
-  "base_image": "quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler",
-  "base_config_digest": "sha256:c9d3e4921ba2153a0b1cec0005d01c76f7acce3def96cd6bca20a185a54f94d9",
+  "base_image": "hub.i.basemind.com/stepcast/stepcast:cann-9.2.0_20261022115200-950-openeuler24.0",
+  "base_config_digest": null,
   "cann_version": "9.2.0",
   "cann_arm64_manifest": "sha256:811ca9bb37475ba1a8db6cd1f52731651c13f5860a4cfb58773a32e603e02f57",
   "cann_image": "quay.io/ascend/cann:9.2.0-950-openeuler24.03-py3.12-devel",
@@ -13,16 +13,16 @@
   "verified_session_image": "quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler-step5-cann9.2.0-317c7fb99e",
   "verified_session_config_digest": "sha256:0a16c96cc8be9bacdd5028d35bed3623297b5313870d87229984c08062033483",
   "successful_recovery_cache_config": "sha256:1046b891679b3590163b7a25fbeabbd81fb29ce6b8ef7c862206034d80f152fd",
-  "recipe_sha256": "a1ec32b119a20294fa2024f22a0003e957cfe68f73e0fa2fb50d1c06433930f7",
+  "recipe_sha256": "13ecdaef0b26089329c49a9ded2403b86d1fcbbc51277ed9f0dc405416bc0a08",
   "runtime_sha256": {
-    "cann92-env.sh": "ad1df9792d4275cb39b9b863e6ddd0d4dacf434406174d6a5ac2f9ac59664851",
-    "cann92-build-env.sh": "a4fe72808556136f909d91451167489c758e916f742a5e562b9532feeb2d809d",
+    "cann92-env.sh": "a6adf37f857198299b69f0e6eda6f89997a8b7bc2a2f959081107dde040606df",
+    "cann92-build-env.sh": "23119f5f7fcc8ae7ca0cd123bfed83129bfc3afc7be5494e0bc0f360153cd21d",
     "cann92-entrypoint.sh": "329e544409c682071d4192a9420570598be7c59a57b27d08389503a83f713977",
-    "normalize-cann92.py": "ad5d36ef6eeeac3e3bda0256f4de703b5140e9bb14825dec18b50f39a850d088",
-    "apply_dependency_profile.py": "c38c4b7ce693612bbd9d180ff005103f9bd7b0172bb2cf049162ccbf2bafe066",
+    "normalize-cann92.py": "ab14b406904553ec62e69510b16bad9ad974de2071dd65ec3342cbc062946d49",
+    "apply_dependency_profile.py": "8001f8416672bd1e1a6f945a722240f4ace1356271055b11d1570e112bf912bb",
     "probe_environment.py": "a89b43513c86afa443d30f7906ebb761f49bf92026a1daecf72bcf791a38e46f",
     "install_ops.py": "db0ccc707f876095348c25aeffe058dc7009b04093b6631ad335705163a032ab",
-    "patch_flash_hcc.py": "d7346ba333502a7a0c0048e870b7cbe404a4eb6e1aed06a3a9b0f6fc91dcf053"
+    "patch_flash_hcc.py": "b4e48d1209eb0ed8aad711f4c17bbc8609850bfe3090c4cdb1491e81977364dc"
   },
   "inputs": [
     {
@@ -74,7 +74,8 @@
   "session_recipe_sha256": "54e547b4953a582d000d0880873396425f54b974e5113efd2d5446aff7c9ba0c",
   "recipe_changes_from_session": [
     "Version-readable CANN payload filename and source-image comment only; payload SHA256 and build steps unchanged.",
-    "Current CI recipe and runtime hashes are refreshed after source/version/install changes; previous hashes are preserved separately."
+    "Current CI recipe and runtime hashes are refreshed after source/version/install changes; previous hashes are preserved separately.",
+    "FA3 native.patch supersedes patch_flash_hcc.py: the patch already derives the HCC C++ include from the installed compiler (CANN 9.2 = GCC 14.3.0), and running the old anchor rewrite first breaks the source hash gate."
   ],
   "cache_profile": "tailring-cann9.2.0-143f3649d8",
   "historical_source_commits": {
@@ -179,5 +180,37 @@
   },
   "vllm_base_version": "0.30.0rc1",
   "vllm_version_policy": "Anchored on vllm_base_version, exactly like vllm_ascend_version_policy: the stepcast vllm fork tags stop at v0.26.1rc0, so an unanchored setuptools_scm derivation puts a 0.30 image in the 0.26 line. Same series as the tag in `git describe` -> setuptools_scm derivation; otherwise bumped base + commit. Overridable per build with --vllm-base-version.",
-  "previous_recipe_sha256": "aba85f6975764b4d384de94d69ddcec4aa50a614e52bf7e4e8f12f503482ece5"
+  "previous_recipe_sha256": "8ad97bc3467c5719d7512a82d4fe7b0569c824d546a402f0376110a573cefa16",
+  "historical_vllm_ascend_base": {
+    "image": "quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler",
+    "config_digest": "sha256:c9d3e4921ba2153a0b1cec0005d01c76f7acce3def96cd6bca20a185a54f94d9"
+  },
+  "recipe_mode": "cann-base-a5-multistage",
+  "base_download_status": "awaiting user confirmation; digest must be captured before build",
+  "previous_runtime_sha256": {
+    "cann92-env.sh": "ad1df9792d4275cb39b9b863e6ddd0d4dacf434406174d6a5ac2f9ac59664851",
+    "cann92-build-env.sh": "a4fe72808556136f909d91451167489c758e916f742a5e562b9532feeb2d809d",
+    "cann92-entrypoint.sh": "329e544409c682071d4192a9420570598be7c59a57b27d08389503a83f713977",
+    "normalize-cann92.py": "ad5d36ef6eeeac3e3bda0256f4de703b5140e9bb14825dec18b50f39a850d088",
+    "apply_dependency_profile.py": "c38c4b7ce693612bbd9d180ff005103f9bd7b0172bb2cf049162ccbf2bafe066",
+    "probe_environment.py": "a89b43513c86afa443d30f7906ebb761f49bf92026a1daecf72bcf791a38e46f",
+    "install_ops.py": "db0ccc707f876095348c25aeffe058dc7009b04093b6631ad335705163a032ab",
+    "patch_flash_hcc.py": "d7346ba333502a7a0c0048e870b7cbe404a4eb6e1aed06a3a9b0f6fc91dcf053"
+  },
+  "legacy_cann_payload_role": "historical source cache only; toolkit supplied by active CANN base",
+  "numpy_profile": "1.26.4 (exact triton-ascend 3.6.0 pin); OpenCV 4.13 installed --no-deps and smoke-checked against NumPy 1.26.4",
+  "build_wheels": [
+    {
+      "file": "triton_ascend-3.6.0+dev20261013182112-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+      "bytes": 322871759,
+      "sha256": "d46b9b80a3e0cb21e1965410acacf800b47bd16a150e995f06194b01aaf59c03",
+      "role": "verified build wheel cache, no repeated in-image download"
+    }
+  ],
+  "dependency_index_profile": {
+    "primary": "https://artifactory.stepfun-inc.com/artifactory/api/pypi/pypi-public/simple",
+    "pytorch": "https://artifactory.stepfun-inc.com/artifactory/api/pypi/pytorch-public/simple",
+    "ascend": "https://mirrors.huaweicloud.com/ascend/repos/pypi"
+  },
+  "build_cache_profile": "DOCKER_BUILDKIT=1 with a persistent pip cache mount (/root/.cache/pip); --no-cache-dir is not used"
 }

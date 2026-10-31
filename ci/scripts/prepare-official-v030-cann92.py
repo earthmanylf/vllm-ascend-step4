@@ -42,15 +42,11 @@ SOURCE_INPUT = 'vllm-ascend.tar.gz'
 GENERATED_INPUTS = ('vllm-ascend.tar.gz', 'vllm.tar.gz')
 # Inputs the base image can provide instead. Only consulted with
 # --reuse-base-assets; otherwise they are required as before.
-REUSABLE_INPUTS = (
+CANN_BASE_PROVIDED_INPUTS = (
     'cann92-release/cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz',
-    'ascend-catlass.tar.gz',
-    'custom-assets.tar.gz',
-    'ops-git-metadata.tar.gz',
-    # The native recipe installs with `python3 -m pip`; the uv wheel was only
-    # ever used by the retired source-rebase flow. It is not needed here.
     'uv-0.9.5-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl',
 )
+
 
 def archive_ref(repo, ref, out):
     """Export `ref` as a tar, the way the session build did.
@@ -113,9 +109,11 @@ def main():
                              '(default: vllm_ascend_base_version from the pin)')
     args = parser.parse_args()
     need(args.check_only or args.output is not None, '--output or --check-only required')
+    need(not args.reuse_base_assets, '--reuse-base-assets is invalid for the CANN-only recipe; native sources and ops must be built')
     ci = args.ci_dir.resolve(strict=True)
     inputs = args.inputs_dir.resolve(strict=True)
     lock = json.loads((ci / 'pins/official-v030-cann92.json').read_text())
+    all_inputs = lock['inputs'] + lock.get('build_wheels', [])
     recipe = ci / 'docker/Dockerfile'
     need(digest(recipe) == lock['recipe_sha256'], 'Dockerfile differs from locked recipe (version-readable CANN filename)')
     # Dockerfile.fast is the python-overlay recipe: a different recipe on purpose,
@@ -126,11 +124,8 @@ def main():
     missing = []
     lfs_pointers = []
     checked = []
-    for row in lock['inputs']:
-        if row['file'] in GENERATED_INPUTS:
-            continue
-        if args.reuse_base_assets and row['file'] in REUSABLE_INPUTS:
-            # Supplied by the base image; stage a placeholder instead.
+    for row in all_inputs:
+        if row['file'] in GENERATED_INPUTS or row['file'] in CANN_BASE_PROVIDED_INPUTS:
             continue
         path = inputs / row['file']
         if not path.is_file():
@@ -153,14 +148,13 @@ def main():
               'source_ref': args.source_ref, 'source_commit': '',
               'inputs_dir': str(inputs), 'verified_inputs': checked, 'missing_inputs': missing,
               'unhydrated_lfs_inputs': lfs_pointers,
-              'reuse_base_assets': args.reuse_base_assets,
+              'reuse_base_assets': False, 'cann_supplied_by_base': True,
               'all_inputs_available': not missing, 'device_or_build_validation': 'not run'}
     if args.check_only:
         print(json.dumps(report, indent=2))
         return
     need(not missing, 'Missing inputs: ' + ', '.join(missing) +
-         '; git lfs pull obtains shared cache objects; fetch-cann92-payload.py '
-         'can obtain the formal CANN layer from its version-readable official image tag')
+         '; git lfs pull obtains the required source archives; CANN itself is supplied by the base image')
     out = args.output.expanduser().absolute()
     need(out == out.resolve(), 'Context path must be canonical (no symlink parents)')
     repo, delivery = ci.parent, ci.parent.parent
@@ -184,23 +178,12 @@ def main():
         raise ValueError(
             'Working tree is dirty; commit or stash before building so the image '
             'version can be traced to a commit')
-    total = sum(row['bytes'] for row in lock['inputs'])
+    total = sum(row['bytes'] for row in checked)
     need(shutil.disk_usage(out.parent).free >= total + 64 * 1024 * 1024,
          f'Insufficient context disk space; need {total + 64 * 1024 * 1024} bytes')
     out.mkdir()
-    for row in lock['inputs']:
-        if row['file'] in GENERATED_INPUTS:
-            continue
-        if args.reuse_base_assets and row['file'] in REUSABLE_INPUTS:
-            destination = out / row['file']
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.suffix == '.gz':
-                # A valid but empty tar: ADD extracts nothing, so the base
-                # image's own copy of that directory is left untouched.
-                with tarfile.open(destination, 'w:gz'):
-                    pass
-            else:
-                destination.write_bytes(b'')
+    for row in all_inputs:
+        if row['file'] in GENERATED_INPUTS or row['file'] in CANN_BASE_PROVIDED_INPUTS:
             continue
         destination = out / row['file']
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +246,13 @@ def main():
         staged = sorted(p.name for p in (out / 'third-party' / 'prebuilt').iterdir())
         report['union_ops_staged'] = staged
         print('union ops staged: ' + ', '.join(staged))
+    else:
+        # Docker COPY is evaluated even when the later installer is disabled.
+        # Keep its optional input present without shipping any union vendor.
+        prebuilt = out / 'third-party' / 'prebuilt'
+        prebuilt.mkdir(parents=True, exist_ok=True)
+        (prebuilt / '.keep').write_text('Union vendors disabled for this build.\n')
+        report['union_ops_staged'] = []
 
     shutil.copyfile(recipe, out / 'Dockerfile')
     shutil.copyfile(ci / 'docker/Dockerfile.dockerignore', out / '.dockerignore')

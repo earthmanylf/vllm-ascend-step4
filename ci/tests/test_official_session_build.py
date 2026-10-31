@@ -41,7 +41,7 @@ class RecipeTests(unittest.TestCase):
         self.assertNotIn("c139edab", recipe)
         self.assertIn("source /opt/upgrade/cann92-build-env.sh", recipe)
         self.assertIn("patch_flash_hcc.py", recipe)
-        self.assertIn("cann-9.2.0-950-openeuler24.03-py3.12-devel-ascend.tar.gz", recipe)
+        self.assertNotIn("COPY cann92-release/", recipe)
         self.assertNotIn("ascend-payload.tar.gz", recipe)
 
     def test_prepared_vllm_version_is_a_consumed_build_argument(self):
@@ -139,6 +139,29 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(sha(self.out / "a.tar.gz"), self.lock["inputs"][0]["sha256"])
         (self.inputs / "a.tar.gz").write_bytes(b"changed after snapshot")
         self.assertEqual(sha(self.out / "a.tar.gz"), self.lock["inputs"][0]["sha256"])
+
+    def test_non_union_context_has_empty_optional_prebuilt_input(self):
+        self.run_main("--output", str(self.out))
+        prebuilt = self.out / "third-party/prebuilt"
+        self.assertTrue(prebuilt.is_dir())
+        self.assertTrue((prebuilt / ".keep").is_file())
+        self.assertFalse(any(p.is_dir() for p in prebuilt.iterdir()))
+
+    def test_union_context_stages_required_vendor_libraries(self):
+        exclude = self.ci.parent / ".git/info/exclude"
+        with exclude.open("a") as stream:
+            stream.write("\nci/third-party/prebuilt/\n")
+        vendors = ("union_test_transformer", "custom_nn_nn")
+        for vendor in vendors:
+            library = self.ci / "third-party/prebuilt" / vendor / "op_api/lib/libcust_opapi.so"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(vendor.encode())
+        self.run_main("--output", str(self.out), "--with-union-ops")
+        for vendor in vendors:
+            library = self.out / "third-party/prebuilt" / vendor / "op_api/lib/libcust_opapi.so"
+            self.assertEqual(library.read_bytes(), vendor.encode())
+        report = json.loads((self.out / "context-manifest.json").read_text())
+        self.assertEqual(report["union_ops_staged"], sorted(vendors))
 
     def test_existing_context_refused(self):
         self.out.mkdir()

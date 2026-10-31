@@ -1,8 +1,10 @@
 #!/bin/bash
-# Explicit official CANN9.2 release selection; never use toolkit devlib at runtime.
+# Canonicalized from the CANN-only base by normalize-cann92.py.
 source /usr/local/Ascend/cann-9.2.0/set_env.sh
-source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
+ir=/usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh
+[[ ! -f "$ir" ]] || source "$ir"
+atb=/usr/local/Ascend/nnal/atb/set_env.sh
+[[ ! -f "$atb" ]] || source "$atb" --cxx_abi=1
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.2.0
 export ASCEND_TOOLKIT_HOME=$ASCEND_HOME_PATH ASCEND_AICPU_PATH=$ASCEND_HOME_PATH
 export ASCEND_OPP_PATH=$ASCEND_HOME_PATH/opp
@@ -18,23 +20,25 @@ for key in PATH LD_LIBRARY_PATH PYTHONPATH CMAKE_PREFIX_PATH ASCEND_CUSTOM_OPP_P
     done
     export "$key=$clean"
 done
-# CANN Python CLIs have a 3.12.15 shebang; use wrappers with retained official rc1 Python.
-export PATH="/opt/upgrade/cann-cli/bin:$PATH"
+export PATH="/opt/upgrade/.venv/bin:/opt/upgrade/cann-cli/bin:$PATH"
+# The CANN base ships its own cann_ops_transformer under the SDK python path and
+# set_env.sh puts that path ahead of site-packages, so it silently wins over the
+# copy this recipe builds (which is the one carrying the Step5 ops such as
+# indexer_region_score). Give the venv its normal precedence instead.
+venv_site="/opt/upgrade/.venv/lib/python3.12/site-packages"
+if [[ -d "$venv_site" ]]; then
+    export PYTHONPATH="$venv_site${PYTHONPATH:+:$PYTHONPATH}"
+fi
+# Only real driver directories are eligible at runtime, not SDK HAL stubs.
+for driver in /usr/local/Ascend/driver/lib64/common /usr/local/Ascend/driver/lib64/driver; do
+    [[ ! -d "$driver" ]] || export LD_LIBRARY_PATH="$driver${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+done
 vendor="$ASCEND_OPP_PATH/vendors/step5_ops_transformer"
 if [[ -d "$vendor" ]]; then
-    export ASCEND_CUSTOM_OPP_PATH="$vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+    export ASCEND_CUSTOM_OPP_PATH="$vendor"
     export LD_LIBRARY_PATH="$vendor/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-
-# Union mode installs two more vendor packages (union GBSA + UnionSparseMeta).
-# They are opt-in because they do not merely add ops: all four aclnn entry
-# points union GBSA exports -- aclnnGenericBlockSparseAttention and its
-# metadata call, plus their GetWorkspaceSize -- also exist in
-# step5_ops_transformer, and dlopen("libcust_opapi.so") resolves to the first
-# match on this path. Exporting them by default therefore *replaces* the
-# production GBSA kernel with the union fork, which measured 12-33% slower
-# decode at 128K in the bs1..bs144 sweep. Set VLLM_ASCEND_UNION_OPS=1 to opt in;
-# union GBSA must then stay in front of step5_ops, or it would never load.
+# Union packages remain explicit opt-in; their presence must not replace GBSA.
 if [[ "${VLLM_ASCEND_UNION_OPS:-0}" == "1" ]]; then
     for v in custom_nn_nn union_test_transformer; do
         d="$ASCEND_OPP_PATH/vendors/$v"
