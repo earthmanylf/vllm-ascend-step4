@@ -48,10 +48,23 @@ done
 stage_deps() {
   local variant="$1" opbase_ref="$2" tensor_ref="$3" cmake_ref="$4"
   local dst="$HERE/.stage/$variant"
+  local stamp="$dst/.stage-manifest"
+  local want="$variant opbase=$opbase_ref ops-tensor=$tensor_ref cann-cmake=$cmake_ref catlass=769cd40a8716b28650b6bebb08db4834eea4462f"
+  if [[ -f "$stamp" && "$(cat "$stamp")" == "$want" ]]; then
+    echo "    $variant: reusing staged dependencies ($opbase_ref/$tensor_ref)"
+    return 0
+  fi
   rm -rf "$dst"
   mkdir -p "$dst"
+  # --dissociate, not a bare --shared: the op repos' cmake runs `git checkout`
+  # inside the build container, where only $HERE is mounted as /w. A shared
+  # clone records an alternates path pointing at the host absolute path, which
+  # does not exist in there, so every tree read fails with
+  # "unable to normalize alternate object path". Dissociating copies the objects
+  # into the staged repo (still a local copy, no network) and makes it
+  # self-contained.
   for d in opbase ops-tensor catlass ops-test-kit; do
-    git clone -q --shared "$HERE/$d" "$dst/$d"
+    git clone -q --shared --dissociate "$HERE/$d" "$dst/$d"
   done
   git -C "$dst/opbase" checkout -q "$opbase_ref"
   git -C "$dst/ops-tensor" checkout -q "$tensor_ref"
@@ -63,6 +76,7 @@ stage_deps() {
   if [[ -d "$ASSETS" ]] && compgen -G "$ASSETS/*" >/dev/null; then
     cp -a "$ASSETS"/. "$dst/"
   fi
+  printf '%s' "$want" > "$stamp"
 }
 
 echo "==> staging pinned dependencies"
@@ -119,6 +133,7 @@ bash build.sh --ops=generic_block_sparse_attention,generic_block_sparse_attentio
   -j"$JOBS" > /w/.stage/transformer.log 2>&1
 
 cd /w/ops-nn
+rm -rf build build_out
 bash build.sh --pkg --experimental --ops=union_sparse_meta --soc=ascend950 \
   --vendor_name=custom_nn --cann_3rd_lib_path=/w/.stage/nn -j"$JOBS" > /w/.stage/nn-pkg.log 2>&1
 bash build.sh --torch_extension --experimental --ops=union_sparse_meta --soc=ascend950 \
@@ -142,8 +157,11 @@ cp -a "$TR_STAGE" "$HERE/prebuilt/union_test_transformer"
 NN_RUN="$HERE/ops-nn/build_out/cann-ops-nn-custom_nn_linux-aarch64.run"
 "$DOCKER" run --rm -v "$HERE:/w" --entrypoint bash "$IMAGE" -lc "
 set -e
+# --force: the installer probes libcust_opmaster_rt2.0.so, which needs the
+# host driver (libascend_hal.so). This container only flattens the payload; the
+# real install happens in the image build, so the probe cannot and need not pass.
 bash /w/ops-nn/build_out/cann-ops-nn-custom_nn_linux-aarch64.run \
-  --install-path=/w/.stage/nn-install/custom_nn_nn -q --nox11 > /w/.stage/nn-install.log 2>&1
+  --install-path=/w/.stage/nn-install/custom_nn_nn -q --nox11 --force > /w/.stage/nn-install.log 2>&1
 mv /w/.stage/nn-install/custom_nn_nn/vendors/custom_nn_nn /w/prebuilt/custom_nn_nn
 rm -rf /w/.stage/nn-install
 " || { echo "installing $NN_RUN failed; see .stage/nn-install.log" >&2; exit 1; }

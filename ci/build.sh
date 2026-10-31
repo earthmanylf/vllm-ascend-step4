@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build an image from the code that is checked out right now.
 #
-#   ./build.sh                     # default: python-overlay, fast, offline
+#   ./build.sh                     # default: fused CANN-only A5 native build
 #   ./build.sh --full              # native rebuild (needs aarch64 + CANN payload)
 #   ./build.sh --image REF         # tag to produce
 #   ./build.sh --check-only        # verify inputs, build nothing
@@ -9,7 +9,7 @@
 #
 # Two modes exist because they answer different questions:
 #
-#   python-overlay (default)
+#   python-overlay (explicit --python-overlay)
 #     The base image already carries CANN 9.2.0, torch-npu, flash-attn and the
 #     compiled vllm_ascend_C extension; this replaces the Python layer with the
 #     current HEAD. Minutes, no network, no toolchain. Correct only while csrc/
@@ -18,12 +18,12 @@
 #
 #   --full
 #     The native recipe: rebuilds the extension and custom ops from source. Needs
-#     an aarch64 host, the 4.8 GB CANN payload and the LFS-hydrated archives.
+#     an aarch64 host, the CANN-only base, and LFS-hydrated source archives.
 set -euo pipefail
 
 CI_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DOCKER="${CI_DOCKER_BIN:-docker}"
-MODE=overlay
+MODE=full
 IMAGE=""
 REGISTRY="${CI_IMAGE_REGISTRY:-UNIHUB}"
 PUSH="${CI_PUSH:-0}"
@@ -44,13 +44,14 @@ usage() {
   cat <<'HELP'
 Build an image from the code that is checked out right now.
 
-  ./build.sh                  default: python-overlay (fast, offline)
-  ./build.sh --full           native rebuild (aarch64 + CANN payload)
+  ./build.sh                  default: fused CANN-only A5 native build
+  ./build.sh --full           same native CANN-only recipe
+  ./build.sh --python-overlay explicit overlay for an already verified native image
   ./build.sh --check-only     verify the build can happen, build nothing
   ./build.sh --dry-run        prepare the context, build nothing
 
 Modes:
-  python-overlay (default)
+  python-overlay (explicit --python-overlay)
     The base image already carries CANN 9.2.0, torch-npu, flash-attn and the
     compiled vllm_ascend_C extension, so only the Python layer is replaced with
     the current HEAD. Minutes, no network, no toolchain. Valid only while csrc/
@@ -59,7 +60,7 @@ Modes:
 
   --full
     Native recipe: rebuilds the extension and custom ops from source. Needs an
-    aarch64 host, the 4.8 GB CANN payload and the LFS-hydrated archives.
+    aarch64 host, the CANN-only base, and LFS-hydrated source archives.
 
 Image naming: <registry>/stepcast:<release>-<vllm>-<ascend>-<date>-<time>
   e.g. hub.i.basemind.com/stepcast/stepcast:
@@ -74,15 +75,15 @@ Options:
                       Default UNIHUB -> hub.i.basemind.com/stepcast.
   --push              Push after building. Without it the image stays local.
   --release X.Y.Z     Release stamp for the tag (default: derived).
-  --base-image REF    Base image for the overlay (default: newest local image
-                      that carries a step5 source label).
+  --base-image REF    CANN-only base for native builds (default: pinned CANN ref);
+                      verified native base when --python-overlay is explicit.
   --source-ref REF    git ref to package (default: HEAD).
-  --reuse-base-assets Native only: the base image already has CANN 9.2.0 and the
-                      vendored assets, so skip the 4.8 GB payload and the three
-                      archives. Makes an offline native build possible.
-  --vllm-commit SHA   Native only: vllm commit to clone (default: --vllm-tag tip).
+  --reuse-base-assets Retired: a CANN-only base does not contain vLLM/ops assets.
+  --vllm-commit SHA   Exact vllm commit to clone (default: the source pin).
   --with-union-ops    Native only: install union-mode custom ops from
                       ci/third-party/prebuilt/ (see ci/third-party/README.md).
+  --max-jobs N        Native compile parallelism (default 16).
+  --cargo-build-jobs N Cargo parallelism (default 16).
   --keep              Keep the generated context.
 HELP
 }
@@ -90,6 +91,7 @@ HELP
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --full) MODE=full; shift ;;
+    --python-overlay) MODE=overlay; shift ;;
     --image) IMAGE="${2:?--image needs a value}"; shift 2 ;;
     --base-image) BASE_IMAGE="${2:?--base-image needs a value}"; shift 2 ;;
     --source-ref) SOURCE_REF="${2:?--source-ref needs a value}"; shift 2 ;;
@@ -97,7 +99,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --keep) KEEP=1; shift ;;
     --registry) REGISTRY="${2:?--registry needs a value}"; shift 2 ;;
-    --reuse-base-assets) REUSE_BASE_ASSETS=1; shift ;;
+    --reuse-base-assets) echo "CANN-only recipe requires native source assets; --reuse-base-assets is no longer supported" >&2; exit 2 ;;
     --with-union-ops) WITH_UNION_OPS=1; shift ;;
     --vllm-commit) VLLM_COMMIT="${2:?}"; shift 2 ;;
     --vllm-tag) VLLM_TAG="${2:?}"; shift 2 ;;
@@ -111,9 +113,9 @@ while [[ $# -gt 0 ]]; do
       [[ "${2:-}" == docker ]] || {
         echo "--backend only supports 'docker', got '${2:-<none>}'" >&2; exit 2; }
       EXTRA+=("$1" "$2"); shift 2 ;;
-    --fast|--source-rebase|--inputs-dir|--context-dir|--receipt)
+    --fast|--source-rebase|--inputs-dir|--context-dir|--receipt|--max-jobs|--cargo-build-jobs)
       # Same compatibility, value-taking flags pass through to the native recipe.
-      if [[ "$1" == --inputs-dir || "$1" == --context-dir || "$1" == --receipt ]]; then
+      if [[ "$1" == --inputs-dir || "$1" == --context-dir || "$1" == --receipt || "$1" == --max-jobs || "$1" == --cargo-build-jobs ]]; then
         EXTRA+=("$1" "${2:?$1 needs a value}"); shift 2
       else
         EXTRA+=("$1"); shift
@@ -153,10 +155,13 @@ pick_base_image() {
 }
 
 if [[ "$MODE" == full ]]; then
-  echo "==> Native rebuild (aarch64 + CANN payload + LFS archives required)"
+  echo "==> Fused CANN-only A5 native build (local CANN base + source archives)"
   # The native recipe derives its own release tag from the context it prepares,
   # so an explicit --image is only needed to override it.
   NATIVE_ARGS=(--commit "$SOURCE_REF" --registry "$REGISTRY")
+  ((CHECK_ONLY)) && NATIVE_ARGS+=(--check-only)
+  ((DRY_RUN)) && NATIVE_ARGS+=(--dry-run)
+  ((KEEP)) && NATIVE_ARGS+=(--keep)
   [[ -n "$IMAGE" ]] && NATIVE_ARGS+=(--image "$IMAGE")
   [[ -n "$BASE_IMAGE" ]] && NATIVE_ARGS+=(--base-image "$BASE_IMAGE")
   [[ -n "${VLLM_COMMIT:-}" ]] && NATIVE_ARGS+=(--vllm-commit "$VLLM_COMMIT")

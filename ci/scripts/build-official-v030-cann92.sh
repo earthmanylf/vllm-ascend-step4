@@ -22,6 +22,8 @@ VLLM_BASE_VERSION="${VLLM_BASE_VERSION:-$(python3 -c 'import json,sys;print(json
 # staging a 4.8 GB payload and three archives.
 REUSE_BASE_ASSETS="${REUSE_BASE_ASSETS:-0}"
 WITH_UNION_OPS="${WITH_UNION_OPS:-0}"
+MAX_JOBS="${MAX_JOBS:-16}"
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}"
 DOCKER="${CI_DOCKER_BIN:-docker}"
 BACKEND="${BACKEND:-docker}"
 COMMIT="${COMMIT:-HEAD}"
@@ -36,12 +38,12 @@ Usage: ci/build.sh [--dry-run|--check-only] [--inputs-dir DIR] [--context-dir NE
                    [--backend docker] [--fast]
 
 Default input cache: ci/cache/tailring-cann9.2.0-143f3649d8
-Default: full official v0.30.0rc1 + formal CANN 9.2.0 recipe from DSH session b5f168ee.
+Default: fused original A5/openEuler + Step5 CI recipe from a CANN-only 9.2.0 base.
 vllm-ascend is compiled from the current HEAD by default, not from a pinned commit;
 --commit REF builds another ref. The image version is derived from that ref.
 --check-only checks hashes of present inputs and reports missing inputs without building.
 --dry-run requires every input and creates a verified context, but does not build.
-Actual builds require native aarch64 and the exact official rc1 base config locally.
+Actual builds require native aarch64 and the requested CANN base already downloaded locally.
 --fast falls back to this full rebuild: old native reuse is unsafe for this upgrade.
 ci/scripts/seed-shared-cache.py --source EXISTING_ARCHIVE_ROOT
 ci/scripts/fetch-cann92-payload.py --image quay.io/ascend/cann:9.2.0-950-openeuler24.03-py3.12-devel
@@ -56,11 +58,13 @@ while [[ $# -gt 0 ]]; do
     --context-dir) need_value "$@"; CONTEXT="$2"; shift 2 ;;
     --image) need_value "$@"; IMAGE="$2"; shift 2 ;;
     --registry) need_value "$@"; REGISTRY="$2"; shift 2 ;;
-    --reuse-base-assets) REUSE_BASE_ASSETS=1; shift ;;
+    --reuse-base-assets) die "CANN-only recipe cannot reuse prebuilt vLLM/ops; remove --reuse-base-assets" ;;
     --with-union-ops) WITH_UNION_OPS=1; shift ;;
+    --max-jobs) need_value "$@"; MAX_JOBS="$2"; shift 2 ;;
+    --cargo-build-jobs) need_value "$@"; CARGO_BUILD_JOBS="$2"; shift 2 ;;
     --base-image) need_value "$@"; BASE_IMAGE_OVERRIDE="$2"; shift 2 ;;
     --vllm-commit) need_value "$@"; VLLM_COMMIT="$2"; shift 2 ;;
-    --vllm-tag) need_value "$@"; VLLM_TAG="$2"; shift 2 ;;
+    --vllm-tag) die "Fused native build requires a fixed --vllm-commit, not a floating tag" ;;
     --vllm-repo) need_value "$@"; VLLM_REPO="$2"; shift 2 ;;
     --vllm-token) need_value "$@"; GITLAB_ACCESS_TOKEN="$2"; shift 2 ;;
     --commit) need_value "$@"; COMMIT="$2"; shift 2 ;;
@@ -74,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     *) die "Unknown official-profile option: $1 (historical flags require --legacy)" ;;
   esac
 done
+[[ "$MAX_JOBS" =~ ^[1-9][0-9]*$ && "$CARGO_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || die "Build job counts must be positive integers"
 [[ "$BACKEND" == docker ]] || die "Official session profile requires --backend docker"
 need_cmd python3; need_cmd git
 # The vllm-ascend tree comes from $COMMIT (HEAD by default); only the CANN layer,
@@ -114,9 +119,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 python3 "$CI_DIR/scripts/prepare-official-v030-cann92.py" \
   --ci-dir "$CI_DIR" --inputs-dir "$INPUT_ROOT" --output "$CONTEXT" \
-  $([[ "$REUSE_BASE_ASSETS" == "1" ]] && echo --reuse-base-assets) \
   $([[ "$WITH_UNION_OPS" == "1" ]] && echo --with-union-ops) \
-  --source-ref "$COMMIT"
+  --source-ref "$COMMIT" --vllm-base-version "$VLLM_BASE_VERSION" \
+  --vllm-commit "${VLLM_COMMIT:-$(json_get "$CI_DIR/pins/official-v030-cann92.json" vllm_source.commit)}"
 CONTEXT="$(cd "$CONTEXT" && pwd -P)"
 if [[ "$DRY_RUN" == 1 ]]; then
   log "Dry-run complete: $CONTEXT; no build/daemon/device operation"
@@ -144,36 +149,32 @@ VLLM_ASCEND_BASE="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));p
 VLLM_ASCEND_HOW="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["derivation"])' "$VER_JSON")"
 log "vllm-ascend: $VLLM_ASCEND_VERSION ($VLLM_ASCEND_COMMIT)"
 log "  series $VLLM_ASCEND_BASE, version derived via $VLLM_ASCEND_HOW"
-if [[ -n "$BASE_IMAGE_OVERRIDE" ]]; then
-  BASE="$BASE_IMAGE_OVERRIDE"
-  if [[ "$REUSE_BASE_ASSETS" == "1" ]]; then
-    log "Base: $BASE (local image; assets reused, digest pin skipped)"
-  else
-    log "Base: $BASE"
-  fi
-else
-  BASE="quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler"
-fi
-ACTUAL="$("$DOCKER" image inspect "$BASE" --format '{{.Id}}')"
-LOCKED="$(json_get "$CI_DIR/pins/official-v030-cann92.json" base_config_digest)"
-if [[ -z "$BASE_IMAGE_OVERRIDE" ]]; then
-  [[ "$ACTUAL" == "$LOCKED" ]] || die "Official rc1 base config mismatch: $ACTUAL != $LOCKED"
-fi
+BASE_REF="${BASE_IMAGE_OVERRIDE:-$(json_get "$CI_DIR/pins/official-v030-cann92.json" base_image)}"
+"$DOCKER" image inspect "$BASE_REF" > "$CONTEXT/base-image-inspect.json" \
+  || die "CANN base is not available locally; download it before building: $BASE_REF"
+BASE="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))[0]; print(next(iter(d.get("RepoDigests",[])),d["Id"]))' "$CONTEXT/base-image-inspect.json")"
+log "CANN-only base: $BASE_REF -> $BASE"
+log "Build parallelism: MAX_JOBS=$MAX_JOBS CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS"
 # Retain session network/Python/DNS behavior. No old native wheels or implicit base pull.
-VLLM_VERSION="${VLLM_VERSION:-$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("vllm_version",""))' "$CONTEXT/source-version.json")}"
+VLLM_VERSION="$(json_get "$VER_JSON" vllm_version)"
+VLLM_COMMIT="$(json_get "$VER_JSON" vllm_commit)"
 [[ -n "$VLLM_VERSION" ]] || die "prepared context has no vllm_version"
-DOCKER_BUILDKIT=0 "$DOCKER" build --network host \
+python3 "$CI_DIR/scripts/check-image-layer-budget.py" --image "$BASE" --dockerfile "$CONTEXT/Dockerfile" --docker "$DOCKER"
+
+# BuildKit is required for the persistent pip cache mount: a failure late in the
+# recipe must not discard dependency downloads that already succeeded.
+DOCKER_BUILDKIT=1 "$DOCKER" build --pull=false --progress=plain --network host \
   --add-host pypi.org:151.101.192.223 \
   --add-host files.pythonhosted.org:151.101.192.223 \
   --add-host ascend-triton-open.obs.cn-north-4.myhuaweicloud.com:122.9.24.7 \
   --build-arg "BASE_IMAGE=$BASE" \
+  --build-arg "MAX_JOBS=$MAX_JOBS" \
+  --build-arg "CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS" \
   --build-arg "VLLM_ASCEND_VERSION=$VLLM_ASCEND_VERSION" \
   --build-arg "VLLM_ASCEND_COMMIT=$VLLM_ASCEND_COMMIT" \
-  --build-arg "REUSE_BASE_ASSETS=$REUSE_BASE_ASSETS" \
+  --build-arg "VLLM_ASCEND_BASE_VERSION=$VLLM_ASCEND_BASE" \
   --build-arg "WITH_UNION_OPS=$WITH_UNION_OPS" \
-  --build-arg "VLLM_SOURCE=git" \
   --build-arg "VLLM_REPO=$VLLM_REPO" \
-  --build-arg "VLLM_TAG=$VLLM_TAG" \
   --build-arg "VLLM_COMMIT=$VLLM_COMMIT" \
   --build-arg "VLLM_VERSION=$VLLM_VERSION" \
   --build-arg "VLLM_BASE_VERSION=$VLLM_BASE_VERSION" \
@@ -198,7 +199,7 @@ runtime = json.loads((context / 'runtime-identity.json').read_text())
 assert runtime['machine'] == 'aarch64'
 assert runtime['packages']['torch']['version'] == '2.10.0+cpu'
 assert runtime['packages']['torch-npu']['version'] == '2.10.0.post4'
-assert runtime['packages']['vllm']['version'] == '0.29.1rc1.dev2194+gca5e43ddcd.empty'
+assert runtime['packages']['vllm']['version'].split('.empty')[0] == json.loads((context / 'source-version.json').read_text())['vllm_version']
 source = json.loads((context / 'source-version.json').read_text())
 assert runtime['packages']['vllm-ascend']['version'] == source['version'], (
     f"built {runtime['packages']['vllm-ascend']['version']} but exported {source['version']}")
@@ -213,10 +214,8 @@ receipt = {
     'context': json.loads((context / 'context-manifest.json').read_text()),
     'runtime': runtime,
     'source': json.loads((context / 'source-version.json').read_text()),
-    'matches_session_config': image['Id'] ==
-        'sha256:0a16c96cc8be9bacdd5028d35bed3623297b5313870d87229984c08062033483'
-        and json.loads((context / 'source-version.json').read_text())['commit']
-        == '143f3649d8181edae635091c5fe809eb51ff992c',
+    'base_image': json.loads((context / 'base-image-inspect.json').read_text())[0],
+    'recipe_mode': 'cann-base-a5-multistage',
     'device_validation': 'not run; separate 950DT numerical/inference acceptance required',
 }
 output = pathlib.Path(sys.argv[4]).expanduser().absolute()

@@ -1,0 +1,7 @@
+{
+  "method": "mtp",
+  "num_speculative_tokens": 3,
+  "enforce_eager": false,
+  "rejection_sample_method": "synthetic",
+  "synthetic_acceptance_rate": 0.6
+}

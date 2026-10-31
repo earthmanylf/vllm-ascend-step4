@@ -17,3 +17,5 @@
 !patch_flash_hcc.py
 !third-party/
 !third-party/prebuilt/
+
+!triton_ascend-3.6.0+dev20261013182112-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl

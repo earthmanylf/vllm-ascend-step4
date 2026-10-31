@@ -1,0 +1,6 @@
+{
+  "method": "mtp",
+  "num_speculative_tokens": 3,
+  "enforce_eager": false,
+  "rejection_sample_method": "standard"
+}
