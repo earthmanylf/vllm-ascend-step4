@@ -28,40 +28,60 @@ def _gated_scale_kernel(
     stride_attn_token,
     stride_gate_token,
     stride_out_token,
+    NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     token = tl.program_id(0)
-    head = tl.program_id(1)
-    g = tl.sigmoid(
-        tl.load(gate_ptr + token * stride_gate_token + head).to(tl.float32)
-    )
+    head_block = tl.program_id(1)
+    heads = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
     dims = tl.arange(0, BLOCK_D)
+    head_ok = heads < NUM_HEADS
     dim_ok = dims < HEAD_DIM
-    x = tl.load(
-        attn_ptr + token * stride_attn_token + head * HEAD_DIM + dims,
-        mask=dim_ok,
-        other=0.0,
-    ).to(tl.float32)
-    tl.store(
-        out_ptr + token * stride_out_token + head * HEAD_DIM + dims,
-        (x * g).to(out_ptr.dtype.element_ty),
-        mask=dim_ok,
+    mask = head_ok[:, None] & dim_ok[None, :]
+    g = tl.sigmoid(
+        tl.load(
+            gate_ptr + token * stride_gate_token + heads,
+            mask=head_ok,
+            other=0.0,
+        ).to(tl.float32)
     )
+    src = token * stride_attn_token + heads[:, None] * HEAD_DIM + dims[None, :]
+    x = tl.load(attn_ptr + src, mask=mask, other=0.0).to(tl.float32)
+    dst = token * stride_out_token + heads[:, None] * HEAD_DIM + dims[None, :]
+    tl.store(
+        out_ptr + dst,
+        (x * g[:, None]).to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+_LANE_BUDGET = 4096
+
+
+def _pick_head_block(num_heads: int, head_dim: int) -> int:
+    """Heads per program, mirroring _pick_head_chunk in fused_qknorm_rope.py."""
+    if num_heads * head_dim <= _LANE_BUDGET:
+        return triton.next_power_of_2(num_heads)
+    return triton.next_power_of_2(max(1, min(num_heads, _LANE_BUDGET // head_dim)))
 
 
 def _gated_scale(attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     num_heads = gate.shape[-1]
     head_dim = attn_output.shape[-1] // num_heads
+    block_h = _pick_head_block(num_heads, head_dim)
     out = torch.empty_like(attn_output)
-    _gated_scale_kernel[(attn_output.shape[0], num_heads)](
+    _gated_scale_kernel[(attn_output.shape[0], triton.cdiv(num_heads, block_h))](
         attn_output,
         gate,
         out,
         attn_output.stride(0),
         gate.stride(0),
         out.stride(0),
+        NUM_HEADS=num_heads,
         HEAD_DIM=head_dim,
+        BLOCK_H=block_h,
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
     return out
