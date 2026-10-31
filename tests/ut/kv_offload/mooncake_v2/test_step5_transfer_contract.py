@@ -1412,6 +1412,7 @@ def test_step5_staggered_remote_futures_do_not_publish_before_all_groups(product
     receiver.quarantined_requests = {}
     receiver.can_report_invalid_block_ids = False
     receiver.ready_event = threading.Event()
+    receiver._closed_before_start = False
     receiver.device = "cpu"
     request = NS(
         local_block_ids=([1], [3], [5]),

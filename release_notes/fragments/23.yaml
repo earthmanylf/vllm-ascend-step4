@@ -1,0 +1,11 @@
+pr: 23
+entries:
+  - category: feature
+    text: >-
+      Enabled FA3 KV transfer for the validated Step5 BF16 BLNHC Mooncake
+      profile while retaining unsupported-profile and native ABI checks.
+  - category: bugfix
+    text: >-
+      Completed normal Mooncake receiver-worker shutdown with FIFO drainage,
+      thread and executor cleanup, and explicit retention of READs whose
+      native completion remains unknown.

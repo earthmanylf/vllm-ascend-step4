@@ -142,7 +142,10 @@ class MooncakePullRecvingThread(threading.Thread):
         # engine_id -> remote_pp_rank
         # -> [(local_layer_index, remote_layer_index), ...]
         self.remote_layer_index_pairs: SizedDict[str, dict[int, list[tuple[int, int]]]] = SizedDict()
-        self.request_queue: queue.Queue[tuple[str, dict[str, ReqMeta]]] = queue.Queue()
+        self.request_queue: queue.Queue[tuple[str, dict[str, ReqMeta]] | None] = queue.Queue()
+        self._closing = False
+        self._closed_before_start = False
+        self._close_lock = threading.Lock()
         self.finished_requests: queue.SimpleQueue[tuple[str, bool]] = queue.SimpleQueue()
         # A failed legacy native READ is not a quiescence fence. Keep its
         # metadata and do not publish completion until a real fence exists.
@@ -158,7 +161,33 @@ class MooncakePullRecvingThread(threading.Thread):
     ) -> None:
         """Queue requests for one remote engine."""
         if requests:
-            self.request_queue.put((remote_engine_id, requests))
+            with self._close_lock:
+                if self._closing:
+                    raise RuntimeError("Mooncake pull receiver is shutting down")
+                self.request_queue.put((remote_engine_id, requests))
+
+    def shutdown(self) -> None:
+        """Drain accepted work and join Python threads, not a native DMA fence."""
+        if threading.current_thread() is self:
+            raise RuntimeError("Mooncake pull receiver cannot join itself")
+        with self._close_lock:
+            if not self._closing:
+                if self.ident is None and self.request_queue.unfinished_tasks:
+                    raise RuntimeError(
+                        "Cannot shut down an unstarted Mooncake receiver with accepted work; retain requests"
+                    )
+                self._closing = True
+                if self.ident is None:
+                    self._closed_before_start = True
+                else:
+                    self.request_queue.put(None)
+        if self.ident is not None:
+            self.join()
+        self.executor.shutdown(wait=True)
+        if self.quarantined_requests:
+            raise RuntimeError(
+                "Mooncake shutdown has quarantined READs with unknown native completion; retain registered buffers"
+            )
 
     def get_and_clear_finished_requests(self) -> KVConnectorTransferResults:
         """Drain completion and failure together for each finished request."""
@@ -181,10 +210,17 @@ class MooncakePullRecvingThread(threading.Thread):
 
     def run(self) -> None:
         """Consume queued requests and invoke the transfer implementation."""
+        if self._closed_before_start:
+            self.ready_event.set()
+            return
         torch.npu.set_device(self.device)
         self.ready_event.set()
         while True:
-            remote_engine_id, requests = self.request_queue.get()
+            item = self.request_queue.get()
+            if item is None:
+                self.request_queue.task_done()
+                return
+            remote_engine_id, requests = item
             is_step5 = getattr(self, "is_step5", False)
             if is_step5:
                 requests = {key: value for key, value in requests.items() if key not in self.quarantined_requests}
@@ -1770,6 +1806,10 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
                 raise RuntimeError("Timed out starting Mooncake pull receiving thread")
             if not self._recving_thread.is_alive():
                 raise RuntimeError("Mooncake pull receiving thread failed to start")
+
+    def shutdown(self) -> None:
+        if self._recving_thread is not None:
+            self._recving_thread.shutdown()
 
     def clear_mtp_seed_requests(self, request_ids: set[str]) -> None:
         for request_id in request_ids:

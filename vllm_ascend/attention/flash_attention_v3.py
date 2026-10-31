@@ -14,7 +14,7 @@ from flash_attn_npu_3 import flash_attn_with_kvcache, get_scheduler_metadata
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder, AttentionType
 from vllm.v1.attention.backends.registry import register_backend
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -22,7 +22,33 @@ from vllm_ascend.attention.attention_v1 import (
     AscendMetadata,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.core.step5_kv_cache import _validate_step5_blnhc_spec, uses_step5_blnhc
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
+
+
+def validate_fa3_kv_transfer_config(vllm_config: VllmConfig) -> None:
+    """Limit PD to Step5's byte-compatible BLNHC main K/V planes."""
+    transfer = vllm_config.kv_transfer_config
+    if transfer is None or not getattr(transfer, "is_kv_transfer_instance", False) or not uses_step5_blnhc(vllm_config):
+        raise ValueError("Device-tiling FA3 KV transfer requires the Step5 V2 Mooncake pull profile.")
+    model = vllm_config.model_config
+    cache = vllm_config.cache_config
+    if model.dtype != torch.bfloat16 or cache.cache_dtype not in ("auto", "bfloat16"):
+        raise ValueError("Device-tiling FA3 Step5 KV transfer requires BF16 model and main KV cache.")
+    # Model construction precedes upstream layout resolution. BLNHC-only backend
+    # capability and descriptor validation enforce the eventual physical layout.
+    if getattr(cache, "kv_cache_layout", None) not in (None, "BLNHC"):
+        raise ValueError("Device-tiling FA3 Step5 KV transfer requires BLNHC.")
+    head_size = model.get_head_size()
+    _validate_step5_blnhc_spec(
+        FullAttentionSpec(
+            block_size=cache.block_size,
+            num_kv_heads=model.get_num_kv_heads(vllm_config.parallel_config),
+            head_size=head_size,
+            head_size_v=head_size,
+            dtype=model.dtype,
+        )
+    )
 
 
 def validate_fa3_scheduler_api() -> None:
@@ -103,8 +129,16 @@ class AscendFlashAttentionBackend(AscendAttentionBackend):
 
     @classmethod
     def supports_kv_connector(cls) -> bool:
-        # The native page interpretation is not a byte-compatible PD protocol.
-        return False
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is None or config.kv_transfer_config is None:
+            return False
+        try:
+            validate_fa3_kv_transfer_config(config)
+        except ValueError:
+            return False
+        return True
 
 
 @dataclass
@@ -122,6 +156,11 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         validate_fa3_scheduler_api()
+        if vllm_config.kv_transfer_config is not None:
+            validate_fa3_kv_transfer_config(vllm_config)
+            _validate_step5_blnhc_spec(kv_cache_spec)
+            if kv_cache_spec.head_size_v == 0:
+                raise ValueError("Device-tiling FA3 Step5 KV transfer requires a main K/V attention spec.")
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs + 1
         self.block_size = kv_cache_spec.block_size
         self.scheduler_specs: set[tuple] = set()
@@ -346,7 +385,15 @@ class AscendFlashAttentionImpl(AscendAttentionBackendImpl):
         if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
             raise ValueError("Device-tiling FA3 does not support context parallelism.")
         if self.vllm_config.kv_transfer_config is not None:
-            raise ValueError("Device-tiling FA3 compact pools do not support KV transfer.")
+            validate_fa3_kv_transfer_config(self.vllm_config)
+            main_spec = FullAttentionSpec(
+                block_size=self.vllm_config.cache_config.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                dtype=self.kv_cache_dtype,
+            )
+            _validate_step5_blnhc_spec(main_spec)
         if self.sliding_window is not None and self.sliding_window <= 0:
             raise ValueError("FA3 sliding_window must be positive or None.")
         self.window_size = (self.sliding_window - 1, 0) if self.sliding_window is not None else (-1, -1)

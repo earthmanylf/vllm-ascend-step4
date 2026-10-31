@@ -53,6 +53,30 @@ The native stride patch is separate from the baseline model's summary/Ring
 algorithms. This change does not import the later layer-compact storage
 profile or the rest of the review candidate's model changes.
 
+## Limited Step5 KV transfer eligibility
+
+FA3 admits only the existing Step5 V2 BLNHC Mooncake pull contract: registered
+`MooncakeConnectorV2` (or its `MooncakePullConnector` alias), producer/consumer
+roles, BF16 model and main KV (`auto` or `bfloat16`), one local KV head,
+192-dimensional K/V, and 128-token blocks. It reuses the Step5 configuration
+and cache-spec validators, including their PP4/TP4 producer and DP4/TP4
+consumer MTP3 graph/async profiles. Prefix caching is not disabled by this gate.
+Other models, connectors, module overrides, context parallelism, offload,
+KVPP, unsupported geometry and speculative schedules remain rejected.
+
+The capability query requires an explicit current VllmConfig; without one
+(or without KV transfer) it returns false. Constructors and metadata builders
+validate their own config and actual layer/spec geometry. During construction
+the layout may be unresolved; BLNHC-only negotiation and the existing
+allocation descriptor checks enforce the physical layout before use.
+Local FA3 without KV transfer retains its existing behavior. Native ABI 1 is
+still mandatory; configuration eligibility does not certify an installed library.
+
+This is a local eligibility adaptation, not cross-host PD acceptance. Real
+producer writes, production connector READ completion/visibility, decoder FA3
+reads, target/draft sharing, prefix/ring state and final graph/async execution
+still need independent hardware validation before production delivery.
+
 ## Validation boundary
 
 CPU contract tests do not prove NPU correctness. A compiled matching symbol
