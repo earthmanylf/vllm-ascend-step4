@@ -40,6 +40,7 @@ def receiver_type():
 def test_unknown_completion_never_published_for_step5(receiver_type, is_step5, raises, can_report):
     thread = receiver_type.__new__(receiver_type)
     thread.device = 0
+    thread._closed_before_start = False
     thread.is_step5 = is_step5
     thread.ready_event = threading.Event()
     thread.request_queue = BoundedQueue()

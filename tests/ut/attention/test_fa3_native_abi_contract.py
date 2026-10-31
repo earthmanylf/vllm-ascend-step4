@@ -82,9 +82,13 @@ def test_step5_dsa_and_fa3_keep_blnhc_only_capability():
     # Use the baseline's actual eligibility function; isolate imports only.
     helper_path = ROOT / "vllm_ascend/core/step5_kv_cache.py"
     tree = ast.parse(helper_path.read_text())
-    eligibility = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "uses_step5_blnhc")
+    eligibility = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name in ("uses_step5_blnhc", "validate_step5_kv_transfer_config")
+    ]
     namespace = {}
-    exec(compile(ast.Module(body=[eligibility], type_ignores=[]), str(helper_path), "exec"), namespace)
+    exec(compile(ast.Module(body=eligibility, type_ignores=[]), str(helper_path), "exec"), namespace)
     cfg = SimpleNamespace(
         use_v2_model_runner=True,
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="step5")),

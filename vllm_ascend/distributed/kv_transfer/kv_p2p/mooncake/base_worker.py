@@ -481,6 +481,9 @@ class MooncakeBaseConnectorWorker:
             register_regions.lengths,
         )
 
+    def shutdown(self) -> None:
+        """No background transfer work exists in the base producer worker."""
+
     def get_finished(self) -> tuple[set[str], set[str]]:
         """Compatibility wrapper for the legacy completion API."""
         results = self.get_transfer_results()

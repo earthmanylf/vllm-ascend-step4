@@ -379,6 +379,7 @@ def test_mtp_runtime_propagates_full_descriptor_after_capture_size_rounding(fa3)
     runner.input_batch = SimpleNamespace(is_prefilling_np=np.zeros(2, dtype=np.bool_))
     runner.input_buffers = SimpleNamespace(positions=torch.arange(9), seq_lens_cpu=actual.seq_lens)
     runner.draft_attn_state = "spec"
+    runner._exact_draft_seq_lens = True
     runner.draft_vllm_config = builder.vllm_config
     desc = SimpleNamespace(cg_mode="full", num_tokens=9, num_reqs=3, uniform_token_count=3)
     replay = runner._build_attn_metadata(2, desc, np.array([0, 3, 6]), None, 0)["layer"]
